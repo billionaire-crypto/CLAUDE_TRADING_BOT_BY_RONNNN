@@ -1,0 +1,28 @@
+# ============================================================
+# Trading Bot - Python Dependencies
+# Install with: pip install -r requirements.txt
+# ============================================================
+
+# Exchange connectivity
+ccxt>=4.0.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# Data analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Technical indicators (uncomment whichever you use)
+# ta>=0.11.0             # Simple TA library
+# pandas-ta>=0.3.14b     # Pandas-based TA
+# ta-lib>=0.4.28         # Full TA-Lib (requires C install)
+
+# Scheduling / automation
+schedule>=1.2.0
+
+# Telegram notifications (optional)
+# python-telegram-bot>=20.0
+
+# Logging extras (optional)
+# colorlog>=6.7.0

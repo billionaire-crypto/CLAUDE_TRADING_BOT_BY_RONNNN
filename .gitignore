@@ -1,0 +1,56 @@
+# ============================================================
+# TRADING BOT - .gitignore
+# ============================================================
+
+# --- NEVER commit these ---
+.env
+*.key
+*.pem
+
+# --- Logs ---
+logs/
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# --- Virtual Environments ---
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# --- Database files ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- IDE / Editor ---
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# --- Test / Coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+
+config/
+
+.claude/
+src.zip
+trade_journal.csv
+src/exports/
+
