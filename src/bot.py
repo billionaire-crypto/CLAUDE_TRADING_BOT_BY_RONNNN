@@ -36,7 +36,9 @@ DATA_PATH       = r"C:\Users\kyawz\Downloads\GLBX-20260331-885WT5W7KA\glbx-mdp3-
 INIT_CASH       = 50_000.0
 RUN_MODE        = "BACKTEST"
 EXECUTION_PROFILE = "CONSERVATIVE"
-LIVE_EXECUTION_ENABLED = False
+TOPSTEPX_DRY_RUN = os.getenv("TOPSTEPX_DRY_RUN", "true").strip().lower() == "true"
+TOPSTEPX_ENABLE_ORDER_ROUTING = os.getenv("TOPSTEPX_ENABLE_ORDER_ROUTING", "false").strip().lower() == "true"
+LIVE_EXECUTION_ENABLED = TOPSTEPX_ENABLE_ORDER_ROUTING and not TOPSTEPX_DRY_RUN
 PRODUCTION_AUDIT_ENABLED = True
 
 # Strategy params
@@ -69,6 +71,8 @@ import pytz
 TIMEZONE             = pytz.timezone("America/Chicago")
 SESSION_OPEN_H       = 17
 SESSION_OPEN_M       = 0
+LIVE_TRADE_WINDOW_START_H = 9
+LIVE_TRADE_WINDOW_START_M = 30
 ENTRY_CUTOFF_H       = 15
 ENTRY_CUTOFF_M       = 8
 HARD_FLATTEN_H       = 15
@@ -93,7 +97,7 @@ SCALING_TIER_2_THRESHOLD = 1_500.0
 SCALING_TIER_3_THRESHOLD = 2_000.0
 
 # ── DYNAMIC RISK PROFILES ────────────────────────────────────────────────────
-CALM_ATR_RATIO   = 1.00
+CALM_ATR_RATIO   = 0.70
 STRONG_ATR_RATIO = 0.70
 
 NORMAL_CONTRACTS    = 4
@@ -123,6 +127,7 @@ EMA_SPREAD_MIN = 0.0010
 FVG_MAX_AGE_BARS   = 20
 FVG_MIN_SIZE_TICKS = 2
 FVG_FRESH_ONLY     = False
+FVG_BLOCK_SWEEP_LEVELS: set = {"globex_high"}  # block FVGs preceded by a globex_high liquidity sweep
 FVG_LEVEL_ALIGNMENT_BONUS_ENABLED = True
 FVG_LEVEL_ALIGNMENT_TICKS         = 8
 FVG_BOS_BONUS_ENABLED             = True
@@ -188,6 +193,18 @@ VWAP_MR_MIN_TARGET_TICKS       = 20
 VWAP_MR_MAX_TARGET_TICKS       = 60
 VWAP_MR_TARGET_BUFFER_TICKS    = 4
 VWAP_MR_DEBUG_PRINT_LIMIT      = 25
+
+# Module E: VWAP extension short (afternoon mean-reversion)
+VWAP_EXT_ENABLED            = False
+VWAP_EXT_WINDOW_START       = (13, 30)  # 13:30 CT
+VWAP_EXT_WINDOW_END         = (15, 0)   # 15:00 CT
+VWAP_EXT_MIN_ATR_MULT       = 1.2       # price >= VWAP + 1.2 * ATR to qualify
+VWAP_EXT_CONTRACTS          = 2
+VWAP_EXT_MAX_TRADES_PER_DAY = 1
+VWAP_EXT_STOP_ATR_MULT      = 1.0       # stop = entry + 1.0 * ATR (widened from 0.5)
+VWAP_EXT_TARGET_ATR_MULT    = 1.5       # target = entry - 1.5 * ATR (widened from 0.75)
+VWAP_EXT_MAX_BARS           = 8         # time-based exit: 40 min on 5-min bars
+VWAP_EXT_DEBUG_PRINT_LIMIT  = 25
 
 # Complementary module: opening-drive first pullback continuation
 OD_PULLBACK_ENABLED             = False
@@ -361,7 +378,7 @@ class TradeRecord:
     fvg_stop: float
 
     # V28: entry type
-    entry_type: str = "FVG"       # "FVG", "ORB", "OD_PULLBACK", "VWAP_MR", or "FAILED_BREAKOUT"
+    entry_type: str = "FVG"       # "FVG", "ORB", "OD_PULLBACK", "VWAP_MR", "VWAP_EXT", or "FAILED_BREAKOUT"
 
     # Timing
     entry_hour: int = 0
@@ -387,6 +404,9 @@ class TradeRecord:
     fvg_type: str = ""
     fvg_quality_score: int = 0
     fvg_quality_flags: str = ""
+    sweep_preceded: bool = False
+    sweep_level: str = ""
+    sweep_bars_ago: int = 0
 
     # ORB quality (0 for FVG trades)
     orb_range_ticks: float = 0.0
@@ -583,6 +603,9 @@ class LiveSignalSnapshot:
     fvg_type: str = ""
     fvg_quality_score: int = 0
     fvg_quality_flags: str = ""
+    sweep_preceded: bool = False
+    sweep_level: str = ""
+    sweep_bars_ago: int = 0
     fb_level_type: str = ""
     fb_level_price: float = 0.0
     fb_sweep_distance_ticks: float = 0.0
@@ -746,8 +769,21 @@ def run_startup_audit() -> Dict[str, object]:
 
     add_check("run_mode_explicit", RUN_MODE == "BACKTEST",
               f"RUN_MODE={RUN_MODE}")
-    add_check("live_execution_disabled", not LIVE_EXECUTION_ENABLED,
-              f"LIVE_EXECUTION_ENABLED={LIVE_EXECUTION_ENABLED}")
+    execution_mode_valid = (
+        (TOPSTEPX_DRY_RUN and not TOPSTEPX_ENABLE_ORDER_ROUTING and not LIVE_EXECUTION_ENABLED)
+        or (not TOPSTEPX_DRY_RUN and TOPSTEPX_ENABLE_ORDER_ROUTING and LIVE_EXECUTION_ENABLED)
+    )
+    execution_mode_label = "DRY_RUN" if TOPSTEPX_DRY_RUN else "ROUTED_PRACTICE"
+    add_check(
+        "execution_mode_explicit",
+        execution_mode_valid,
+        (
+            f"mode={execution_mode_label}, "
+            f"TOPSTEPX_DRY_RUN={TOPSTEPX_DRY_RUN}, "
+            f"TOPSTEPX_ENABLE_ORDER_ROUTING={TOPSTEPX_ENABLE_ORDER_ROUTING}, "
+            f"LIVE_EXECUTION_ENABLED={LIVE_EXECUTION_ENABLED}"
+        ),
+    )
     add_check("data_path_exists", os.path.exists(DATA_PATH),
               DATA_PATH)
     add_check("commission_positive", COMMISSION_PER_CONTRACT > 0,
@@ -965,18 +1001,22 @@ def fvg_distance_to_level_ticks(fvg: FVG, level_price: float) -> float:
 
 def _is_in_session(dt_ct) -> bool:
     from datetime import time as dtime
+    if getattr(dt_ct, "weekday", lambda: 7)() >= 5:
+        return False
     t      = dt_ct.time()
+    start  = dtime(LIVE_TRADE_WINDOW_START_H, LIVE_TRADE_WINDOW_START_M)
     cutoff = dtime(HARD_FLATTEN_H, HARD_FLATTEN_M)
-    reopen = dtime(SESSION_OPEN_H, SESSION_OPEN_M)
-    return not (cutoff <= t < reopen)
+    return start <= t < cutoff
 
 
 def _is_entry_allowed(dt_ct) -> bool:
     from datetime import time as dtime
+    if getattr(dt_ct, "weekday", lambda: 7)() >= 5:
+        return False
     t      = dt_ct.time()
+    start  = dtime(LIVE_TRADE_WINDOW_START_H, LIVE_TRADE_WINDOW_START_M)
     cutoff = dtime(ENTRY_CUTOFF_H, ENTRY_CUTOFF_M)
-    reopen = dtime(SESSION_OPEN_H, SESSION_OPEN_M)
-    return not (cutoff <= t < reopen)
+    return start <= t < cutoff
 
 
 def _passes_strategy_filters(
@@ -1033,6 +1073,49 @@ def _passes_strategy_filters(
     return True
 
 
+def _detect_prior_sweep(
+    df: pd.DataFrame,
+    current_bar_idx: int,
+    session_date: object,
+    session_level_data: dict,
+    lookback_bars: int = 10,
+    min_sweep_pts: float = 3.0,
+    max_sweep_pts: float = 8.0,
+) -> dict:
+    """
+    Look back up to lookback_bars within the current session to detect if a
+    key level (PDH/PDL/globex high/low) was swept (wick crossed by
+    min_sweep_pts–max_sweep_pts NQ points) with bar closing back inside.
+    Returns {"swept": bool, "level": str, "bars_ago": int}.
+    """
+    levels = {
+        "prev_day_high": float(session_level_data.get("prev_day_high", 0.0)),
+        "prev_day_low":  float(session_level_data.get("prev_day_low", 0.0)),
+        "globex_high":   float(session_level_data.get("globex_high", 0.0)),
+        "globex_low":    float(session_level_data.get("globex_low", 0.0)),
+    }
+
+    start = max(0, current_bar_idx - lookback_bars)
+    window = df.iloc[start:current_bar_idx]
+
+    for bars_ago, (ts, bar) in enumerate(reversed(list(window.iterrows())), 1):
+        if ts.date() != session_date:
+            continue
+        for level_name, level_price in levels.items():
+            if level_price <= 0:
+                continue
+            if level_name.endswith("_high"):
+                sweep_pts = float(bar["high"]) - level_price
+                closed_inside = float(bar["close"]) < level_price
+            else:
+                sweep_pts = level_price - float(bar["low"])
+                closed_inside = float(bar["close"]) > level_price
+            if min_sweep_pts <= sweep_pts <= max_sweep_pts and closed_inside:
+                return {"swept": True, "level": level_name, "bars_ago": bars_ago}
+
+    return {"swept": False, "level": "", "bars_ago": 0}
+
+
 def _compute_fvg_quality_score(
     prev_row,
     dt_ct,
@@ -1040,6 +1123,7 @@ def _compute_fvg_quality_score(
     entry_fvg: Optional[FVG],
     current_bar: int,
     session_level_data: Optional[dict] = None,
+    sweep_result: Optional[dict] = None,
 ) -> dict:
     if not FVG_QUALITY_SCORE_ENABLED or entry_fvg is None:
         return {"score": 0, "flags": ""}
@@ -1124,6 +1208,10 @@ def _compute_fvg_quality_score(
             if favorable_half_ok:
                 score += 1
                 flags.append("react")
+
+    if sweep_result and sweep_result.get("swept"):
+        score += 1
+        flags.append("sweep")
 
     return {"score": score, "flags": "|".join(flags)}
 
@@ -1322,6 +1410,56 @@ def _build_vwap_mr_setup(prev_row, current_price: float, dt_ct, active_fvgs, cur
     }
 
     return None
+
+
+def _is_vwap_ext_window(dt_ct) -> bool:
+    from datetime import time as dtime
+    t     = dt_ct.time()
+    start = dtime(VWAP_EXT_WINDOW_START[0], VWAP_EXT_WINDOW_START[1])
+    end   = dtime(VWAP_EXT_WINDOW_END[0],   VWAP_EXT_WINDOW_END[1])
+    return start <= t <= end
+
+
+def _build_vwap_ext_setup(prev_row, bar_2, current_price: float, dt_ct):
+    """Module E: short when price is >= 1.2x ATR above VWAP in the PM session,
+    with 2-bar bearish momentum confirmation. ATR regime gate is enforced by
+    the caller (profile["contracts"] > 0 required before calling)."""
+    if not VWAP_EXT_ENABLED or not _is_vwap_ext_window(dt_ct):
+        return None
+
+    for field_name in ("vwap", "atr", "open", "close"):
+        if field_name not in prev_row or pd.isna(prev_row[field_name]):
+            return None
+        if field_name in ("open", "close") and (field_name not in bar_2 or pd.isna(bar_2[field_name])):
+            return None
+
+    vwap = float(prev_row["vwap"])
+    atr  = float(prev_row["atr"])
+    if vwap <= 0 or atr <= 0:
+        return None
+
+    # Price must be extended >= 1.2x ATR above VWAP
+    vwap_distance = current_price - vwap
+    if vwap_distance < VWAP_EXT_MIN_ATR_MULT * atr:
+        return None
+
+    # 2-bar bearish momentum: both prior bars closed below their opens
+    if not (float(prev_row["close"]) < float(prev_row["open"])
+            and float(bar_2["close"]) < float(bar_2["open"])):
+        return None
+
+    stop_ticks   = max(1, int(VWAP_EXT_STOP_ATR_MULT  * atr / MNQ_TICK_SIZE))
+    target_ticks = max(1, int(VWAP_EXT_TARGET_ATR_MULT * atr / MNQ_TICK_SIZE))
+    stop_price   = current_price + stop_ticks * MNQ_TICK_SIZE
+
+    return {
+        "direction":      "short",
+        "target_ticks":   target_ticks,
+        "stop_price":     stop_price,
+        "vwap":           vwap,
+        "atr":            atr,
+        "vwap_distance":  vwap_distance,
+    }
 
 
 def _is_od_drive_bar(dt_ct) -> bool:
@@ -1993,6 +2131,10 @@ def run_backtest(
             elif hit_stop:
                 exit_price  = stop_px
                 exit_reason = "stop"
+            elif (entry_type == "VWAP_EXT"
+                  and (i - entry_bar_idx) >= VWAP_EXT_MAX_BARS):
+                exit_price  = row["open"]
+                exit_reason = "time_exit"
             elif ((direction == "long"  and not prev_row["long_signal"]) or
                   (direction == "short" and not prev_row["short_signal"])):
                 exit_price  = row["open"]
@@ -2055,6 +2197,7 @@ def run_backtest(
             entry_dir      = None
             this_entry_type = None
             vwap_mr_setup  = None
+            vwap_ext_setup = None
             od_setup       = None
             fb_setup       = None
 
@@ -2183,6 +2326,22 @@ def run_backtest(
                         entry_dir = vwap_mr_setup["direction"]
                         this_entry_type = "VWAP_MR"
 
+            if (entry_dir is None
+                    and VWAP_EXT_ENABLED
+                    and profile["contracts"] > 0
+                    and state.daily_trades < STRONG_MAX_TRADES):
+                vwap_ext_trades_today = sum(1 for t in day_trades_list if t.entry_type == "VWAP_EXT")
+                if vwap_ext_trades_today < VWAP_EXT_MAX_TRADES_PER_DAY:
+                    vwap_ext_setup = _build_vwap_ext_setup(
+                        prev_row=prev_row,
+                        bar_2=bar_2,
+                        current_price=current_price,
+                        dt_ct=date_ct,
+                    )
+                    if vwap_ext_setup is not None:
+                        entry_dir       = vwap_ext_setup["direction"]
+                        this_entry_type = "VWAP_EXT"
+
             if entry_dir is None:
                 portfolio.append(cash)
                 continue
@@ -2203,6 +2362,19 @@ def run_backtest(
             # ORB with strong regime: 5 contracts
             # ORB without strong regime: 3 contracts (ORB_INDEPENDENT_CONTRACTS)
             # FVG: uses regime profile contracts
+            sweep_result = _detect_prior_sweep(
+                df=df,
+                current_bar_idx=i,
+                session_date=session_date,
+                session_level_data=sl,
+            ) if this_entry_type == "FVG" else {"swept": False, "level": "", "bars_ago": 0}
+
+            if (FVG_BLOCK_SWEEP_LEVELS
+                    and sweep_result.get("swept")
+                    and sweep_result.get("level") in FVG_BLOCK_SWEEP_LEVELS):
+                portfolio.append(cash)
+                continue
+
             fvg_quality = _compute_fvg_quality_score(
                 prev_row=prev_row,
                 dt_ct=date_ct,
@@ -2210,6 +2382,7 @@ def run_backtest(
                 entry_fvg=entry_fvg,
                 current_bar=i,
                 session_level_data=sl,
+                sweep_result=sweep_result,
             )
 
             peak_equity  = state.eod_high_balance
@@ -2228,6 +2401,8 @@ def run_backtest(
                 base_contracts = FB_CONTRACTS
             elif this_entry_type == "VWAP_MR":
                 base_contracts = VWAP_MR_CONTRACTS
+            elif this_entry_type == "VWAP_EXT":
+                base_contracts = VWAP_EXT_CONTRACTS
             else:
                 base_contracts = profile["contracts"]
             if drawdown_pct > -2.5:
@@ -2285,6 +2460,9 @@ def run_backtest(
                 elif this_entry_type == "VWAP_MR":
                     fvg_stop = vwap_mr_setup["stop_price"]
                     target_ticks = int(vwap_mr_setup["target_ticks"])
+                elif this_entry_type == "VWAP_EXT":
+                    fvg_stop = vwap_ext_setup["stop_price"]
+                    target_ticks = int(vwap_ext_setup["target_ticks"])
                 else:
                     # FVG stop: beyond FVG boundary
                     if entry_dir == "long":
@@ -2310,8 +2488,12 @@ def run_backtest(
                 entry_regime = od_setup["regime"]
             elif this_entry_type == "FAILED_BREAKOUT":
                 entry_regime = fb_setup["regime"]
-            else:
+            elif this_entry_type == "VWAP_MR":
                 entry_regime = vwap_mr_setup["regime"]
+            elif this_entry_type == "VWAP_EXT":
+                entry_regime = "mean_revert"
+            else:
+                entry_regime = profile["regime"]
             in_trade     = True
             direction    = entry_dir
             entry_price  = current_price
@@ -2385,6 +2567,9 @@ def run_backtest(
                 "fvg_type":                    (entry_fvg.direction if entry_fvg else ""),
                 "fvg_quality_score":           (int(fvg_quality["score"]) if entry_fvg else 0),
                 "fvg_quality_flags":           (str(fvg_quality["flags"]) if entry_fvg else ""),
+                "sweep_preceded":              sweep_result.get("swept", False),
+                "sweep_level":                 sweep_result.get("level", ""),
+                "sweep_bars_ago":              sweep_result.get("bars_ago", 0),
                 "orb_range_ticks":             orb.range_ticks if orb.formed else 0.0,
                 "orb_high":                    orb.high if orb.formed else 0.0,
                 "orb_low":                     orb.low  if orb.formed else 0.0,
@@ -2555,6 +2740,9 @@ def _build_trade_record(
         fvg_type               = snap.get("fvg_type", ""),
         fvg_quality_score      = snap.get("fvg_quality_score", 0),
         fvg_quality_flags      = snap.get("fvg_quality_flags", ""),
+        sweep_preceded         = snap.get("sweep_preceded", False),
+        sweep_level            = snap.get("sweep_level", ""),
+        sweep_bars_ago         = snap.get("sweep_bars_ago", 0),
         orb_range_ticks        = snap.get("orb_range_ticks", 0.0),
         orb_high               = snap.get("orb_high", 0.0),
         orb_low                = snap.get("orb_low", 0.0),
@@ -3074,6 +3262,72 @@ def monte_carlo(stats: dict) -> dict:
 
 # ── EXPORT ────────────────────────────────────────────────────────────────────
 
+def print_vwap_ext_slice(trades: List[TradeRecord], limit: int = VWAP_EXT_DEBUG_PRINT_LIMIT) -> None:
+    ext_trades = [t for t in trades if t.entry_type == "VWAP_EXT"]
+
+    print("\n  VWAP EXT (MODULE E) DIAGNOSTIC")
+    print("=" * 60)
+    if not ext_trades:
+        print("  No VWAP EXT trades in this run.")
+        print("=" * 60)
+        return
+
+    total_pnl = sum(t.pnl_usd for t in ext_trades)
+    win_rate  = np.mean([t.won for t in ext_trades]) * 100
+    wins  = [t for t in ext_trades if t.won]
+    losses = [t for t in ext_trades if not t.won]
+    avg_win  = np.mean([t.pnl_usd for t in wins])  if wins   else 0.0
+    avg_loss = np.mean([t.pnl_usd for t in losses]) if losses else 0.0
+    pf = abs(sum(t.pnl_usd for t in wins) / sum(t.pnl_usd for t in losses)) if losses else float("inf")
+    years = sorted({str(t.date)[:4] for t in ext_trades})
+
+    print(f"  {'VWAP EXT trades':<28} {len(ext_trades):>6}")
+    print(f"  {'Win rate':<28} {win_rate:>6.2f}%")
+    print(f"  {'Net P&L':<28} ${total_pnl:>10,.2f}")
+    print(f"  {'Avg P&L / trade':<28} ${total_pnl / len(ext_trades):>10,.2f}")
+    print(f"  {'Avg win':<28} ${avg_win:>10,.2f}")
+    print(f"  {'Avg loss':<28} ${avg_loss:>10,.2f}")
+    print(f"  {'Profit factor':<28} {pf:>10.2f}")
+    print(f"  {'Avg bars to exit':<28} {np.mean([t.bars_to_exit for t in ext_trades]):>10.2f}")
+    print("-" * 60)
+    print("  By exit reason:")
+    reason_groups: dict = {}
+    for t in ext_trades:
+        reason_groups.setdefault(t.exit_reason, []).append(t)
+    for reason in sorted(reason_groups):
+        grp = reason_groups[reason]
+        print(
+            f"    {reason:<16}  trades={len(grp):>3}  "
+            f"wr={np.mean([x.won for x in grp]) * 100:>6.2f}%  "
+            f"pnl=${sum(x.pnl_usd for x in grp):>8,.2f}"
+        )
+    print("-" * 60)
+    print("  By year:")
+    for yr in years:
+        grp = [t for t in ext_trades if str(t.date)[:4] == yr]
+        print(
+            f"    {yr}  trades={len(grp):>3}  "
+            f"wr={np.mean([x.won for x in grp]) * 100:>6.2f}%  "
+            f"pnl=${sum(x.pnl_usd for x in grp):>8,.2f}"
+        )
+    print("-" * 60)
+    print("  Sample trades:")
+    print("    date               side   entry     exit      pnl    bars  reason")
+    for t in ext_trades[:limit]:
+        print(
+            f"    {str(t.date)[:16]:<16} "
+            f"{t.direction:<5} "
+            f"{t.entry:>8.2f} "
+            f"{t.exit:>8.2f} "
+            f"{t.pnl_usd:>8.2f} "
+            f"{t.bars_to_exit:>5} "
+            f"{t.exit_reason}"
+        )
+    if len(ext_trades) > limit:
+        print(f"  ... showing first {limit} of {len(ext_trades)} VWAP EXT trades")
+    print("=" * 60)
+
+
 def print_vwap_mr_slice(trades: List[TradeRecord], limit: int = VWAP_MR_DEBUG_PRINT_LIMIT) -> None:
     vwap_trades = [t for t in trades if t.entry_type == "VWAP_MR"]
 
@@ -3427,6 +3681,29 @@ def print_fvg_quality_score_diagnostic(trades: List[TradeRecord]) -> None:
     print(f"  Score model                 {'ON' if FVG_QUALITY_SCORE_ENABLED else 'OFF'}")
     score_df = _build_group_stats(fvg, ["fvg_quality_score"]).sort_values("fvg_quality_score")
     _print_segment_lines("By score", score_df, ["fvg_quality_score"])
+
+    # Sweep segmentation
+    if "sweep_preceded" in fvg.columns:
+        sweep_fvg  = fvg[fvg["sweep_preceded"] == True]
+        plain_fvg  = fvg[fvg["sweep_preceded"] == False]
+        print(f"\n  POST-SWEEP FVG SEGMENTATION  (lookback=10 bars, 3-8 NQ pts)")
+        print(f"  {'':30} {'Count':>6} {'WR%':>6} {'AvgPnL':>8} {'NetPnL':>10}")
+        for label, grp in [("Sweep-preceded", sweep_fvg), ("Non-sweep", plain_fvg), ("All FVG", fvg)]:
+            if grp.empty:
+                continue
+            wr  = grp["won"].mean() * 100
+            avg = grp["pnl_usd"].mean()
+            net = grp["pnl_usd"].sum()
+            n   = len(grp)
+            print(f"  {label:<30} {n:>6} {wr:>5.1f}% {avg:>8.2f} {net:>10,.0f}")
+
+        if not sweep_fvg.empty:
+            print(f"\n  Sweep level breakdown:")
+            for lvl, grp in sweep_fvg.groupby("sweep_level"):
+                wr  = grp["won"].mean() * 100
+                avg = grp["pnl_usd"].mean()
+                print(f"    {lvl:<28} n={len(grp):>4}  WR={wr:.1f}%  avg=${avg:.2f}")
+
     print("=" * 60)
 
 
@@ -3756,17 +4033,19 @@ def main(args=None):
     df, trades, daily_records, state = run_backtest(df, session_levels)
     print(f"  Backtest complete: {len(trades)} trades, {len(daily_records)} sessions.")
 
-    orb_count = sum(1 for t in trades if t.entry_type == "ORB")
-    fb_count = sum(1 for t in trades if t.entry_type == "FAILED_BREAKOUT")
-    od_count = sum(1 for t in trades if t.entry_type == "OD_PULLBACK")
-    fvg_count = sum(1 for t in trades if t.entry_type == "FVG")
+    orb_count  = sum(1 for t in trades if t.entry_type == "ORB")
+    fb_count   = sum(1 for t in trades if t.entry_type == "FAILED_BREAKOUT")
+    od_count   = sum(1 for t in trades if t.entry_type == "OD_PULLBACK")
+    fvg_count  = sum(1 for t in trades if t.entry_type == "FVG")
     vwap_count = sum(1 for t in trades if t.entry_type == "VWAP_MR")
+    vext_count = sum(1 for t in trades if t.entry_type == "VWAP_EXT")
     print(
         f"  ORB trades: {orb_count}"
         f"  |  FB trades: {fb_count}"
         f"  |  OD trades: {od_count}"
         f"  |  FVG trades: {fvg_count}"
         f"  |  VWAP trades: {vwap_count}"
+        f"  |  VWAP_EXT trades: {vext_count}"
     )
 
     monthly_records = build_monthly_records(daily_records, trades)
@@ -3778,6 +4057,7 @@ def main(args=None):
     print_failed_breakout_cap_diagnostic(state)
     print_od_pullback_slice(trades)
     print_vwap_mr_slice(trades)
+    print_vwap_ext_slice(trades)
     print_fvg_quality_score_diagnostic(trades)
     print_analysis_highlights(trades)
 
