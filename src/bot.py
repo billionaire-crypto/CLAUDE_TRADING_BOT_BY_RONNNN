@@ -271,6 +271,8 @@ FOMC_DATES = {
     "2024-07-31","2024-09-18","2024-11-07","2024-12-18","2025-01-29",
     "2025-03-19","2025-05-07","2025-06-18","2025-07-30","2025-09-17",
     "2025-11-05","2025-12-17","2026-01-28","2026-03-18",
+    "2026-05-06","2026-06-17","2026-07-29","2026-09-16",
+    "2026-11-04","2026-12-16",
 }
 CPI_DATES = {
     "2019-01-11","2019-02-13","2019-03-12","2019-04-10","2019-05-10",
@@ -290,7 +292,9 @@ CPI_DATES = {
     "2024-11-13","2024-12-11","2025-01-15","2025-02-12","2025-03-12",
     "2025-04-10","2025-05-13","2025-06-11","2025-07-15","2025-08-12",
     "2025-09-10","2025-10-15","2025-11-13","2025-12-10","2026-01-14",
-    "2026-02-11","2026-03-11",
+    "2026-02-11","2026-03-11","2026-04-10","2026-05-13",
+    "2026-06-11","2026-07-15","2026-08-12","2026-09-10",
+    "2026-10-14","2026-11-12","2026-12-10",
 }
 NFP_DATES = {
     "2019-01-04","2019-02-01","2019-03-08","2019-04-05","2019-05-03",
@@ -310,7 +314,9 @@ NFP_DATES = {
     "2024-11-01","2024-12-06","2025-01-10","2025-02-07","2025-03-07",
     "2025-04-04","2025-05-02","2025-06-06","2025-07-03","2025-08-01",
     "2025-09-05","2025-10-03","2025-11-07","2025-12-05","2026-01-09",
-    "2026-02-06","2026-03-06",
+    "2026-02-06","2026-03-06","2026-04-03","2026-05-08",
+    "2026-06-05","2026-07-03","2026-08-07","2026-09-04",
+    "2026-10-02","2026-11-06","2026-12-04",
 }
 ALL_NEWS_DATES = FOMC_DATES | CPI_DATES | NFP_DATES
 
@@ -1910,6 +1916,40 @@ def run_backtest(
 
         # ── Day rollover ──────────────────────────────────────────────────────
         if current_day != session_date:
+            # Close any position carried into a new session at the prior bar's close
+            if in_trade and current_day is not None:
+                exit_price    = float(prev_row["close"])
+                pnl_pts       = (exit_price - entry_price) if direction == "long" else (entry_price - exit_price)
+                gross_pnl_usd = pnl_pts * MNQ_POINT_VALUE * contracts
+                costs_usd     = round_turn_cost(contracts)
+                pnl_usd       = gross_pnl_usd - costs_usd
+                pnl_pct       = pnl_pts / entry_price
+                won           = pnl_usd > 0
+                cash         += pnl_usd
+                state.update(won, pnl_pct, pnl_usd)
+                if cash > day_peak_cash:   day_peak_cash   = cash
+                if cash < day_trough_cash: day_trough_cash = cash
+                tr = _build_trade_record(
+                    entry_snapshot=entry_snapshot,
+                    date=df.index[i - 1],
+                    direction=direction,
+                    entry_price=entry_price, exit_price=exit_price,
+                    pnl_pts=pnl_pts, gross_pnl_usd=gross_pnl_usd,
+                    costs_usd=costs_usd, pnl_usd=pnl_usd,
+                    pnl_pct=pnl_pct, won=won, cash=cash,
+                    contracts=contracts, entry_regime=entry_regime,
+                    exit_reason="eod_flatten", fvg_stop=fvg_stop,
+                    trade_mae=trade_mae, trade_mfe=trade_mfe,
+                    bars_to_exit=(i - 1) - entry_bar_idx, state=state,
+                )
+                trades.append(tr)
+                day_trades_list.append(tr)
+                if won: consecutive_wins += 1; consecutive_losses = 0
+                else:   consecutive_losses += 1; consecutive_wins = 0
+                in_trade  = False
+                trade_mfe = 0.0
+                trade_mae = 0.0
+
             if current_day is not None:
                 state.end_of_day(cash)
                 sl = session_levels.get(current_day, {})
@@ -3098,7 +3138,7 @@ def print_stats(
     print(f"  {'Sharpe Ratio':<30} {stats['sharpe']:>12.2f}")
     print(f"  {'Sortino Ratio':<30} {stats['sortino']:>12.2f}")
     print(f"  {'Profit Factor':<30} {stats['profit_factor']:>12.2f}")
-    print(f"  {'Floor Breached':<30} {'YES ⚠️' if stats['floor_breached'] else 'NO ✅':>12}")
+    print(f"  {'Floor Breached':<30} {'YES (!)' if stats['floor_breached'] else 'NO':>12}")
     print(f"  {'Min Buffer Over Floor':<30} ${stats['min_buffer_over_floor']:>11,.2f}")
     print("-" * 60)
     print(f"  {'Total Trades':<30} {stats['num_trades']:>12}")

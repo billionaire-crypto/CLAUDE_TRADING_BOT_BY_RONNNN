@@ -40,7 +40,7 @@ def load_mes_data(filepath: str) -> pd.DataFrame:
     df_5m = df_5m[['open', 'high', 'low', 'close', 'volume']]
 
     print(f"Done! {len(df_5m):,} 5-minute bars loaded")
-    print(f"Date range: {df_5m.index[0]} → {df_5m.index[-1]}")
+    print(f"Date range: {df_5m.index[0]} to {df_5m.index[-1]}")
     print(df_5m.head())
 
     return df_5m
