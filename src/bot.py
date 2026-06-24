@@ -32,7 +32,13 @@ warnings.filterwarnings("ignore")
 from src.load_data import load_mes_data
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-DATA_PATH       = r"C:\Users\kyawz\Downloads\GLBX-20260331-885WT5W7KA\glbx-mdp3-20100606-20260329.ohlcv-1m.csv"
+# Path to the 1-minute OHLCV market-data CSV used for backtesting.
+# Set the MNQ_DATA_PATH environment variable to point at your own file;
+# otherwise it falls back to the original author's Windows download path.
+DATA_PATH       = os.environ.get(
+    "MNQ_DATA_PATH",
+    r"C:\Users\kyawz\Downloads\GLBX-20260331-885WT5W7KA\glbx-mdp3-20100606-20260329.ohlcv-1m.csv",
+)
 INIT_CASH       = 50_000.0
 RUN_MODE        = "BACKTEST"
 EXECUTION_PROFILE = "CONSERVATIVE"

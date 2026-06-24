@@ -1,28 +1,23 @@
 # ============================================================
-# Trading Bot - Python Dependencies
+# Trading Bot V29 - Python Dependencies
 # Install with: pip install -r requirements.txt
 # ============================================================
+# This list matches what the code actually imports.
 
-# Exchange connectivity
-ccxt>=4.0.0
-
-# Environment variable loading
-python-dotenv>=1.0.0
-
-# Data analysis
+# Data analysis (strategy engine + backtest)
 pandas>=2.0.0
 numpy>=1.24.0
 
-# Technical indicators (uncomment whichever you use)
-# ta>=0.11.0             # Simple TA library
-# pandas-ta>=0.3.14b     # Pandas-based TA
-# ta-lib>=0.4.28         # Full TA-Lib (requires C install)
+# Timezone handling (America/Chicago session logic)
+pytz>=2023.3
+# Ensures timezone database is available on minimal systems (used by pandas)
+tzdata>=2023.3
 
-# Scheduling / automation
-schedule>=1.2.0
+# Charts / analytics output
+plotly>=5.18.0
 
-# Telegram notifications (optional)
-# python-telegram-bot>=20.0
+# TopstepX live connection (real-time user hub)
+websocket-client>=1.7.0
 
-# Logging extras (optional)
-# colorlog>=6.7.0
+# Decompressing the raw market-data download (.csv.zst)
+zstandard>=0.22.0
