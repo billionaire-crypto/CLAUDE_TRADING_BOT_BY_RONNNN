@@ -10,6 +10,36 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+
+def _load_dotenv_file() -> None:
+    """Load key=value pairs from a project-root .env into the environment.
+
+    The bot reads every credential/setting from environment variables, but
+    nothing else loads the .env file the user is told to create. This tiny
+    parser fills that gap with no third-party dependency. Real environment
+    variables always win over the .env file.
+    """
+    env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        # A missing or unreadable .env should never crash startup.
+        pass
+
+
+_load_dotenv_file()
+
 from src import bot
 from src.topstepx_client import (
     TopstepXAPIError,
