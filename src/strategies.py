@@ -310,6 +310,181 @@ class TurtleSoup(Strategy):
         return None
 
 
+# ── Choppy candidate 1: failed break of YESTERDAY's RTH extreme ──────────────
+class RangeEdgeFade(Strategy):
+    """Fade a failed poke beyond yesterday's RTH high/low (a level the market
+    respects) back toward VWAP. Trapped-breakout reversal — only at proven
+    levels, unlike the statistical-stretch fades."""
+
+    name = "Range-edge-fade"
+
+    def __init__(self):
+        self.prior_high = None
+        self.prior_low = None
+        self._cur_high = None
+        self._cur_low = None
+
+    def reset_session(self, session_date):
+        if self._cur_high is not None:
+            self.prior_high = self._cur_high
+            self.prior_low = self._cur_low
+        self._cur_high = None
+        self._cur_low = None
+
+    def observe(self, i, row, prev_row, bar_2, ctx):
+        h, l = float(row["high"]), float(row["low"])
+        self._cur_high = h if self._cur_high is None else max(self._cur_high, h)
+        self._cur_low = l if self._cur_low is None else min(self._cur_low, l)
+
+    def entry(self, i, row, prev_row, bar_2, ctx):
+        if self.prior_high is None or pd.isna(prev_row["vwap"]):
+            return None
+        price = float(row["open"])
+        vwap = float(prev_row["vwap"])
+        if float(prev_row["high"]) > self.prior_high and float(prev_row["close"]) < self.prior_high and vwap < price:
+            stop = _cap_short_stop(price, float(prev_row["high"]) + TICK)
+            if stop - price <= 0:
+                return None
+            return EntrySignal("short", stop, self.name, exit_on_trend_flip=False, target_price=vwap)
+        if float(prev_row["low"]) < self.prior_low and float(prev_row["close"]) > self.prior_low and vwap > price:
+            stop = _cap_long_stop(price, float(prev_row["low"]) - TICK)
+            if price - stop <= 0:
+                return None
+            return EntrySignal("long", stop, self.name, exit_on_trend_flip=False, target_price=vwap)
+        return None
+
+
+# ── Choppy candidate 2: expansion breakout out of a squeeze ──────────────────
+class SqueezeBreakout(Strategy):
+    """After a low-volatility coil (Bollinger inside Keltner = squeeze), trade the
+    bar that closes outside the Bollinger band in the breakout direction. Flips
+    the chop thesis: quiet precedes expansion. Shared 2R target."""
+
+    name = "Squeeze-breakout"
+    LOOKBACK = 6  # a squeeze within the last N closed bars still qualifies
+
+    def __init__(self):
+        self._since_squeeze = 999
+
+    def reset_session(self, session_date):
+        self._since_squeeze = 999
+
+    def observe(self, i, row, prev_row, bar_2, ctx):
+        sq = prev_row["squeeze"]
+        if bool(sq):
+            self._since_squeeze = 0
+        else:
+            self._since_squeeze += 1
+
+    def entry(self, i, row, prev_row, bar_2, ctx):
+        if self._since_squeeze > self.LOOKBACK:
+            return None
+        bb_u, bb_l, close = prev_row["bb_upper"], prev_row["bb_lower"], prev_row["close"]
+        if not _ok(bb_u, bb_l, close):
+            return None
+        price = float(row["open"])
+        if float(close) > float(bb_u):
+            stop = _cap_long_stop(price, float(bb_l))
+            if price - stop <= 0:
+                return None
+            return EntrySignal("long", stop, self.name, exit_on_trend_flip=False)
+        if float(close) < float(bb_l):
+            stop = _cap_short_stop(price, float(bb_u))
+            if stop - price <= 0:
+                return None
+            return EntrySignal("short", stop, self.name, exit_on_trend_flip=False)
+        return None
+
+
+# ── Choppy candidate 3: failed poke outside the first-hour range ─────────────
+class OpeningRangeFade(Strategy):
+    """Fade a failed break of the 08:30-09:30 CT opening range (= the first RTH
+    hour, 09:30-10:30 ET), back to its midpoint. One fade per side per day."""
+
+    name = "OR-fade"
+    FORM_START = dtime(8, 30)
+    FORM_END = dtime(9, 30)
+
+    def reset_session(self, session_date):
+        self.or_high = None
+        self.or_low = None
+        self.or_mid = None
+        self.formed = False
+        self.faded_high = False
+        self.faded_low = False
+
+    def observe(self, i, row, prev_row, bar_2, ctx):
+        t = ctx.ts_ct.time()
+        if self.FORM_START <= t < self.FORM_END:
+            h, l = float(row["high"]), float(row["low"])
+            self.or_high = h if self.or_high is None else max(self.or_high, h)
+            self.or_low = l if self.or_low is None else min(self.or_low, l)
+        elif t >= self.FORM_END and not self.formed and self.or_high is not None:
+            self.formed = True
+            self.or_mid = (self.or_high + self.or_low) / 2.0
+
+    def entry(self, i, row, prev_row, bar_2, ctx):
+        if not self.formed:
+            return None
+        price = float(row["open"])
+        if (not self.faded_high and float(prev_row["high"]) > self.or_high
+                and float(prev_row["close"]) < self.or_high and self.or_mid < price):
+            stop = _cap_short_stop(price, float(prev_row["high"]) + TICK)
+            if stop - price <= 0:
+                return None
+            return EntrySignal("short", stop, self.name, {"side": "high"},
+                               exit_on_trend_flip=False, target_price=self.or_mid)
+        if (not self.faded_low and float(prev_row["low"]) < self.or_low
+                and float(prev_row["close"]) > self.or_low and self.or_mid > price):
+            stop = _cap_long_stop(price, float(prev_row["low"]) - TICK)
+            if price - stop <= 0:
+                return None
+            return EntrySignal("long", stop, self.name, {"side": "low"},
+                               exit_on_trend_flip=False, target_price=self.or_mid)
+        return None
+
+    def confirm(self, signal):
+        if signal.meta.get("side") == "high":
+            self.faded_high = True
+        elif signal.meta.get("side") == "low":
+            self.faded_low = True
+
+
+# ── Choppy candidate 4: VWAP reversion gated to the midday lull ──────────────
+class LunchLullReversion(Strategy):
+    """The VWAP-stretch fade, allowed ONLY in the calm midday window
+    (10:30-12:30 CT ~ 11:30-13:30 ET). The time gate IS the experiment: does
+    reversion that fails all-day work when the market is at its quietest?"""
+
+    name = "Lunch-reversion"
+    LULL_START = dtime(10, 30)
+    LULL_END = dtime(12, 30)
+    STRETCH_ATR = 1.5
+    RSI_OS = 15
+    RSI_OB = 85
+
+    def entry(self, i, row, prev_row, bar_2, ctx):
+        t = ctx.ts_ct.time()
+        if not (self.LULL_START <= t < self.LULL_END):
+            return None
+        vwap, close, atr, rsi2 = prev_row["vwap"], prev_row["close"], prev_row["atr"], prev_row["rsi2"]
+        if not _ok(vwap, close, atr, rsi2) or float(atr) <= 0:
+            return None
+        price = float(row["open"])
+        vwap = float(vwap)
+        if (vwap - float(close)) >= self.STRETCH_ATR * float(atr) and float(rsi2) < self.RSI_OS and vwap > price:
+            stop = _cap_long_stop(price, float(prev_row["low"]) - TICK)
+            if price - stop <= 0:
+                return None
+            return EntrySignal("long", stop, self.name, exit_on_trend_flip=False, target_price=vwap)
+        if (float(close) - vwap) >= self.STRETCH_ATR * float(atr) and float(rsi2) > self.RSI_OB and vwap < price:
+            stop = _cap_short_stop(price, float(prev_row["high"]) + TICK)
+            if stop - price <= 0:
+                return None
+            return EntrySignal("short", stop, self.name, exit_on_trend_flip=False, target_price=vwap)
+        return None
+
+
 # ── Trend engine: VWAP cross with EMA-trend filter (highest-evidence, low-param) ─
 class VWAPCross(Strategy):
     """Enter on a close-confirmed cross of VWAP in the direction of the EMA trend.
@@ -389,6 +564,10 @@ def build_candidates():
         MeanReversionVWAP(),
         KeltnerRSIFade(),
         TurtleSoup(),
+        RangeEdgeFade(),
+        SqueezeBreakout(),
+        OpeningRangeFade(),
+        LunchLullReversion(),
     ]
 
 
