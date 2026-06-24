@@ -26,12 +26,14 @@ import numpy as np
 import pandas as pd
 
 from src import bot
+from src import regime
 from src import strategies
 from src import evaluate
+from src import combine_sim
 
 TICK = bot.MNQ_TICK_SIZE
-DAYS_PER_SIM = 90            # ~4.5 months of trading days per simulation
-SEEDS_PER_REGIME = 8        # independent random paths per regime
+DAYS_PER_SIM = 60            # ~3 months of trading days per simulation
+SEEDS_PER_REGIME = 4        # independent random paths per regime (kept small: the
 BARS_PER_DAY = 78          # 5-min RTH bars, 09:30-16:00 Eastern
 
 # Each regime is a (drift, noise_sd, mean_revert_theta) recipe per 5-min bar.
@@ -44,7 +46,7 @@ REGIMES = {
 }
 
 
-def _gen_path(regime: dict, seed: int) -> pd.DataFrame:
+def _gen_path(recipe: dict, seed: int) -> pd.DataFrame:
     """Build a synthetic OHLCV df: tz-aware US/Eastern, 5-min RTH bars."""
     rng = np.random.default_rng(seed)
     start = pd.Timestamp("2020-01-02", tz="US/Eastern")
@@ -58,11 +60,11 @@ def _gen_path(regime: dict, seed: int) -> pd.DataFrame:
                                 periods=BARS_PER_DAY, freq="5min", tz="US/Eastern")
         day_open = price
         for ts in session:
-            mean_pull = regime["theta"] * (day_open - price)
-            step = regime["drift"] + mean_pull + rng.normal(0, regime["sd"])
+            mean_pull = recipe["theta"] * (day_open - price)
+            step = recipe["drift"] + mean_pull + rng.normal(0, recipe["sd"])
             o = price
             c = o + step
-            wick = abs(rng.normal(0, regime["sd"] * 0.6))
+            wick = abs(rng.normal(0, recipe["sd"] * 0.6))
             hi = max(o, c) + wick
             lo = min(o, c) - wick
             o, c, hi, lo = (round(x / TICK) * TICK for x in (o, c, hi, lo))
@@ -76,14 +78,87 @@ def _gen_path(regime: dict, seed: int) -> pd.DataFrame:
     return df
 
 
-def _run_one(df: pd.DataFrame, candidate) -> dict:
+def _prepare(df: pd.DataFrame) -> pd.DataFrame:
     df = bot.add_indicators(df)
     df = bot.generate_signals(df)
+    df = regime.add_regime_features(df)
+    return df
+
+
+def _run_one(df: pd.DataFrame, candidate) -> dict:
+    df = _prepare(df)
     trades, _ = evaluate.backtest(df, candidate)
     n = len(trades)
     net = sum(t.pnl_usd for t in trades)
     wins = sum(1 for t in trades if t.won)
     return {"n": n, "net": net, "win_rate": (wins / n * 100) if n else 0.0}
+
+
+def _gen_mixed(seed: int, block_days: int = 70) -> pd.DataFrame:
+    """One continuous series that CYCLES through every regime in blocks, so the
+    router has all moods to switch between."""
+    rng = np.random.default_rng(seed)
+    cycle = list(REGIMES.items())
+    total_days = block_days * len(cycle)
+    days = pd.bdate_range(pd.Timestamp("2018-01-02", tz="US/Eastern"), periods=total_days)
+
+    idx, o_, h_, l_, c_, v_ = [], [], [], [], [], []
+    price = 18000.0
+    for n, d in enumerate(days):
+        recipe = cycle[(n // block_days) % len(cycle)][1]
+        session = pd.date_range(d + pd.Timedelta(hours=9, minutes=30),
+                                periods=BARS_PER_DAY, freq="5min", tz="US/Eastern")
+        day_open = price
+        for ts in session:
+            step = recipe["drift"] + recipe["theta"] * (day_open - price) + rng.normal(0, recipe["sd"])
+            o = price
+            c = o + step
+            wick = abs(rng.normal(0, recipe["sd"] * 0.6))
+            hi, lo = max(o, c) + wick, min(o, c) - wick
+            o, c, hi, lo = (round(x / TICK) * TICK for x in (o, c, hi, lo))
+            hi, lo = max(hi, o, c), min(lo, o, c)
+            idx.append(ts); o_.append(o); h_.append(hi); l_.append(lo); c_.append(c)
+            v_.append(int(abs(rng.normal(500, 150))) + 1)
+            price = c
+    return pd.DataFrame({"open": o_, "high": h_, "low": l_, "close": c_, "volume": v_},
+                        index=pd.DatetimeIndex(idx, name="ts_event"))
+
+
+def validate_router() -> None:
+    """End-to-end pipeline check on a mixed-regime synthetic series: edge grid ->
+    rulebook -> router -> discipline -> Topstep combine judge. Structural only."""
+    print("\n" + "=" * 78)
+    print("  ROUTER PIPELINE VALIDATION (mixed-regime synthetic series)")
+    print("=" * 78)
+    df = _prepare(_gen_mixed(seed=20240101))
+    counts = df["regime_class"].value_counts().to_dict()
+    print("  bars per detected regime:", {k: int(v) for k, v in counts.items()})
+
+    grid = evaluate.run_edge_grid(df, strategies.build_candidates(), end=None)
+    evaluate.print_edge_grid(grid)
+
+    rulebook = evaluate.build_rulebook(grid)
+    print("\n  RULEBOOK (regime -> strategy; others = stand aside):")
+    if not rulebook:
+        print("    (empty — no synthetic cell cleared MIN_CELL_TRADES; plumbing still proven.)")
+        return
+    for r, name in rulebook.items():
+        print(f"    {r:<10} -> {name}")
+
+    router = strategies.RegimeRouter({r: strategies.build_strategy(n) for r, n in rulebook.items()})
+    trades, _ = evaluate.backtest(df, router, discipline=evaluate.Discipline())
+    sc = evaluate.topstep_scorecard(trades)
+    if sc["n"] == 0:
+        print("\n  Router took 0 trades (stood aside everywhere). Pipeline OK.")
+        return
+    by_reg = {}
+    for t in trades:
+        by_reg[t.regime] = by_reg.get(t.regime, 0) + 1
+    print(f"\n  Router (+discipline): {sc['n']} trades, {sc['win_rate']:.0f}% win, "
+          f"${sc['net']:,.0f} net, maxDD ${sc['max_dd']:,.0f}, by regime {by_reg}")
+    combine_sim.print_report("synthetic router", combine_sim.monte_carlo(
+        combine_sim.trades_to_daily_pnl(trades)))
+    print("  (SYNTHETIC — proves the engine adapts/judges; real verdict needs real data.)")
 
 
 def main() -> None:
@@ -100,9 +175,13 @@ def main() -> None:
     for regime_name, recipe in REGIMES.items():
         regime_offset = list(REGIMES).index(regime_name) * 10_000
         for seed in range(SEEDS_PER_REGIME):
-            df = _gen_path(recipe, regime_offset + seed * 101)
+            df = _prepare(_gen_path(recipe, regime_offset + seed * 101))  # prepare ONCE
             for cand in strategies.build_candidates():
-                results[cand.name][regime_name].append(_run_one(df, cand))
+                trades, _ = evaluate.backtest(df, cand)
+                n = len(trades)
+                results[cand.name][regime_name].append({
+                    "n": n, "net": sum(t.pnl_usd for t in trades),
+                    "win_rate": (sum(1 for t in trades if t.won) / n * 100) if n else 0.0})
         print(f"  simulated regime: {regime_name}")
 
     # ── Per-regime scorecard: average NET per sim, and % of sims profitable ─────
@@ -147,6 +226,8 @@ def main() -> None:
     print("    market to keep showing up, which it won't.")
     print("  - These are SYNTHETIC results. The real test is src/evaluate.py on your data.")
     print("=" * 78)
+
+    validate_router()
 
 
 if __name__ == "__main__":

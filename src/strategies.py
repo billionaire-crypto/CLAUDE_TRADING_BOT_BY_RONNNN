@@ -36,6 +36,12 @@ class EntrySignal:
     stop_price: float          # harness derives the target from this
     entry_type: str            # label for reporting
     meta: dict = field(default_factory=dict)
+    # Trend strategies ride until the trend flips; mean-reversion fades must NOT
+    # (they enter counter-trend), so they opt out.
+    exit_on_trend_flip: bool = True
+    # Fades aim at the mean (VWAP / band middle), not a fixed 2R. If set, the
+    # harness uses this target instead of deriving 2R from the stop.
+    target_price: float = None
 
 
 def _cap_long_stop(entry_price: float, raw_stop: float) -> float:
@@ -209,11 +215,186 @@ class ORBreakout(Strategy):
         self.fired = True
 
 
-# ── Candidate registry: fresh instances per run (state is stateful) ─────────────
+# ════════════════════════════════════════════════════════════════════════════════
+#  REGIME-MATCHED STRATEGIES (read regime features from src/regime.py)
+#  Fades enter COUNTER-trend and target the mean, so exit_on_trend_flip=False and
+#  they supply their own target_price. They do NOT self-gate on regime — the edge
+#  grid measures how each behaves per regime, and the RegimeRouter does the gating.
+# ════════════════════════════════════════════════════════════════════════════════
+MR_STRETCH_ATR = 1.5           # how far from VWAP counts as "stretched"
+RSI2_OVERSOLD  = 15
+RSI2_OVERBOUGHT = 85
+KC_RSI2_OS     = 10            # tighter for the band-touch variant
+KC_RSI2_OB     = 90
+
+
+def _ok(*vals) -> bool:
+    return not any(pd.isna(v) for v in vals)
+
+
+# ── Choppy specialist 1: mean-reversion to VWAP (value) ─────────────────────────
+class MeanReversionVWAP(Strategy):
+    """In a balanced session, fade price that has stretched far from VWAP back to it.
+    Anchored to VWAP (fair value), not a band. High-win-rate / modest-target profile."""
+
+    name = "MeanRev-VWAP"
+
+    def entry(self, i, row, prev_row, bar_2, ctx):
+        vwap, close, atr, rsi2 = prev_row["vwap"], prev_row["close"], prev_row["atr"], prev_row["rsi2"]
+        if not _ok(vwap, close, atr, rsi2) or atr <= 0:
+            return None
+        price = float(row["open"])
+        if (vwap - close) >= MR_STRETCH_ATR * atr and rsi2 < RSI2_OVERSOLD and vwap > price:
+            stop = _cap_long_stop(price, float(prev_row["low"]) - TICK)
+            if price - stop <= 0:
+                return None
+            return EntrySignal("long", stop, self.name, exit_on_trend_flip=False, target_price=float(vwap))
+        if (close - vwap) >= MR_STRETCH_ATR * atr and rsi2 > RSI2_OVERBOUGHT and vwap < price:
+            stop = _cap_short_stop(price, float(prev_row["high"]) + TICK)
+            if stop - price <= 0:
+                return None
+            return EntrySignal("short", stop, self.name, exit_on_trend_flip=False, target_price=float(vwap))
+        return None
+
+
+# ── Choppy specialist 2: Keltner band touch + RSI(2) extreme ────────────────────
+class KeltnerRSIFade(Strategy):
+    """Fade a close beyond the Keltner band confirmed by an RSI(2) extreme, back to
+    the band middle. (Connors-style mean reversion, band-anchored.)"""
+
+    name = "Keltner-RSI"
+
+    def entry(self, i, row, prev_row, bar_2, ctx):
+        kc_lo, kc_hi, kc_mid = prev_row["kc_lower"], prev_row["kc_upper"], prev_row["kc_mid"]
+        close, rsi2 = prev_row["close"], prev_row["rsi2"]
+        if not _ok(kc_lo, kc_hi, kc_mid, close, rsi2):
+            return None
+        price = float(row["open"])
+        if close < kc_lo and rsi2 < KC_RSI2_OS and kc_mid > price:
+            stop = _cap_long_stop(price, float(prev_row["low"]) - TICK)
+            if price - stop <= 0:
+                return None
+            return EntrySignal("long", stop, self.name, exit_on_trend_flip=False, target_price=float(kc_mid))
+        if close > kc_hi and rsi2 > KC_RSI2_OB and kc_mid < price:
+            stop = _cap_short_stop(price, float(prev_row["high"]) + TICK)
+            if stop - price <= 0:
+                return None
+            return EntrySignal("short", stop, self.name, exit_on_trend_flip=False, target_price=float(kc_mid))
+        return None
+
+
+# ── Choppy specialist 3: failed-breakout fade (Turtle Soup, Raschke/Connors) ─────
+class TurtleSoup(Strategy):
+    """Fade a FAILED break of the prior 20-bar extreme: the prior bar swept a new
+    20-bar low/high but closed back inside the range. Self-selects false breakouts."""
+
+    name = "TurtleSoup"
+
+    def entry(self, i, row, prev_row, bar_2, ctx):
+        r_lo, r_hi, mid = prev_row["roll20_low"], prev_row["roll20_high"], prev_row["bb_mid"]
+        if not _ok(r_lo, r_hi, mid):
+            return None
+        price = float(row["open"])
+        # Failed downside break -> fade long back to the mean.
+        if float(prev_row["low"]) < r_lo and float(prev_row["close"]) > r_lo and mid > price:
+            stop = _cap_long_stop(price, float(prev_row["low"]) - TICK)
+            if price - stop <= 0:
+                return None
+            return EntrySignal("long", stop, self.name, exit_on_trend_flip=False, target_price=float(mid))
+        # Failed upside break -> fade short.
+        if float(prev_row["high"]) > r_hi and float(prev_row["close"]) < r_hi and mid < price:
+            stop = _cap_short_stop(price, float(prev_row["high"]) + TICK)
+            if stop - price <= 0:
+                return None
+            return EntrySignal("short", stop, self.name, exit_on_trend_flip=False, target_price=float(mid))
+        return None
+
+
+# ── Trend engine: VWAP cross with EMA-trend filter (highest-evidence, low-param) ─
+class VWAPCross(Strategy):
+    """Enter on a close-confirmed cross of VWAP in the direction of the EMA trend.
+    Rides with the trend (harness 2R target, trend-flip exit)."""
+
+    name = "VWAP-cross"
+
+    def entry(self, i, row, prev_row, bar_2, ctx):
+        vwap_p, vwap_2 = prev_row["vwap"], bar_2["vwap"]
+        ef, es = prev_row["ema_fast"], prev_row["ema_slow"]
+        if not _ok(vwap_p, vwap_2, ef, es):
+            return None
+        price = float(row["open"])
+        c_prev, c_2 = float(prev_row["close"]), float(bar_2["close"])
+        # Cross confirmed on two closed bars: was below VWAP, just closed above it.
+        if ef > es and c_2 <= vwap_2 and c_prev > vwap_p:
+            raw = min(float(prev_row["low"]), float(bar_2["low"])) - TICK
+            stop = _cap_long_stop(price, raw)
+            if price - stop <= 0:
+                return None
+            return EntrySignal("long", stop, self.name)
+        if ef < es and c_2 >= vwap_2 and c_prev < vwap_p:
+            raw = max(float(prev_row["high"]), float(bar_2["high"])) + TICK
+            stop = _cap_short_stop(price, raw)
+            if stop - price <= 0:
+                return None
+            return EntrySignal("short", stop, self.name)
+        return None
+
+
+# ── The router: trade only the (regime -> strategy) cells the edge grid proved ──
+class RegimeRouter(Strategy):
+    """Delegates each bar to the strategy assigned to the CURRENT regime (read from
+    the just-closed bar's `regime_class`). Unassigned regimes -> stand aside."""
+
+    name = "RegimeRouter"
+
+    def __init__(self, rulebook: dict):
+        # rulebook: {regime_label: Strategy instance}
+        self.rulebook = rulebook
+        self._pending = None
+
+    def reset_session(self, session_date):
+        for sub in self.rulebook.values():
+            sub.reset_session(session_date)
+
+    def observe(self, i, row, prev_row, bar_2, ctx):
+        for sub in self.rulebook.values():
+            sub.observe(i, row, prev_row, bar_2, ctx)
+
+    def entry(self, i, row, prev_row, bar_2, ctx):
+        regime = prev_row.get("regime_class") if hasattr(prev_row, "get") else prev_row["regime_class"]
+        sub = self.rulebook.get(regime)
+        if sub is None:
+            return None
+        sig = sub.entry(i, row, prev_row, bar_2, ctx)
+        if sig is not None:
+            self._pending = sub
+            sig.entry_type = f"{regime}:{sig.entry_type}"
+        return sig
+
+    def confirm(self, signal: EntrySignal):
+        if self._pending is not None:
+            self._pending.confirm(signal)
+            self._pending = None
+
+
+# ── Registries ──────────────────────────────────────────────────────────────────
 def build_candidates():
+    """Full menu of individual strategies — what the edge grid evaluates per regime."""
     return [
-        FVGTrend(require_displacement=False),
-        FVGTrend(require_displacement=True),
+        VWAPCross(),
         VWAPPullback(),
         ORBreakout(),
+        FVGTrend(require_displacement=False),
+        FVGTrend(require_displacement=True),
+        MeanReversionVWAP(),
+        KeltnerRSIFade(),
+        TurtleSoup(),
     ]
+
+
+def build_strategy(name: str):
+    """Fresh instance of one strategy by name (used to assemble a router rulebook)."""
+    for s in build_candidates():
+        if s.name == name:
+            return s
+    raise KeyError(f"unknown strategy: {name}")
