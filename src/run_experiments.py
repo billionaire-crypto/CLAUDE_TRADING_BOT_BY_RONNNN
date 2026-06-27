@@ -9,6 +9,13 @@ Usage:
 or:
     python src/run_experiments.py
 """
+import io
+import sys
+
+# Force UTF-8 output on Windows consoles that default to cp1252
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
 import copy
 import textwrap
 from typing import List
@@ -67,16 +74,16 @@ def _run_experiment(name: str, overrides: dict, saved_defaults: dict,
     _restore(saved_defaults)
 
     n_total = len(trades)
-    n_chop  = sum(1 for t in trades if t.regime in ("choppy", "chop"))
+    n_adx_chop = sum(1 for t in trades if t.bar_adx_regime == "choppy")
     n_mr    = sum(1 for t in trades if t.entry_type in ("VWAP_MR", "FAILED_BREAKOUT"))
     n_trend = sum(1 for t in trades if t.entry_type in ("FVG", "ORB"))
 
-    print(f"  Trades total={n_total}  chop-regime={n_chop}  MR-entries={n_mr}  trend-entries={n_trend}")
+    print(f"  Trades total={n_total}  ADX-chop={n_adx_chop}  MR-entries={n_mr}  trend-entries={n_trend}")
 
     stats = bot.compute_stats(df_out, trades, daily_records, state)
 
-    # Chop-only trades: use the regime label on TradeRecord.
-    chop_trades = [t for t in trades if t.regime in ("choppy", "chop")]
+    # Chop-only trades: filter by the ADX bar regime stored at entry time.
+    chop_trades = [t for t in trades if t.bar_adx_regime == "choppy"]
     avg_cost    = stats.get("avg_cost", 0.0)
     chop_sc     = bot._compute_consistency_scorecard(chop_trades, daily_records, avg_cost)
 
@@ -137,9 +144,9 @@ def main():
     )
     results.append(r)
 
-    # ── E1: Two-sided σ-band VWAP reversion (both sides, sigma entry) ─────────
+    # ── E1: Two-sided sigma-band VWAP reversion (both sides, sigma entry) ───────
     r = _run_experiment(
-        "E1 — Two-sided σ-band VWAP MR (TWO_SIDED + SIGMA_BAND + FVG_AS_BONUS)",
+        "E1 — Two-sided sigma-band VWAP MR (TWO_SIDED+SIGMA+FVG_BONUS)",
         {
             "VWAP_MR_ENABLED":    True,
             "VWAP_MR_TWO_SIDED":  True,

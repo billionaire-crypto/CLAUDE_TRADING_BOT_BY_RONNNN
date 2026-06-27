@@ -464,6 +464,9 @@ class TradeRecord:
     edge_ratio: float = 0.0
     efficiency_ratio: float = 0.0
 
+    # ADX-based bar regime at entry (independent of ATR profile)
+    bar_adx_regime: str = ""   # "trending" | "choppy" | "neutral" | "unknown"
+
     # VWAP MR diagnostics
     vwap_mr_distance_points: float = 0.0
     vwap_mr_rsi: float = 0.0
@@ -2499,6 +2502,8 @@ def run_backtest(
                 entry_regime = fb_setup["regime"]
             else:
                 entry_regime = vwap_mr_setup["regime"]
+            # ADX-based bar regime (used by consistency scorecard to filter chop subset)
+            entry_bar_adx_regime = classify_regime_adx(prev_row)
             in_trade     = True
             direction    = entry_dir
             entry_price  = current_price
@@ -2638,6 +2643,7 @@ def run_backtest(
                 "daily_loss_used_pct":         dl_pct,
                 "mll_used_pct":                mll_pct,
                 "qualifying_days_banked":      0,
+                "bar_adx_regime":              entry_bar_adx_regime,
             }
 
         portfolio.append(cash)
@@ -2785,6 +2791,7 @@ def _build_trade_record(
         fb_reentry_distance_ticks = snap.get("fb_reentry_distance_ticks", 0.0),
         fb_target_ticks         = snap.get("fb_target_ticks", 0),
         fb_bars_from_sweep_to_entry = snap.get("fb_bars_from_sweep_to_entry", 0),
+        bar_adx_regime           = snap.get("bar_adx_regime", ""),
         mae=trade_mae, mfe=trade_mfe, bars_to_exit=bars_to_exit,
         r_multiple=r_multiple, edge_ratio=edge_ratio, efficiency_ratio=efficiency,
         combine_profit_at_entry  = snap.get("combine_profit_at_entry", 0.0),
@@ -3165,6 +3172,7 @@ def compute_stats(
     # Full consistency scorecard across all trades
     consistency_scorecard = _compute_consistency_scorecard(trades, daily_records, avg_cost)
 
+    # ATR-profile regime breakdown (original behaviour)
     regime_stats = {}
     for r in sorted(set(t.regime for t in trades)):
         rt = [t for t in trades if t.regime == r]
@@ -3172,6 +3180,22 @@ def compute_stats(
             rw = [t.pnl_usd for t in rt if t.won]
             rl = [t.pnl_usd for t in rt if not t.won]
             regime_stats[r] = {
+                "count":    len(rt),
+                "win_rate": len(rw) / len(rt) * 100,
+                "net_pnl":  sum(t.pnl_usd for t in rt),
+                "avg_win":  float(np.mean(rw)) if rw else 0.0,
+                "avg_loss": float(np.mean(rl)) if rl else 0.0,
+                "scorecard": _compute_consistency_scorecard(rt, daily_records, avg_cost),
+            }
+
+    # ADX bar-regime breakdown (used by experiment runner chop scorecard)
+    adx_regime_stats = {}
+    for r in sorted(set(t.bar_adx_regime for t in trades)):
+        rt = [t for t in trades if t.bar_adx_regime == r]
+        if rt:
+            rw = [t.pnl_usd for t in rt if t.won]
+            rl = [t.pnl_usd for t in rt if not t.won]
+            adx_regime_stats[r] = {
                 "count":    len(rt),
                 "win_rate": len(rw) / len(rt) * 100,
                 "net_pnl":  sum(t.pnl_usd for t in rt),
@@ -3189,6 +3213,7 @@ def compute_stats(
         avg_win=avg_win, avg_loss=avg_loss,
         total_gross=total_gross, total_costs=total_costs,
         consistency_scorecard=consistency_scorecard,
+        adx_regime_stats=adx_regime_stats,
         total_net=total_net, avg_cost=avg_cost,
         floor_breached=state.floor_breached,
         min_buffer_over_floor=state.min_buffer_over_floor,
