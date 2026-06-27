@@ -41,6 +41,7 @@ BRACKET_VERIFY_TIMEOUT_SECONDS = 8.0
 BRACKET_VERIFY_REST_POLL_SECONDS = 1.0
 CONSISTENCY_BUFFER = 0.02
 STRATEGY_BAR_SECONDS = 300
+MANUAL_FLATTEN_COOLDOWN_MINUTES = 10   # block new entries for this long after a manual flatten
 
 QUARTER_MONTH_CODES = {
     3: "H",
@@ -188,6 +189,8 @@ def _default_state() -> Dict[str, Any]:
         "consistency_ratio": 0.0,
         "consistency_status": "clear",
         "last_heavy_reconcile_at": None,
+        "manual_flatten_cooldown_until": None,
+        "manual_flatten_reason": "",
     }
 
 
@@ -1370,6 +1373,28 @@ def _submit_order_plan(
         )
         raise TopstepXAPIError("Refusing to route signal: duplicate signal detected for the same session.")
 
+    cooldown_until_raw = state.get("manual_flatten_cooldown_until")
+    if cooldown_until_raw:
+        try:
+            cooldown_until_dt = datetime.fromisoformat(str(cooldown_until_raw))
+            if _current_ct_now() < cooldown_until_dt:
+                cooldown_msg = (
+                    f"Signal blocked: manual flatten cooldown active until {cooldown_until_raw} "
+                    f"(reason={state.get('manual_flatten_reason', '?')}). "
+                    f"Cooldown prevents immediate re-entry after a manual close."
+                )
+                _log_trade_event(
+                    event_type="submit_blocked_manual_flatten_cooldown",
+                    signal_payload=signal_payload,
+                    account_name=str(order_payload.get("accountName", "")),
+                    contract_name=str(order_payload.get("contractName", "")),
+                    dry_run=bool(config.dry_run),
+                    notes=cooldown_msg,
+                )
+                raise TopstepXAPIError(cooldown_msg)
+        except ValueError:
+            pass  # malformed timestamp — let the trade through
+
     if not execute or config.dry_run or not config.enable_order_routing:
         state["last_dry_run_signal_id"] = signal_id
         state["last_dry_run_session_date"] = signal.get("session_date", "")
@@ -1572,6 +1597,24 @@ def _flatten_account_internal(
             broker_response=response,
         )
     payload["responses"] = responses
+
+    # After a manual flatten (telegram or CLI), block new bot entries for a cooldown window.
+    # This prevents the bot from immediately re-entering the same signal the user just closed.
+    if reason in {"telegram_command", "manual"} and any(
+        r.get("close_contract_id") for r in responses
+    ):
+        cooldown_state = _load_state()
+        cooldown_until = (
+            _current_ct_now() + timedelta(minutes=MANUAL_FLATTEN_COOLDOWN_MINUTES)
+        ).isoformat()
+        cooldown_state["manual_flatten_cooldown_until"] = cooldown_until
+        cooldown_state["manual_flatten_reason"] = reason
+        _save_state(cooldown_state)
+        _write_log(
+            "INFO",
+            f"manual_flatten_cooldown set until {cooldown_until} reason={reason}",
+        )
+
     return payload
 
 
