@@ -116,6 +116,26 @@ EXPLOSIVE_MAX_TRADES   = 0       # V28: explosive = 0 trades allowed
 ADX_STRONG_THRESHOLD    = 10
 ADX_EXPLOSIVE_THRESHOLD = 30
 
+# ── REGIME DETECTOR (clock + ADX) ──────────────────────────────────────────────
+# The "is the owner sitting or moving?" detector.
+#   - Clock  = time of day rhythm (AM rush / lunch bench / PM rush)
+#   - ADX    = are the steps pointing one way (trend) or all over (chop)?
+#   - CHOP   = optional Choppiness Index confirmation (squiggly vs straight path)
+# detect_regime() uses ADX when REGIME_USE_ADX is True; set False to fall back to
+# the legacy volatility-only (ATR) rule for A/B comparison in the backtest.
+REGIME_USE_ADX        = True
+ADX_CHOP_MAX          = 20.0   # ADX below this  -> ranging / chop
+ADX_TREND_MIN         = 25.0   # ADX above this  -> trending; 20-25 = neutral (stand aside)
+CHOP_INDEX_ENABLED    = False  # require Choppiness Index confirmation for "choppy"
+CHOP_INDEX_PERIOD     = 14
+CHOP_INDEX_RANGE_MIN  = 61.8   # Choppiness Index above this confirms a range
+
+# Clock windows (US/Central). The lunch "bench" window is when fades work best.
+MR_WINDOW_START_CT    = (11, 0)    # mean-reversion (bounce-catching) window start
+MR_WINDOW_END_CT      = (13, 30)   # mean-reversion window end
+TREND_AM_WINDOW_CT    = ((8, 30), (10, 0))   # morning rush -> trend strategies
+TREND_PM_WINDOW_CT    = ((14, 0), (14, 50))  # afternoon push -> trend strategies
+
 # EMA Spread filter
 EMA_SPREAD_MIN = 0.0010
 
@@ -848,6 +868,17 @@ def fetch_data() -> pd.DataFrame:
 
 # ── INDICATORS ────────────────────────────────────────────────────────────────
 
+def compute_choppiness_index(high, low, tr, period: int):
+    """Choppiness Index over `period` bars (0-100).
+
+    High values (~> 61.8) = lots of motion but little net progress -> ranging/chop;
+    low values (~< 38.2) = efficient, straight-line travel -> trending. `tr` is the
+    per-bar true range (so gap moves are counted consistently with ATR)."""
+    atr_sum    = tr.rolling(period).sum()
+    chop_range = (high.rolling(period).max() - low.rolling(period).min()).replace(0, np.nan)
+    return 100 * np.log10(atr_sum / chop_range) / np.log10(period)
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df["close"]
     high  = df["high"]
@@ -888,6 +919,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     dx         = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan))
     df["adx"]  = dx.rolling(14).mean()
 
+    # Choppiness Index: high = squiggly/range-bound, low = straight/trending.
+    df["chop_index"] = compute_choppiness_index(high, low, tr, CHOP_INDEX_PERIOD)
+
     df["ema_spread"] = (df["ema_fast"] - df["ema_slow"]).abs() / df["close"]
     df["structure_high"] = df["high"].rolling(FVG_BOS_LOOKBACK_BARS).max().shift(1)
     df["structure_low"]  = df["low"].rolling(FVG_BOS_LOOKBACK_BARS).min().shift(1)
@@ -905,12 +939,66 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── SIGNALS ───────────────────────────────────────────────────────────────────
 
+def classify_regime_adx(row) -> str:
+    """ADX-based regime: 'trending' | 'choppy' | 'neutral' | 'unknown'.
+
+    Reads the *direction* of the steps (ADX) rather than just their speed (ATR):
+      ADX >= ADX_TREND_MIN          -> trending  (owner is moving)
+      ADX <  ADX_CHOP_MAX (+ CHOP)  -> choppy    (owner is sitting)
+      in between                    -> neutral   (unsure -> stand aside)
+    """
+    adx = row.get("adx") if hasattr(row, "get") else row["adx"]
+    if adx is None or pd.isna(adx):
+        return "unknown"
+    adx = float(adx)
+    if adx >= ADX_TREND_MIN:
+        return "trending"
+    if adx < ADX_CHOP_MAX:
+        if CHOP_INDEX_ENABLED:
+            chop = row.get("chop_index") if hasattr(row, "get") else row["chop_index"]
+            if chop is None or pd.isna(chop) or float(chop) < CHOP_INDEX_RANGE_MIN:
+                return "neutral"
+        return "choppy"
+    return "neutral"
+
+
 def detect_regime(row) -> str:
+    """Regime label for the bar. Uses the ADX detector unless REGIME_USE_ADX is
+    off, in which case it falls back to the legacy volatility-only (ATR) rule."""
+    if REGIME_USE_ADX:
+        return classify_regime_adx(row)
     if pd.isna(row["atr"]) or pd.isna(row["atr_avg_20"]):
         return "unknown"
     if row["atr"] >= row["atr_avg_20"] * ATR_REGIME_MULT:
         return "trending"
     return "choppy"
+
+
+def _in_window_ct(dt_ct, start, end) -> bool:
+    """True if dt_ct's clock time is within [start, end] (CT tuples)."""
+    from datetime import time as dtime
+    t = dt_ct.time()
+    return dtime(start[0], start[1]) <= t <= dtime(end[0], end[1])
+
+
+def session_phase(dt_ct) -> str:
+    """Clock-based market rhythm:
+    'am_trend' (morning rush) | 'lunch_chop' (bench) | 'pm_trend' (afternoon push)
+    | 'other'. The clock alone tells you which game is *likely* on."""
+    if _in_window_ct(dt_ct, TREND_AM_WINDOW_CT[0], TREND_AM_WINDOW_CT[1]):
+        return "am_trend"
+    if _in_window_ct(dt_ct, MR_WINDOW_START_CT, MR_WINDOW_END_CT):
+        return "lunch_chop"
+    if _in_window_ct(dt_ct, TREND_PM_WINDOW_CT[0], TREND_PM_WINDOW_CT[1]):
+        return "pm_trend"
+    return "other"
+
+
+def is_mean_reversion_window(row, dt_ct) -> bool:
+    """Green light for bounce-catching (mean reversion):
+    the clock says lunch 'bench' AND ADX confirms the owner is actually sitting.
+    Both must agree — a busy-news lunch that keeps trending is excluded."""
+    return session_phase(dt_ct) == "lunch_chop" and classify_regime_adx(row) == "choppy"
 
 
 def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
