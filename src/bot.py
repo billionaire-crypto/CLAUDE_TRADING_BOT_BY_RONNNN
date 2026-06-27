@@ -4030,9 +4030,13 @@ def main(args=None):
     print(f"  Run mode: {RUN_MODE}  |  Profile: {EXECUTION_PROFILE}  |  Live execution: {'ON' if LIVE_EXECUTION_ENABLED else 'OFF'}")
     print(f"  Instrument: MNQ  |  Point value: ${MNQ_POINT_VALUE}/pt")
     print(f"  ORB: {ORB_RANGE_BARS} bars (9:30-10:00 CT) | FVG: all session")
-    print(f"  ATR cap: 2.0  |  July: DISABLED")
-    print(f"  Max trades/day: {STRONG_MAX_TRADES} (shared cap across modules)")
-    print(f"  Max contracts: {STRONG_CONTRACTS} (Topstep scaling plan)")
+    print(f"  ATR cap: 2.0  |  CALM_ATR_RATIO: {CALM_ATR_RATIO}  |  July: {'SKIP' if SKIP_JULY else 'ON'}")
+    print(
+        f"  Regimes: strong={STRONG_CONTRACTS}c/{STRONG_TARGET_TICKS}t/{STRONG_MAX_TRADES}max"
+        f" | normal={NORMAL_CONTRACTS}c/{NORMAL_TARGET_TICKS}t/{NORMAL_MAX_TRADES}max"
+        f" | calm=0c (atr<1.5 or ratio<{CALM_ATR_RATIO})"
+    )
+    print(f"  Breakeven stop: {BREAKEVEN_TRIGGER_TICKS} ticks ({'ON' if BREAKEVEN_TRIGGER_TICKS > 0 else 'OFF'})")
     print(
         "  One-account filters:"
         f" late-longs={'ON' if LONG_QUALITY_FILTERS_ENABLED else 'OFF'}"
@@ -4041,6 +4045,9 @@ def main(args=None):
         f" | long-ema-aged={'ON' if FVG_LONG_EMA_FILTER_ENABLED else 'OFF'}"
         f" (age>={FVG_LONG_EMA_FILTER_MIN_AGE_BARS}, {FVG_LONG_MIN_EMA_SPREAD_PTS:.0f}pts)"
         f" | skip_fomc={'ON' if SKIP_FOMC_ENTRIES else 'OFF'}"
+        f" | fomc_blackout={'ON' if FOMC_BLACKOUT_ENABLED else 'OFF'}"
+        f" ({FOMC_BLACKOUT_START_CT[0]:02d}:{FOMC_BLACKOUT_START_CT[1]:02d}"
+        f"-{FOMC_BLACKOUT_END_CT[0]:02d}:{FOMC_BLACKOUT_END_CT[1]:02d} CT)"
         f" | skip_hour11={'ON' if SKIP_HOUR_11_ENTRIES else 'OFF'}"
         f" | skip_long_10_11={'ON' if SKIP_LONG_HOUR_10_11 else 'OFF'}"
     )
