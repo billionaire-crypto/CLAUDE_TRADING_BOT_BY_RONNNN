@@ -204,9 +204,9 @@ LATE_LONG_TARGET_END_HOUR      = 11
 LATE_LONG_TARGET_TICKS         = 80
 
 # Complementary module: VWAP mean reversion V2a
-VWAP_MR_ENABLED                = False
-VWAP_MR_WINDOW_START           = (12, 0)
-VWAP_MR_WINDOW_END             = (14, 0)
+VWAP_MR_ENABLED                = True
+VWAP_MR_WINDOW_START           = (10, 30)  # validated in E2a holdout
+VWAP_MR_WINDOW_END             = (12, 30)  # validated in E2a holdout
 VWAP_MR_CONTRACTS              = 2
 VWAP_MR_MAX_TRADES_PER_DAY     = 1
 VWAP_MR_MAX_ADX                = 20
