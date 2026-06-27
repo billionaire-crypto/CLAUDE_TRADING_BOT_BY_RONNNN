@@ -93,12 +93,12 @@ SCALING_TIER_2_THRESHOLD = 1_500.0
 SCALING_TIER_3_THRESHOLD = 2_000.0
 
 # ── DYNAMIC RISK PROFILES ────────────────────────────────────────────────────
-CALM_ATR_RATIO   = 1.00
+CALM_ATR_RATIO   = 0.75   # removed: 1.00 was curve-fitted upward; 0.75 keeps the quietest bars out
 STRONG_ATR_RATIO = 0.70
 
-NORMAL_CONTRACTS    = 4
+NORMAL_CONTRACTS    = 2   # restored from 0; conservative start for the middle tier
 NORMAL_TARGET_TICKS = 64  # 16 NQ points = equiv to 4 ES points
-NORMAL_MAX_TRADES   = 5
+NORMAL_MAX_TRADES   = 3   # capped lower than STRONG until live data validates
 
 STRONG_CONTRACTS    = 5          # V28: capped at Topstep max
 STRONG_TARGET_TICKS = 100  # 20 NQ points = equiv to 5 ES points at 4x scale
@@ -170,11 +170,19 @@ PARTIAL_PROFIT_ENABLED  = False
 PARTIAL_PROFIT_TICKS    = 40     # 10 NQ points — lock in profit here
 PARTIAL_PROFIT_FRACTION = 0.60   # close 60% of contracts, let 40% run
 
+# Breakeven stop: once +N ticks in profit, move stop to entry (set 0 to disable)
+BREAKEVEN_TRIGGER_TICKS = 20
+
+# FOMC announcement blackout: skip entries in a 45-min window around the 2 PM ET release
+FOMC_BLACKOUT_ENABLED  = True
+FOMC_BLACKOUT_START_CT = (13, 45)  # 1:45 PM CT — 15 min before announcement
+FOMC_BLACKOUT_END_CT   = (14, 30)  # 2:30 PM CT — 30 min after announcement
+
 # One-account optimization filters
 SKIP_FOMC_ENTRIES              = False
 SKIP_HOUR_11_ENTRIES           = False
 SKIP_LONG_HOUR_10_11           = False
-LONG_QUALITY_FILTERS_ENABLED   = True
+LONG_QUALITY_FILTERS_ENABLED   = False  # removed: ADX+EMA-spread gate for 10-11 CT longs was too hour-specific
 LONG_FILTER_START_HOUR         = 10
 LONG_FILTER_END_HOUR           = 11
 LONG_FILTER_MIN_ADX            = 10
@@ -259,8 +267,8 @@ FB_DEBUG_PRINT_LIMIT            = 25
 
 ANALYSIS_HIGHLIGHT_MIN_TRADES  = 40
 
-# V28: Disable July (36.3% WR, net negative over 7yr)
-SKIP_JULY = True
+# July disabled in V28 based on 7yr sample WR; removed as curve-fitted seasonality
+SKIP_JULY = False
 
 # Monte Carlo
 MC_SIMULATIONS  = 10_000
@@ -731,12 +739,22 @@ def get_risk_profile(row) -> dict:
           and row["adx"] >= ADX_STRONG_THRESHOLD):
         return {
             "regime": "strong",
-            "contracts": STRONG_CONTRACTS,       # 5 max
-            "target_ticks": STRONG_TARGET_TICKS, # 20
-            "max_trades": STRONG_MAX_TRADES,     # 4
+            "contracts": STRONG_CONTRACTS,
+            "target_ticks": STRONG_TARGET_TICKS,
+            "max_trades": STRONG_MAX_TRADES,
+        }
+    elif row["atr"] >= 1.5:
+        # Normal: volatility is sufficient but ADX is weak — trade at reduced size.
+        # Previously returned 0 contracts (curve-fitted off); restored with conservative sizing.
+        return {
+            "regime": "normal",
+            "contracts": NORMAL_CONTRACTS,
+            "target_ticks": NORMAL_TARGET_TICKS,
+            "max_trades": NORMAL_MAX_TRADES,
         }
     else:
-        return {"regime": "normal", "contracts": 0, "target_ticks": 0, "max_trades": 0}
+        # ATR too low to reach a meaningful target — genuine reason to sit out.
+        return {"regime": "calm", "contracts": 0, "target_ticks": 0, "max_trades": 0}
 
 
 # ── DATA ──────────────────────────────────────────────────────────────────────
@@ -1096,6 +1114,13 @@ def _passes_strategy_filters(
     """Apply optional post-signal filters for one-account optimization."""
     if SKIP_FOMC_ENTRIES and str(session_date) in FOMC_DATES:
         return False
+
+    if FOMC_BLACKOUT_ENABLED and str(session_date) in FOMC_DATES:
+        ct_min = dt_ct.hour * 60 + dt_ct.minute
+        bs, bm = FOMC_BLACKOUT_START_CT
+        es, em = FOMC_BLACKOUT_END_CT
+        if bs * 60 + bm <= ct_min < es * 60 + em:
+            return False
 
     if SKIP_HOUR_11_ENTRIES and dt_ct.hour == 11:
         return False
@@ -1885,8 +1910,9 @@ def run_backtest(
     entry_regime  = "unknown"
     entry_type    = "FVG"
     entry_bar_idx = 0
-    partial_taken      = False   # has partial profit fired for current trade?
-    partial_pnl_banked = 0.0    # P&L locked in from partial exit
+    partial_taken        = False   # has partial profit fired for current trade?
+    partial_pnl_banked   = 0.0    # P&L locked in from partial exit
+    breakeven_triggered  = False   # has stop been moved to entry price?
 
     trade_mfe = 0.0
     trade_mae = 0.0
@@ -2089,14 +2115,26 @@ def run_backtest(
             if won: consecutive_wins += 1;  consecutive_losses = 0
             else:   consecutive_losses += 1; consecutive_wins = 0
 
-            in_trade           = False
-            trade_mfe          = 0.0
-            trade_mae          = 0.0
-            partial_taken      = False
-            partial_pnl_banked = 0.0
+            in_trade             = False
+            trade_mfe            = 0.0
+            trade_mae            = 0.0
+            partial_taken        = False
+            partial_pnl_banked   = 0.0
+            breakeven_triggered  = False
 
         # ── Exit logic ────────────────────────────────────────────────────────
         if in_trade:
+            # Breakeven stop: once trade is +BREAKEVEN_TRIGGER_TICKS in profit,
+            # move stop to entry price. Prevents a winner from becoming a loser.
+            if BREAKEVEN_TRIGGER_TICKS > 0 and not breakeven_triggered:
+                be_pts = BREAKEVEN_TRIGGER_TICKS * MNQ_TICK_SIZE
+                if direction == "long" and trade_mfe >= be_pts:
+                    fvg_stop = max(fvg_stop, entry_price)
+                    breakeven_triggered = True
+                elif direction == "short" and trade_mfe >= be_pts:
+                    fvg_stop = min(fvg_stop, entry_price)
+                    breakeven_triggered = True
+
             target_pts  = target_ticks * MNQ_TICK_SIZE
             partial_pts = PARTIAL_PROFIT_TICKS * MNQ_TICK_SIZE
             if direction == "long":
@@ -2184,11 +2222,12 @@ def run_backtest(
                 if won: consecutive_wins += 1;  consecutive_losses = 0
                 else:   consecutive_losses += 1; consecutive_wins = 0
 
-                in_trade           = False
-                trade_mfe          = 0.0
-                trade_mae          = 0.0
-                partial_taken      = False
-                partial_pnl_banked = 0.0
+                in_trade             = False
+                trade_mfe            = 0.0
+                trade_mae            = 0.0
+                partial_taken        = False
+                partial_pnl_banked   = 0.0
+                breakeven_triggered  = False
 
         # ── Entry logic ───────────────────────────────────────────────────────
         if not in_trade:
@@ -2504,15 +2543,16 @@ def run_backtest(
                 entry_regime = vwap_mr_setup["regime"]
             # ADX-based bar regime (used by consistency scorecard to filter chop subset)
             entry_bar_adx_regime = classify_regime_adx(prev_row)
-            in_trade     = True
-            direction    = entry_dir
-            entry_price  = current_price
-            entry_type   = this_entry_type
-            entry_bar_idx = i
-            trade_mfe    = 0.0
-            trade_mae    = 0.0
-            partial_taken      = False
-            partial_pnl_banked = 0.0
+            in_trade             = True
+            direction            = entry_dir
+            entry_price          = current_price
+            entry_type           = this_entry_type
+            entry_bar_idx        = i
+            trade_mfe            = 0.0
+            trade_mae            = 0.0
+            partial_taken        = False
+            partial_pnl_banked   = 0.0
+            breakeven_triggered  = False
             trade_number_overall += 1
             trade_number_today   += 1
 
