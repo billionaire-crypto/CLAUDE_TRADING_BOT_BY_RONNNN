@@ -25,12 +25,12 @@ def load_mes_data(filepath: str) -> pd.DataFrame:
         'volume': 'sum'
     }).dropna()
 
-    # After resample, pick front month per bar
-    # Keep only rows where symbol is the first alphabetically per timestamp
-    # (Databento continuous contract handles this, just deduplicate)
+    # After resample, pick front month per bar.
+    # Front month = highest-volume contract at each timestamp — avoids stale
+    # back-month prints that create phantom spike-and-revert bars.
     df_5m = df_5m.reset_index()
-    df_5m = df_5m.sort_values(['ts_event', 'symbol'])
-    df_5m = df_5m.drop_duplicates(subset='ts_event', keep='first')
+    df_5m = df_5m.sort_values(['ts_event', 'volume'])          # ascending volume
+    df_5m = df_5m.drop_duplicates(subset='ts_event', keep='last')  # keep highest
 
     # Filter to regular trading hours only (9:30 - 16:00 EST)
     
