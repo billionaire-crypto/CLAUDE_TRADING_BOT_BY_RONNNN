@@ -24,6 +24,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dataclasses import dataclass, field
+from collections import deque
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict
 import warnings
@@ -104,6 +105,11 @@ STRONG_CONTRACTS    = 5          # V28: capped at Topstep max
 STRONG_TARGET_TICKS = 100  # 20 NQ points = equiv to 5 ES points at 4x scale
 STRONG_MAX_TRADES   = 4          # V28: 1 ORB + 3 FVG
 
+# ATR constant-dollar-risk sizing: re-sizes FVG contracts so stop exposure
+# stays near a fixed dollar target regardless of where the structural stop lands.
+ATR_CDR_ENABLED    = True
+ATR_CDR_TARGET_USD = 80.0   # target stop-exposure in dollars per FVG trade
+
 # V28: Explosive regime disabled (33% WR, consistently loses)
 # ATR ratio hard cap at 2.0 enforced in get_risk_profile()
 EXPLOSIVE_ATR_RATIO    = 2.0     # kept for reference — but blocked
@@ -144,7 +150,7 @@ TREND_PM_WINDOW_CT    = ((14, 0), (14, 50))  # afternoon push -> trend strategie
 EMA_SPREAD_MIN = 0.0010
 
 # FVG settings
-FVG_MAX_AGE_BARS   = 20
+FVG_MAX_AGE_BARS   = 4
 FVG_MIN_SIZE_TICKS = 2
 FVG_FRESH_ONLY     = False
 FVG_LEVEL_ALIGNMENT_BONUS_ENABLED = True
@@ -164,6 +170,76 @@ ORB_STOP_BUFFER_TICKS  = 1       # ticks beyond ORB boundary for stop
 
 # V28: ORB fires independently of ATR regime
 ORB_INDEPENDENT_CONTRACTS = 3    # contracts when ORB fires without ATR confirmation
+
+# ── PDH/PDL RETEST SETTINGS ──────────────────────────────────────────────────
+PDH_RETEST_ENABLED     = True
+PDH_BREAK_TICKS        = 8    # ticks price must extend beyond PDH/PDL to confirm clean break
+PDH_ENTRY_ZONE_TICKS   = 6    # enter when price pulls back within this many ticks of level
+PDH_STOP_TICKS         = 10   # stop placed this many ticks beyond the PDH/PDL level
+PDH_TARGET_TICKS       = 50   # target ticks from entry
+
+# ── VWAP PULLBACK SETTINGS ────────────────────────────────────────────────────
+# After the first hour (10:30 CT), if price moved ≥ 1 ATR from the session open,
+# enter when it pulls back to touch the running VWAP.
+VWAP_PB_ENABLED            = False   # 35% WR, net negative — not a real edge
+VWAP_PB_WINDOW_START       = (10, 30)  # CT — start looking for entries after first hour
+VWAP_PB_WINDOW_END         = (13,  0)  # CT — stop looking (avoid afternoon chop)
+VWAP_PB_MIN_MOVE_ATR       = 1.0       # first-hour VWAP must be ≥ 1 ATR from session open
+VWAP_PB_ENTRY_ZONE_TICKS   = 10        # within 10 ticks of VWAP = entry zone
+VWAP_PB_STOP_TICKS         = 16        # stop on wrong side of VWAP
+VWAP_PB_TARGET_TICKS       = 50        # target ticks from entry
+VWAP_PB_MAX_TRADES_PER_DAY = 2
+
+# ── SWEEP & REVERSE SETTINGS ──────────────────────────────────────────────────
+# When price sweeps above/below the N-bar rolling high/low by a small amount
+# then closes back through the level, the stop-hunt has failed and we fade.
+# Causal logic: stops at the N-bar extreme were triggered, creating the
+# liquidity that now pushes price back in the other direction.
+SWEEP_REV_ENABLED      = False  # net negative (-$266/yr); cut
+SWEEP_REV_LOOKBACK_BARS = 12   # swept parameter — 6/12/24/48 in the test
+SWEEP_REV_SWEEP_TICKS  = 4     # max ticks the sweep can extend beyond the level
+SWEEP_REV_STOP_BUFFER  = 4     # ticks beyond the sweep extreme for our stop
+SWEEP_REV_TARGET_TICKS = 40    # target ticks from entry
+SWEEP_REV_MAX_DAY      = 3     # max sweeps to trade per day
+SWEEP_REV_CONTRACTS    = 1     # 1 contract — stop is structural not fixed
+
+# ── GAP FILL SETTINGS ─────────────────────────────────────────────────────────
+# Fade overnight gaps that are likely to refill to the previous close.
+# All thresholds expressed in ATR multiples — self-calibrating across eras.
+GAP_FILL_ENABLED   = False
+
+# ── VOLUME POC REVERSION SETTINGS ─────────────────────────────────────────────
+# Compute the running session Point of Control (price bin with most volume).
+# Enter a mean-reversion trade back toward POC when price is overextended.
+# Causal: institutions filled most orders at POC — unfilled orders pull price back.
+VPOC_ENABLED       = False  # $7/slot ROI vs FVG's $84/slot; displaced by FVG
+VPOC_BIN_POINTS    = 5.0   # NQ-point resolution for price binning
+VPOC_MIN_BARS      = 12    # need ≥ 1 hour of data before POC is reliable
+VPOC_ENTRY_ATR     = 0.5   # prev-bar high/low must reach ≥ this × ATR beyond POC
+VPOC_STOP_TICKS    = 6     # ticks beyond the rejection bar's extreme for structural stop
+VPOC_MAX_TRADES    = 2     # max VPOC trades per day
+VPOC_CONTRACTS     = 1
+
+# ── HIGHER TIMEFRAME FVG (30-min bars) ────────────────────────────────────────
+# Same 3-bar imbalance logic as 5-min FVG but on 30-min bars.
+# Institutional gaps at this scale represent far more unfilled orders —
+# hypothesis: higher WR than 5-min FVG (60%+) with fewer but larger trades.
+HTF_FVG_ENABLED      = False  # 28% WR; 30-min orders are stale by the time we enter
+HTF_FVG_MINS         = 30    # resample to this many minutes per bar
+HTF_FVG_MAX_AGE_BARS = 4     # expire after 4 × 30min = 2 hours
+HTF_FVG_MIN_SIZE_PTS = 5.0   # minimum gap width in NQ points (filter noise)
+HTF_FVG_STOP_BUFFER  = 8     # ticks beyond FVG boundary for structural stop
+HTF_FVG_TARGET_TICKS = 120   # target (larger because gap is bigger)
+HTF_FVG_MAX_TRADES   = 2     # max per day
+HTF_FVG_CONTRACTS    = 1
+
+# Gap size compared to YESTERDAY'S actual RTH range (H-L), not ATR from globex bars.
+# At 9:30, ATR reflects overnight volatility which is 3-5× smaller than RTH —
+# using ATR would classify tiny gaps as "large." Prev-day range is the honest ruler.
+GAP_FILL_MIN_RANGE = 0.25  # gap ≥ 25% of yesterday's range (smaller = noise)
+GAP_FILL_MAX_RANGE = 0.80  # gap ≤ 80% of yesterday's range (larger = gap-and-go)
+GAP_FILL_STOP_TICKS = 40   # 2 NQ points — fixed tick stop beyond the open
+GAP_FILL_CONTRACTS  = 1    # fixed 1 contract
 
 # V28: Partial profit — take 60% off at 40 ticks, let 40% run to full target
 PARTIAL_PROFIT_ENABLED  = False
@@ -233,19 +309,19 @@ OD_PULLBACK_ENABLED             = False
 OD_DRIVE_WINDOW_START           = (9, 30)
 OD_DRIVE_WINDOW_END             = (9, 45)
 OD_ENTRY_WINDOW_START           = (9, 45)
-OD_ENTRY_WINDOW_END             = (10, 20)
+OD_ENTRY_WINDOW_END             = (10, 45)
 OD_MAX_TRADES_PER_DAY           = 1
 OD_CONTRACTS                    = 3
 OD_MIN_DRIVE_TICKS              = 12
-OD_MAX_DRIVE_TICKS              = 48
-OD_MIN_PULLBACK_PCT             = 0.40
-OD_MAX_PULLBACK_PCT             = 0.60
+OD_MAX_DRIVE_TICKS              = 120
+OD_MIN_PULLBACK_PCT             = 0.25
+OD_MAX_PULLBACK_PCT             = 0.75
 OD_MIN_ADX                      = 10
 OD_MIN_ATR_RATIO                = 0.90
 OD_STOP_CAP_TICKS               = 28
 OD_TARGET_TICKS                 = 80
 OD_DEBUG_PRINT_LIMIT            = 25
-OD_SHORT_ONLY                   = True
+OD_SHORT_ONLY                   = False
 
 # Complementary module: failed breakout / liquidity sweep reversal
 FAILED_BREAKOUT_ENABLED         = True
@@ -334,6 +410,25 @@ NFP_DATES = {
     "2025-09-05","2025-10-03","2025-11-07","2025-12-05","2026-01-09",
     "2026-02-06","2026-03-06",
 }
+# ISM Manufacturing PMI — first business day of each month (10:00 AM ET release)
+ISM_BLACKOUT_ENABLED = True
+ISM_DATES = {
+    "2019-01-02","2019-02-01","2019-03-01","2019-04-01","2019-05-01","2019-06-03",
+    "2019-07-01","2019-08-01","2019-09-03","2019-10-01","2019-11-01","2019-12-02",
+    "2020-01-02","2020-02-03","2020-03-02","2020-04-01","2020-05-01","2020-06-01",
+    "2020-07-01","2020-08-03","2020-09-01","2020-10-01","2020-11-02","2020-12-01",
+    "2021-01-05","2021-02-01","2021-03-01","2021-04-01","2021-05-03","2021-06-01",
+    "2021-07-01","2021-08-02","2021-09-01","2021-10-01","2021-11-01","2021-12-01",
+    "2022-01-04","2022-02-01","2022-03-01","2022-04-01","2022-05-02","2022-06-01",
+    "2022-07-01","2022-08-01","2022-09-01","2022-10-03","2022-11-01","2022-12-01",
+    "2023-01-04","2023-02-01","2023-03-01","2023-04-03","2023-05-01","2023-06-01",
+    "2023-07-03","2023-08-01","2023-09-01","2023-10-02","2023-11-01","2023-12-01",
+    "2024-01-03","2024-02-01","2024-03-01","2024-04-01","2024-05-01","2024-06-03",
+    "2024-07-01","2024-08-01","2024-09-03","2024-10-01","2024-11-01","2024-12-02",
+    "2025-01-02","2025-02-03","2025-03-03","2025-04-01","2025-05-01","2025-06-02",
+    "2025-07-01","2025-08-01","2025-09-02","2025-10-01","2025-11-03","2025-12-01",
+    "2026-01-02","2026-02-02","2026-03-02",
+}
 ALL_NEWS_DATES = FOMC_DATES | CPI_DATES | NFP_DATES
 
 # ── DATA CLASSES ──────────────────────────────────────────────────────────────
@@ -379,6 +474,58 @@ class ODPullbackState:
     pullback_low: float = 0.0
     pullback_high: float = 0.0
     touched_ema21: bool = False
+
+
+@dataclass
+class PDHRetestState:
+    """Tracks the Previous Day High/Low retest state for the current session."""
+    session_date: object = None
+    pdh_break_confirmed: bool = False  # price traded >= PDH + PDH_BREAK_TICKS
+    pdl_break_confirmed: bool = False  # price traded <= PDL - PDH_BREAK_TICKS
+    pdh_fired_today: bool = False      # already took the PDH retest long today
+    pdl_fired_today: bool = False      # already took the PDL retest short today
+
+
+@dataclass
+class VWAPPullbackState:
+    """Tracks first-hour VWAP pullback state for the current session."""
+    session_date: object = None
+    session_open: float = 0.0       # price at the 9:30 CT open bar
+    drive_confirmed: bool = False   # True once first-hour VWAP move ≥ 1 ATR
+    drive_direction: str = ""       # "long" or "short"
+    trades_today: int = 0
+
+
+@dataclass
+class VPOCRevState:
+    """Tracks the running session volume-at-price profile and POC."""
+    session_date:    object = None
+    vol_at_price:    object = None   # dict {bin_price: cumulative_volume}
+    poc:             float  = 0.0    # current point of control price
+    bars_in_session: int    = 0
+    trades_today:    int    = 0
+    entry_extreme:   float  = 0.0   # extreme (high/low) of the rejection bar → structural stop
+    entry_poc:       float  = 0.0   # POC snapped at entry time → target
+
+
+@dataclass
+class SweepRevState:
+    """Tracks rolling N-bar high/low and sweep-and-reverse signals."""
+    session_date: object = None
+    recent_highs: object = None   # deque of bar highs (filled each bar)
+    recent_lows:  object = None   # deque of bar lows
+    sweep_extreme: float = 0.0    # high/low of the bar that swept the level
+    trades_today:  int   = 0
+    _pending:      str   = ""     # "long"/"short" if sweep detected on prev bar
+
+
+@dataclass
+class GapFillState:
+    """Tracks overnight-gap fade state for the current session."""
+    session_date: object = None
+    fired_today: bool = False     # only 1 gap fill entry per session
+    gap_direction: str = ""       # "long" (gap-down fade) or "short" (gap-up fade)
+    open_price: float = 0.0       # 9:30 open price (gap extreme for stop reference)
 
 
 @dataclass
@@ -970,6 +1117,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["mtf_15m_bear"] = (ema_fast_15m < ema_slow_15m).reindex(
         df.index, method="ffill").fillna(False)
 
+    # Relative volume: this bar's volume vs its own 20-bar rolling mean.
+    # High rel_vol = institutional activity = FVG is more mechanical.
+    # Low rel_vol  = thin market = FVG is a statistical guess.
+    df["rel_vol"] = df["volume"] / df["volume"].rolling(20, min_periods=5).mean()
+
     return df
 
 
@@ -1056,14 +1208,19 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
 # ── FVG HELPERS ───────────────────────────────────────────────────────────────
 
 def is_fvg_valid(fvg: FVG, current_bar: int, current_date: object,
-                 current_high: float, current_low: float) -> bool:
+                 current_high: float, current_low: float,
+                 current_close: float = None) -> bool:
     if fvg.session_date != current_date:
         return False
     if (current_bar - fvg.created_bar) > FVG_MAX_AGE_BARS:
         return False
-    if fvg.direction == "bullish" and current_low < fvg.bottom:
+    # Use close price for far-edge invalidation: a wick through the boundary
+    # does not kill the FVG — only a close through it does (orders still resting).
+    ref = current_close if current_close is not None else current_low
+    if fvg.direction == "bullish" and ref < fvg.bottom:
         return False
-    if fvg.direction == "bearish" and current_high > fvg.top:
+    ref = current_close if current_close is not None else current_high
+    if fvg.direction == "bearish" and ref > fvg.top:
         return False
     return True
 
@@ -1114,6 +1271,13 @@ def _passes_strategy_filters(
     """Apply optional post-signal filters for one-account optimization."""
     if SKIP_FOMC_ENTRIES and str(session_date) in FOMC_DATES:
         return False
+
+    # ISM Manufacturing PMI releases at 10:00 AM ET on first business day of month.
+    # Market makers pull quotes; block the single 5-min bar that opens at 10:00 AM ET.
+    if ISM_BLACKOUT_ENABLED and str(session_date) in ISM_DATES:
+        ct_min = dt_ct.hour * 60 + dt_ct.minute
+        if 9 * 60 <= ct_min < 9 * 60 + 5:   # 9:00–9:05 CT = 10:00–10:05 ET
+            return False
 
     if FOMC_BLACKOUT_ENABLED and str(session_date) in FOMC_DATES:
         ct_min = dt_ct.hour * 60 + dt_ct.minute
@@ -1500,6 +1664,14 @@ def _build_vwap_mr_setup(prev_row, current_price: float, dt_ct, active_fvgs, cur
         "failed_fvg_age":  (current_bar - recent_failed_fvg.created_bar)
                            if recent_failed_fvg else -1,
     }
+
+
+def _is_vwap_pb_window(dt_ct) -> bool:
+    from datetime import time as dtime
+    t     = dt_ct.time()
+    start = dtime(VWAP_PB_WINDOW_START[0], VWAP_PB_WINDOW_START[1])
+    end   = dtime(VWAP_PB_WINDOW_END[0],   VWAP_PB_WINDOW_END[1])
+    return start <= t <= end
 
 
 def _is_od_drive_bar(dt_ct) -> bool:
@@ -1889,6 +2061,41 @@ def compute_session_levels(df: pd.DataFrame) -> Dict:
 
 # ── BACKTEST ENGINE ───────────────────────────────────────────────────────────
 
+def compute_htf_fvgs(df: pd.DataFrame) -> List[Dict]:
+    """
+    Resample RTH 5-min bars to HTF_FVG_MINS bars and detect 3-bar FVGs.
+    Returns a list of zone dicts sorted by ts_active (when the zone first becomes tradeable).
+    Only emits zones where all 3 HTF bars are within the same calendar session.
+    """
+    td_htf = pd.Timedelta(minutes=HTF_FVG_MINS)
+    df_htf = df.resample(f"{HTF_FVG_MINS}min", closed="left", label="left").agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low",  "min"),
+        close=("close", "last"),
+    ).dropna(subset=["open"])
+
+    zones: List[Dict] = []
+    for i in range(2, len(df_htf)):
+        ts_a = df_htf.index[i - 2]
+        ts_c = df_htf.index[i]
+        # Skip if the 3-bar window crosses an overnight gap (different session dates)
+        if ts_a.date() != ts_c.date():
+            continue
+        a = df_htf.iloc[i - 2]
+        c = df_htf.iloc[i]
+        ts_active  = ts_c + td_htf        # first 5-min bar that can trade this zone
+        ts_expires = ts_active + td_htf * HTF_FVG_MAX_AGE_BARS
+
+        if c["low"] > a["high"] and (c["low"] - a["high"]) >= HTF_FVG_MIN_SIZE_PTS:
+            zones.append({"ts_active": ts_active, "ts_expires": ts_expires,
+                          "top": c["low"], "bottom": a["high"], "direction": "long"})
+        elif c["high"] < a["low"] and (a["low"] - c["high"]) >= HTF_FVG_MIN_SIZE_PTS:
+            zones.append({"ts_active": ts_active, "ts_expires": ts_expires,
+                          "top": a["low"], "bottom": c["high"], "direction": "short"})
+    return sorted(zones, key=lambda z: z["ts_active"])
+
+
 def run_backtest(
     df: pd.DataFrame,
     session_levels: Dict,
@@ -1919,8 +2126,21 @@ def run_backtest(
 
     current_day   = None
     active_fvgs:  List[FVG] = []
+
+    # HTF FVG state
+    _htf_zones_all:   List[Dict] = compute_htf_fvgs(df) if HTF_FVG_ENABLED else []
+    _htf_zones_ptr:   int        = 0
+    active_htf_fvgs:  List[Dict] = []
+    htffvg_today:     int        = 0
+    _htffvg_zone:     object     = None   # zone that triggered the current entry
+
     orb           = ORBState()
     od            = ODPullbackState()
+    pdhr          = PDHRetestState()
+    vwap_pb       = VWAPPullbackState()
+    sweeprev      = SweepRevState()
+    vpocrev       = VPOCRevState()
+    gapfill       = GapFillState()
 
     trade_number_overall  = 0
     trade_number_today    = 0
@@ -1972,10 +2192,20 @@ def run_backtest(
             day_trough_cash   = cash
             day_trades_list   = []
 
-            # Reset ORB for new session
-            orb = ORBState(session_date=session_date)
-            od  = ODPullbackState(session_date=session_date)
+            # Reset per-session state objects
+            orb      = ORBState(session_date=session_date)
+            od       = ODPullbackState(session_date=session_date)
+            pdhr     = PDHRetestState(session_date=session_date)
+            vwap_pb  = VWAPPullbackState(session_date=session_date)
+            sweeprev = SweepRevState(
+                session_date=session_date,
+                recent_highs=deque(maxlen=SWEEP_REV_LOOKBACK_BARS),
+                recent_lows =deque(maxlen=SWEEP_REV_LOOKBACK_BARS),
+            )
+            vpocrev  = VPOCRevState(session_date=session_date, vol_at_price={})
+            gapfill  = GapFillState(session_date=session_date)
             fb_levels_seen_today = set()
+            htffvg_today = 0
 
             # Clear FVGs from previous session
             active_fvgs = [f for f in active_fvgs if f.session_date == session_date]
@@ -2030,6 +2260,87 @@ def run_backtest(
                 orb.range_ticks = (orb.high - orb.low) / MNQ_TICK_SIZE
                 orb.formed = True
 
+        # ── SWEEP REV: maintain rolling N-bar high/low every bar ────────────
+        # Done BEFORE the entry check so we can detect a sweep on prev_row.
+        if SWEEP_REV_ENABLED and sweeprev.session_date == session_date:
+            if sweeprev.recent_highs is not None:
+                # Detect sweep on the bar that just completed (prev_row)
+                if len(sweeprev.recent_highs) == SWEEP_REV_LOOKBACK_BARS:
+                    _sr_n_high = max(sweeprev.recent_highs)
+                    _sr_n_low  = min(sweeprev.recent_lows)
+                    _sr_ph = float(prev_row["high"])
+                    _sr_pl = float(prev_row["low"])
+                    _sr_pc = float(prev_row["close"])
+                    # Sweep UP + closed back below → mark short opportunity
+                    if _sr_ph > _sr_n_high:
+                        _sr_dist = (_sr_ph - _sr_n_high) / MNQ_TICK_SIZE
+                        if 0 < _sr_dist <= SWEEP_REV_SWEEP_TICKS and _sr_pc <= _sr_n_high:
+                            sweeprev.sweep_extreme = _sr_ph
+                            sweeprev._pending = "short"
+                        else:
+                            sweeprev._pending = ""
+                    # Sweep DOWN + closed back above → mark long opportunity
+                    elif _sr_pl < _sr_n_low:
+                        _sr_dist = (_sr_n_low - _sr_pl) / MNQ_TICK_SIZE
+                        if 0 < _sr_dist <= SWEEP_REV_SWEEP_TICKS and _sr_pc >= _sr_n_low:
+                            sweeprev.sweep_extreme = _sr_pl
+                            sweeprev._pending = "long"
+                        else:
+                            sweeprev._pending = ""
+                    else:
+                        sweeprev._pending = ""
+                else:
+                    sweeprev._pending = ""
+                # Update deque with prev_row AFTER detection
+                sweeprev.recent_highs.append(float(prev_row["high"]))
+                sweeprev.recent_lows.append(float(prev_row["low"]))
+
+        # ── VOLUME POC: update running profile each bar ───────────────────────
+        # Accumulate volume at the bar's midpoint (binned to VPOC_BIN_POINTS).
+        # POC = bin with max cumulative volume → institutional gravity level.
+        if VPOC_ENABLED and vpocrev.session_date == session_date and vpocrev.vol_at_price is not None:
+            _vp_mid  = (float(prev_row["high"]) + float(prev_row["low"])) / 2.0
+            _vp_bin  = round(_vp_mid / VPOC_BIN_POINTS) * VPOC_BIN_POINTS
+            vpocrev.vol_at_price[_vp_bin] = vpocrev.vol_at_price.get(_vp_bin, 0.0) + float(prev_row["volume"])
+            vpocrev.bars_in_session += 1
+            if vpocrev.vol_at_price:
+                vpocrev.poc = max(vpocrev.vol_at_price, key=vpocrev.vol_at_price.get)
+
+        # ── VWAP PB: capture session open (9:30 CT first bar) ───────────────
+        if (VWAP_PB_ENABLED
+                and vwap_pb.session_date == session_date
+                and vwap_pb.session_open == 0.0
+                and date_ct.hour == 9 and date_ct.minute == 30):
+            vwap_pb.session_open = float(row["open"])
+
+        # ── VWAP PB: confirm first-hour drive at exactly 10:30 CT ────────────
+        if (VWAP_PB_ENABLED
+                and not vwap_pb.drive_confirmed
+                and vwap_pb.session_date == session_date
+                and vwap_pb.session_open > 0
+                and date_ct.hour == 10 and date_ct.minute == 30):
+            _pb_vwap = float(prev_row["vwap"]) if not pd.isna(prev_row["vwap"]) else 0.0
+            _pb_atr  = float(prev_row["atr"])  if not pd.isna(prev_row["atr"])  else 0.0
+            if _pb_vwap > 0 and _pb_atr > 0:
+                move = _pb_vwap - vwap_pb.session_open
+                if move >= VWAP_PB_MIN_MOVE_ATR * _pb_atr:
+                    vwap_pb.drive_confirmed  = True
+                    vwap_pb.drive_direction  = "long"
+                elif move <= -VWAP_PB_MIN_MOVE_ATR * _pb_atr:
+                    vwap_pb.drive_confirmed  = True
+                    vwap_pb.drive_direction  = "short"
+
+        # ── PDH/PDL break detection (runs every bar, outside in_trade gate) ──
+        if PDH_RETEST_ENABLED and pdhr.session_date == session_date:
+            _pdh_ref = sl.get("prev_day_high", 0.0)
+            _pdl_ref = sl.get("prev_day_low", 0.0)
+            if _pdh_ref > 0 and not pdhr.pdh_break_confirmed:
+                if float(prev_row["high"]) > _pdh_ref + PDH_BREAK_TICKS * MNQ_TICK_SIZE:
+                    pdhr.pdh_break_confirmed = True
+            if _pdl_ref > 0 and not pdhr.pdl_break_confirmed:
+                if float(prev_row["low"]) < _pdl_ref - PDH_BREAK_TICKS * MNQ_TICK_SIZE:
+                    pdhr.pdl_break_confirmed = True
+
         # Build opening-drive state from the first three 5m bars after 9:30
         if od.session_date == session_date and _is_od_drive_bar(date_ct):
             if od.bars_seen == 0:
@@ -2049,6 +2360,14 @@ def run_backtest(
                 and i > od.drive_end_bar + 1
                 and _is_od_entry_window(date_ct)):
             _update_od_pullback_state(od, prev_row)
+
+        # ── HTF FVG: activate zones whose ts_active <= current bar ───────────
+        _cur_ts = row.name
+        while (_htf_zones_ptr < len(_htf_zones_all)
+               and _htf_zones_all[_htf_zones_ptr]["ts_active"] <= _cur_ts):
+            active_htf_fvgs.append(_htf_zones_all[_htf_zones_ptr])
+            _htf_zones_ptr += 1
+        active_htf_fvgs = [z for z in active_htf_fvgs if z["ts_expires"] > _cur_ts]
 
         # ── Detect new FVG ────────────────────────────────────────────────────
         fvg_size_min = FVG_MIN_SIZE_TICKS * MNQ_TICK_SIZE
@@ -2078,7 +2397,7 @@ def run_backtest(
         # ── Prune stale FVGs ──────────────────────────────────────────────────
         active_fvgs = [
             f for f in active_fvgs
-            if is_fvg_valid(f, i, session_date, row["high"], row["low"])
+            if is_fvg_valid(f, i, session_date, row["high"], row["low"], row["close"])
         ]
 
         # ── Hard flatten outside session ──────────────────────────────────────
@@ -2356,6 +2675,7 @@ def run_backtest(
 
             if (entry_dir is None
                     and OD_PULLBACK_ENABLED
+                    and _router_allow_trend
                     and state.daily_trades < STRONG_MAX_TRADES):
                 od_trades_today = sum(1 for t in day_trades_list if t.entry_type == "OD_PULLBACK")
                 if od_trades_today < OD_MAX_TRADES_PER_DAY:
@@ -2370,6 +2690,157 @@ def run_backtest(
                     if od_setup is not None:
                         entry_dir = od_setup["direction"]
                         this_entry_type = "OD_PULLBACK"
+
+            # ── PDH/PDL RETEST ENTRY ─────────────────────────────────────────────
+            # Fires when price breaks cleanly through a previous day level then
+            # pulls back to test it. Uses the existing daily bias filter.
+            if (entry_dir is None
+                    and PDH_RETEST_ENABLED
+                    and _router_allow_trend
+                    and state.daily_trades < STRONG_MAX_TRADES):
+                _pdh_e = sl.get("prev_day_high", 0.0)
+                _pdl_e = sl.get("prev_day_low", 0.0)
+                if (pdhr.pdh_break_confirmed
+                        and not pdhr.pdh_fired_today
+                        and prev_row["long_bias"]
+                        and _pdh_e > 0
+                        and _pdh_e <= current_price <= _pdh_e + PDH_ENTRY_ZONE_TICKS * MNQ_TICK_SIZE):
+                    entry_dir       = "long"
+                    this_entry_type = "PDH_RETEST"
+                elif (pdhr.pdl_break_confirmed
+                        and not pdhr.pdl_fired_today
+                        and prev_row["short_bias"]
+                        and _pdl_e > 0
+                        and _pdl_e - PDH_ENTRY_ZONE_TICKS * MNQ_TICK_SIZE <= current_price <= _pdl_e):
+                    entry_dir       = "short"
+                    this_entry_type = "PDH_RETEST"
+
+            # ── GAP FILL — detect at 9:30, qualify the gap for entry at 9:35 ────────
+            if (GAP_FILL_ENABLED
+                    and not gapfill.fired_today
+                    and gapfill.session_date == session_date
+                    and date_ct.hour == 9 and date_ct.minute == 30):
+                _gf_pdc   = sl.get("prev_day_close", 0.0)
+                _gf_pdh   = sl.get("prev_day_high",  0.0)
+                _gf_pdl   = sl.get("prev_day_low",   0.0)
+                _gf_range = _gf_pdh - _gf_pdl
+                if _gf_pdc > 0 and _gf_range > 0:
+                    _gf_gap      = current_price - _gf_pdc
+                    _gf_gap_frac = abs(_gf_gap) / _gf_range
+                    if GAP_FILL_MIN_RANGE <= _gf_gap_frac <= GAP_FILL_MAX_RANGE:
+                        gapfill.open_price    = current_price
+                        gapfill.gap_direction = "short" if _gf_gap > 0 else "long"
+
+            # ── GAP FILL — confirm fade at 9:35 and enter ─────────────────────────
+            # Entering one bar later ensures the 9:30 bar STARTED fading the gap
+            # (first bar moved opposite to gap direction) before we commit.
+            if (entry_dir is None
+                    and GAP_FILL_ENABLED
+                    and not gapfill.fired_today
+                    and gapfill.session_date == session_date
+                    and gapfill.gap_direction != ""
+                    and date_ct.hour == 9 and date_ct.minute == 35):
+                _first_bar_faded = (
+                    (gapfill.gap_direction == "short"
+                     and float(prev_row["close"]) < float(prev_row["open"]))  # gap-up, first bar bearish
+                    or
+                    (gapfill.gap_direction == "long"
+                     and float(prev_row["close"]) > float(prev_row["open"]))  # gap-down, first bar bullish
+                )
+                if _first_bar_faded:
+                    entry_dir       = gapfill.gap_direction
+                    this_entry_type = "GAP_FILL"
+
+            # ── SWEEP & REVERSE ENTRY ─────────────────────────────────────────────
+            # Price swept the N-bar high/low by 1–SWEEP_TICKS then closed back
+            # through the level — the stop-hunt failed, fade the move.
+            if (entry_dir is None
+                    and SWEEP_REV_ENABLED
+                    and sweeprev.session_date == session_date
+                    and sweeprev._pending != ""
+                    and sweeprev.trades_today < SWEEP_REV_MAX_DAY
+                    and state.daily_trades < STRONG_MAX_TRADES):
+                entry_dir       = sweeprev._pending
+                this_entry_type = "SWEEP_REV"
+                sweeprev._pending = ""   # consume signal
+
+            # ── HTF FVG ENTRY ─────────────────────────────────────────────────────
+            # Enter when 5-min price trades inside an active 30-min FVG zone.
+            if (entry_dir is None
+                    and HTF_FVG_ENABLED
+                    and htffvg_today < HTF_FVG_MAX_TRADES
+                    and state.daily_trades < STRONG_MAX_TRADES):
+                for _z in list(active_htf_fvgs):
+                    if _z["bottom"] <= current_price <= _z["top"]:
+                        entry_dir       = _z["direction"]
+                        this_entry_type = "HTF_FVG"
+                        _htffvg_zone    = _z
+                        active_htf_fvgs.remove(_z)
+                        break
+
+            # ── VOLUME POC REVERSION ENTRY ────────────────────────────────────────
+            # Require TWO things from the PREVIOUS bar:
+            #   1. Its high/low reached ≥ VPOC_ENTRY_ATR × ATR beyond today's POC.
+            #   2. It closed in the opposing half of its range (rejection confirmed).
+            # Entering at the next bar's open (close of rejection bar) keeps R:R tight.
+            if (entry_dir is None
+                    and VPOC_ENABLED
+                    and vpocrev.session_date == session_date
+                    and vpocrev.poc > 0.0
+                    and vpocrev.bars_in_session >= VPOC_MIN_BARS
+                    and vpocrev.trades_today < VPOC_MAX_TRADES
+                    and state.daily_trades < STRONG_MAX_TRADES):
+                _vp_atr      = float(prev_row["atr"]) if not pd.isna(prev_row["atr"]) else 0.0
+                _vp_required = VPOC_ENTRY_ATR * _vp_atr
+                _vp_ph  = float(prev_row["high"])
+                _vp_pl  = float(prev_row["low"])
+                _vp_pc  = float(prev_row["close"])
+                _vp_bar_range = _vp_ph - _vp_pl
+                _vp_poc = vpocrev.poc
+                if _vp_atr > 0 and _vp_required > 0 and _vp_bar_range > 0:
+                    # SHORT: high reached above POC AND bar closed bearish (lower half)
+                    if (_vp_ph - _vp_poc >= _vp_required
+                            and (_vp_ph - _vp_pc) / _vp_bar_range >= 0.5):
+                        entry_dir = "short"
+                        this_entry_type = "VPOC_REV"
+                        vpocrev.entry_extreme = _vp_ph
+                        vpocrev.entry_poc     = _vp_poc
+                    # LONG: low reached below POC AND bar closed bullish (upper half)
+                    elif (_vp_poc - _vp_pl >= _vp_required
+                            and (_vp_pc - _vp_pl) / _vp_bar_range >= 0.5):
+                        entry_dir = "long"
+                        this_entry_type = "VPOC_REV"
+                        vpocrev.entry_extreme = _vp_pl
+                        vpocrev.entry_poc     = _vp_poc
+
+            # ── VWAP PULLBACK ENTRY ───────────────────────────────────────────────
+            # Fires after the first hour when price returns to touch the running VWAP
+            # in the direction of the morning's established move.
+            if (entry_dir is None
+                    and VWAP_PB_ENABLED
+                    and _router_allow_trend
+                    and vwap_pb.drive_confirmed
+                    and vwap_pb.trades_today < VWAP_PB_MAX_TRADES_PER_DAY
+                    and state.daily_trades < STRONG_MAX_TRADES
+                    and _is_vwap_pb_window(date_ct)):
+                _pb_vwap_now = float(prev_row["vwap"]) if not pd.isna(prev_row["vwap"]) else 0.0
+                if _pb_vwap_now > 0:
+                    _pb_zone = VWAP_PB_ENTRY_ZONE_TICKS * MNQ_TICK_SIZE
+                    # Bounce confirmation: prev bar touched VWAP zone AND closed on the
+                    # correct side, AND current bar opens on the correct side.
+                    # All three conditions together mean VWAP held as a level.
+                    _long_bounce  = (float(prev_row["low"])  <= _pb_vwap_now + _pb_zone
+                                     and float(prev_row["close"]) > _pb_vwap_now
+                                     and current_price >= _pb_vwap_now)
+                    _short_bounce = (float(prev_row["high"]) >= _pb_vwap_now - _pb_zone
+                                     and float(prev_row["close"]) < _pb_vwap_now
+                                     and current_price <= _pb_vwap_now)
+                    if vwap_pb.drive_direction == "long" and prev_row["long_bias"] and _long_bounce:
+                        entry_dir       = "long"
+                        this_entry_type = "VWAP_PB"
+                    elif vwap_pb.drive_direction == "short" and prev_row["short_bias"] and _short_bounce:
+                        entry_dir       = "short"
+                        this_entry_type = "VWAP_PB"
 
             # ── FVG ENTRY (requires ATR regime, fires if ORB/OD not triggered) ──
             if entry_dir is None and _router_allow_trend:
@@ -2457,6 +2928,18 @@ def run_backtest(
                 base_contracts = FB_CONTRACTS
             elif this_entry_type == "VWAP_MR":
                 base_contracts = VWAP_MR_CONTRACTS
+            elif this_entry_type == "PDH_RETEST":
+                base_contracts = profile["contracts"]
+            elif this_entry_type == "VWAP_PB":
+                base_contracts = profile["contracts"]
+            elif this_entry_type == "SWEEP_REV":
+                base_contracts = SWEEP_REV_CONTRACTS
+            elif this_entry_type == "HTF_FVG":
+                base_contracts = HTF_FVG_CONTRACTS
+            elif this_entry_type == "VPOC_REV":
+                base_contracts = VPOC_CONTRACTS
+            elif this_entry_type == "GAP_FILL":
+                base_contracts = GAP_FILL_CONTRACTS
             else:
                 base_contracts = profile["contracts"]
             if drawdown_pct > -2.5:
@@ -2514,6 +2997,66 @@ def run_backtest(
                 elif this_entry_type == "VWAP_MR":
                     fvg_stop = vwap_mr_setup["stop_price"]
                     target_ticks = int(vwap_mr_setup["target_ticks"])
+                elif this_entry_type == "PDH_RETEST":
+                    _pdh_s = sl.get("prev_day_high", 0.0)
+                    _pdl_s = sl.get("prev_day_low", 0.0)
+                    if entry_dir == "long":
+                        fvg_stop = _pdh_s - PDH_STOP_TICKS * MNQ_TICK_SIZE
+                        pdhr.pdh_fired_today = True
+                    else:
+                        fvg_stop = _pdl_s + PDH_STOP_TICKS * MNQ_TICK_SIZE
+                        pdhr.pdl_fired_today = True
+                    target_ticks = PDH_TARGET_TICKS
+                elif this_entry_type == "VWAP_PB":
+                    _pb_vwap_stop = float(prev_row["vwap"]) if not pd.isna(prev_row["vwap"]) else current_price
+                    if entry_dir == "long":
+                        fvg_stop = _pb_vwap_stop - VWAP_PB_STOP_TICKS * MNQ_TICK_SIZE
+                    else:
+                        fvg_stop = _pb_vwap_stop + VWAP_PB_STOP_TICKS * MNQ_TICK_SIZE
+                    target_ticks = VWAP_PB_TARGET_TICKS
+                    vwap_pb.trades_today += 1
+                elif this_entry_type == "SWEEP_REV":
+                    # Stop is structural: beyond the sweep bar's extreme + small buffer.
+                    # If price goes back through the level the stop-hunt "succeeded" — exit.
+                    if entry_dir == "short":
+                        fvg_stop = sweeprev.sweep_extreme + SWEEP_REV_STOP_BUFFER * MNQ_TICK_SIZE
+                    else:
+                        fvg_stop = sweeprev.sweep_extreme - SWEEP_REV_STOP_BUFFER * MNQ_TICK_SIZE
+                    target_ticks = SWEEP_REV_TARGET_TICKS
+                    sweeprev.trades_today += 1
+                elif this_entry_type == "HTF_FVG":
+                    # Stop: beyond the far edge of the 30-min gap + small buffer.
+                    # Target: fixed HTF_FVG_TARGET_TICKS (larger because the gap is bigger).
+                    if entry_dir == "long":
+                        fvg_stop = _htffvg_zone["bottom"] - HTF_FVG_STOP_BUFFER * MNQ_TICK_SIZE
+                    else:
+                        fvg_stop = _htffvg_zone["top"] + HTF_FVG_STOP_BUFFER * MNQ_TICK_SIZE
+                    target_ticks = HTF_FVG_TARGET_TICKS
+                    htffvg_today += 1
+                elif this_entry_type == "VPOC_REV":
+                    # Tight ATR stop from entry — keeps losses small so high R:R is preserved.
+                    # Target: the POC price (where the most volume was done today).
+                    _vp_atr2 = float(prev_row["atr"]) if not pd.isna(prev_row["atr"]) else 0.0
+                    _vp_stop_dist = max(VPOC_STOP_TICKS * MNQ_TICK_SIZE, 0.15 * _vp_atr2)
+                    if entry_dir == "short":
+                        fvg_stop     = current_price + _vp_stop_dist
+                        target_ticks = max(8, int((current_price - vpocrev.entry_poc) / MNQ_TICK_SIZE))
+                    else:
+                        fvg_stop     = current_price - _vp_stop_dist
+                        target_ticks = max(8, int((vpocrev.entry_poc - current_price) / MNQ_TICK_SIZE))
+                    vpocrev.trades_today += 1
+                elif this_entry_type == "GAP_FILL":
+                    _gf_pdc_s = sl.get("prev_day_close", 0.0)
+                    # Stop = beyond the 9:30 open price (the gap's outer extreme)
+                    # plus a buffer. This is structural — the gap-and-go is only
+                    # confirmed if price exceeds where the session opened.
+                    if entry_dir == "short":
+                        fvg_stop = gapfill.open_price + GAP_FILL_STOP_TICKS * MNQ_TICK_SIZE
+                    else:
+                        fvg_stop = gapfill.open_price - GAP_FILL_STOP_TICKS * MNQ_TICK_SIZE
+                    # Target = the gap fill price (prev day close)
+                    target_ticks = max(4, int(abs(current_price - _gf_pdc_s) / MNQ_TICK_SIZE))
+                    gapfill.fired_today = True
                 else:
                     # FVG stop: beyond FVG boundary
                     if entry_dir == "long":
@@ -2531,6 +3074,14 @@ def run_backtest(
                     )
                     active_fvgs  = [f for f in active_fvgs if f is not entry_fvg]
 
+            # ATR constant-dollar-risk sizing: after stop is known, rescale FVG
+            # contracts so the dollar exposure stays near ATR_CDR_TARGET_USD.
+            if ATR_CDR_ENABLED and this_entry_type == "FVG" and fvg_stop != 0.0:
+                _stop_dist = abs(current_price - fvg_stop)
+                if _stop_dist > 0:
+                    _risk_per_ctr = _stop_dist * MNQ_POINT_VALUE
+                    contracts = max(1, min(contracts, int(ATR_CDR_TARGET_USD / _risk_per_ctr)))
+
             if this_entry_type == "FVG":
                 entry_regime = profile["regime"]
             elif this_entry_type == "ORB":
@@ -2539,6 +3090,18 @@ def run_backtest(
                 entry_regime = od_setup["regime"]
             elif this_entry_type == "FAILED_BREAKOUT":
                 entry_regime = fb_setup["regime"]
+            elif this_entry_type == "PDH_RETEST":
+                entry_regime = profile["regime"]
+            elif this_entry_type == "VWAP_PB":
+                entry_regime = profile["regime"]
+            elif this_entry_type == "SWEEP_REV":
+                entry_regime = profile["regime"]
+            elif this_entry_type == "HTF_FVG":
+                entry_regime = profile["regime"]
+            elif this_entry_type == "VPOC_REV":
+                entry_regime = profile["regime"]
+            elif this_entry_type == "GAP_FILL":
+                entry_regime = profile["regime"]
             else:
                 entry_regime = vwap_mr_setup["regime"]
             # ADX-based bar regime (used by consistency scorecard to filter chop subset)
