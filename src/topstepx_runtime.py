@@ -2,13 +2,23 @@ import argparse
 import csv
 import json
 import os
-import sys
 import re
+import socket
+import ssl
+import sys
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from urllib import error, parse, request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# Load .env before anything reads os.getenv()
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+except ImportError:
+    pass
 
 from src import bot
 from src.topstepx_client import (
@@ -1681,6 +1691,69 @@ def _restart_user_stream(
     return restarted
 
 
+TELEGRAM_REQUEST_TIMEOUT_SECONDS = 15
+TELEGRAM_SEND_RETRIES = 3
+
+
+def _telegram_settings() -> Dict[str, str]:
+    return {
+        "token": os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+        "chat_id": os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+    }
+
+
+def _telegram_ready() -> bool:
+    s = _telegram_settings()
+    return bool(s["token"] and s["chat_id"])
+
+
+def _send_telegram_message(text: str) -> None:
+    s = _telegram_settings()
+    endpoint = f"https://api.telegram.org/bot{s['token']}/sendMessage"
+    payload = parse.urlencode(
+        {"chat_id": s["chat_id"], "text": text, "disable_web_page_preview": "true"}
+    ).encode("utf-8")
+    req = request.Request(
+        endpoint,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    for attempt in range(1, TELEGRAM_SEND_RETRIES + 1):
+        try:
+            with request.urlopen(req, timeout=TELEGRAM_REQUEST_TIMEOUT_SECONDS):
+                return
+        except (error.URLError, TimeoutError, socket.timeout, ssl.SSLError) as exc:
+            if attempt == TELEGRAM_SEND_RETRIES:
+                raise TopstepXAPIError(f"Telegram network error after {attempt} attempts: {exc}") from exc
+            time.sleep(2.0)
+
+
+def _send_telegram_lines(lines: List[str]) -> bool:
+    if not _telegram_ready():
+        return False
+    try:
+        _send_telegram_message("\n".join(str(l) for l in lines if str(l).strip()))
+        _write_log("INFO", "telegram_alert_sent key=startup")
+        return True
+    except Exception as exc:
+        _write_log("ERROR", f"telegram_alert_failed key=startup: {exc}", error_only=True)
+        return False
+
+
+def _send_startup_telegram_alert(config: TopstepXConfig, *, auto_submit: bool) -> None:
+    _send_telegram_lines(
+        [
+            "MNQ Bot Started",
+            f"Session date: {_current_session_date()}",
+            f"Account: {config.account_name}",
+            f"Auto-submit: {auto_submit}",
+            f"Dry run: {config.dry_run}",
+            f"Routing enabled: {config.enable_order_routing}",
+        ]
+    )
+
+
 def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
     config = TopstepXConfig.from_env()
     client = TopstepXClient(config)
@@ -1692,6 +1765,7 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
         "INFO",
         f"run_loop_started auto_submit={auto_submit} interval_seconds={interval_seconds} dry_run={config.dry_run}",
     )
+    _send_startup_telegram_alert(config, auto_submit=auto_submit)
 
     while True:
         state = _load_state()
