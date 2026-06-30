@@ -729,11 +729,11 @@ def _bars_to_strategy_df(bars: List[Dict[str, Any]]):
         raise TopstepXAPIError("ProjectX returned bar payloads without timestamps.")
 
     df = bot.pd.DataFrame.from_records(records)
-    df["ts_event"] = bot.pd.to_datetime(df["ts_event"], utc=True).dt.tz_convert("US/Eastern")
+    df["ts_event"] = bot.pd.to_datetime(df["ts_event"], utc=True).dt.tz_convert("America/Chicago")
     df = df.sort_values("ts_event")
     df = df.drop_duplicates(subset="ts_event", keep="last")
     df = df.set_index("ts_event")
-    df = df.between_time("09:30", "16:00")
+    df = df.between_time("08:30", "15:15")
     df = df[["open", "high", "low", "close", "volume"]]
     if df.empty:
         raise TopstepXAPIError("ProjectX live bar retrieval produced an empty RTH dataset after filtering.")
