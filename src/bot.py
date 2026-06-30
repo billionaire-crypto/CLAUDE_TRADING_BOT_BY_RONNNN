@@ -159,6 +159,17 @@ FVG_BOS_BONUS_ENABLED             = True
 FVG_BOS_LOOKBACK_BARS             = 5
 FVG_REACTION_CLOSE_BONUS_ENABLED  = True
 
+# ── FVG experiment filters (all disabled by default) ──────────────────────────
+FVG_LUNCH_FILTER_ENABLED     = False  # idea 1: block entries 11:00–12:30 CT
+FVG_LUNCH_START_CT           = (11, 0)
+FVG_LUNCH_END_CT             = (12, 30)
+FVG_VWAP_RUBBER_BAND_ENABLED = False  # idea 2: require VWAP extension at creation
+FVG_VWAP_MIN_EXTENSION_PTS   = 12.0
+FVG_BODY_QUALITY_ENABLED     = False  # idea 3: require strong impulse candle
+FVG_BODY_MIN_PCT             = 0.60
+FVG_SWEEP_REQUIRED           = False  # idea 4: require liquidity sweep before FVG
+FVG_OVERLAP_REQUIRED         = False  # idea 5: require 2+ overlapping active FVGs
+
 # ── V28: ORB SETTINGS ─────────────────────────────────────────────────────────
 ORB_RANGE_BARS         = 3       # 6 bars = 30 minutes (9:30-10:00 CT)
 ORB_ENTRY_WINDOW_START = (9, 30) # CT hour, minute — range starts forming
@@ -274,6 +285,9 @@ FVG_SCORE_MEDIUM_THRESHOLD     = 3
 FVG_SCORE_MEDIUM_SIZE_STEP     = 1
 FVG_SCORE_HIGH_THRESHOLD       = 4
 FVG_SCORE_HIGH_SIZE_STEP       = 2
+# Score-to-contracts map (overrides old additive system; Topstep 50K limit = 50 MNQ)
+FVG_SCORE_CONTRACT_MAP_ENABLED = True
+FVG_SCORE_CONTRACT_MAP         = {8: 50, 7: 40, 6: 10}  # score >= key → contracts value
 LATE_LONG_TARGET_ENABLED       = False
 LATE_LONG_TARGET_START_HOUR    = 10
 LATE_LONG_TARGET_END_HOUR      = 11
@@ -438,6 +452,9 @@ class FVG:
     created_bar: int
     session_date: object
     tested: bool = False
+    body_pct: float = 0.0              # impulse bar body / total range (0–1)
+    sweep: bool = False                # impulse bar wicked past setup bar extreme
+    vwap_dist_at_creation: float = 0.0 # abs(close - vwap) on impulse bar
 
 
 @dataclass
@@ -1204,6 +1221,15 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── FVG HELPERS ───────────────────────────────────────────────────────────────
 
+def _has_fvg_overlap(target: FVG, all_fvgs: List[FVG]) -> bool:
+    """True if any OTHER active FVG of the same direction overlaps target's zone."""
+    for other in all_fvgs:
+        if other is target or other.direction != target.direction:
+            continue
+        if max(other.bottom, target.bottom) < min(other.top, target.top):
+            return True
+    return False
+
 def is_fvg_valid(fvg: FVG, current_bar: int, current_date: object,
                  current_high: float, current_low: float,
                  current_close: float = None) -> bool:
@@ -1320,6 +1346,13 @@ def _passes_strategy_filters(
         if adx < LONG_FILTER_MIN_ADX:
             return False
         if ema_spread_pts < LONG_FILTER_MIN_EMA_SPREAD_PTS:
+            return False
+
+    if FVG_LUNCH_FILTER_ENABLED and entry_type == "FVG":
+        ct_min = dt_ct.hour * 60 + dt_ct.minute
+        ls, lm = FVG_LUNCH_START_CT
+        le, lem = FVG_LUNCH_END_CT
+        if ls * 60 + lm <= ct_min < le * 60 + lem:
             return False
 
     return True
@@ -2372,23 +2405,35 @@ def run_backtest(
         if bar_2["high"] < row["low"]:
             gap_size = row["low"] - bar_2["high"]
             if gap_size >= fvg_size_min:
+                _imp_range = prev_row["high"] - prev_row["low"]
+                _imp_body  = max(0.0, float(prev_row["close"]) - float(prev_row["open"]))
+                _vwap_val  = float(prev_row.get("vwap", 0.0) or 0.0)
                 active_fvgs.append(FVG(
                     direction="bullish",
                     top=row["low"],
                     bottom=bar_2["high"],
                     created_bar=i,
                     session_date=session_date,
+                    body_pct=(_imp_body / _imp_range) if _imp_range > 0 else 0.0,
+                    sweep=bool(prev_row["low"] < bar_2["low"]),
+                    vwap_dist_at_creation=abs(float(prev_row["close"]) - _vwap_val) if _vwap_val > 0 else 0.0,
                 ))
 
         if bar_2["low"] > row["high"]:
             gap_size = bar_2["low"] - row["high"]
             if gap_size >= fvg_size_min:
+                _imp_range = prev_row["high"] - prev_row["low"]
+                _imp_body  = max(0.0, float(prev_row["open"]) - float(prev_row["close"]))
+                _vwap_val  = float(prev_row.get("vwap", 0.0) or 0.0)
                 active_fvgs.append(FVG(
                     direction="bearish",
                     top=bar_2["low"],
                     bottom=row["high"],
                     created_bar=i,
                     session_date=session_date,
+                    body_pct=(_imp_body / _imp_range) if _imp_range > 0 else 0.0,
+                    sweep=bool(prev_row["high"] > bar_2["high"]),
+                    vwap_dist_at_creation=abs(float(prev_row["close"]) - _vwap_val) if _vwap_val > 0 else 0.0,
                 ))
 
         # ── Prune stale FVGs ──────────────────────────────────────────────────
@@ -2847,6 +2892,10 @@ def run_backtest(
                         for fvg in active_fvgs:
                             if (fvg.direction == "bullish"
                                     and (not FVG_FRESH_ONLY or not fvg.tested)
+                                    and (not FVG_BODY_QUALITY_ENABLED or fvg.body_pct >= FVG_BODY_MIN_PCT)
+                                    and (not FVG_SWEEP_REQUIRED or fvg.sweep)
+                                    and (not FVG_VWAP_RUBBER_BAND_ENABLED or fvg.vwap_dist_at_creation >= FVG_VWAP_MIN_EXTENSION_PTS)
+                                    and (not FVG_OVERLAP_REQUIRED or _has_fvg_overlap(fvg, active_fvgs))
                                     and price_in_fvg(fvg, current_price)):
                                 entry_fvg       = fvg
                                 entry_dir       = "long"
@@ -2857,6 +2906,10 @@ def run_backtest(
                         for fvg in active_fvgs:
                             if (fvg.direction == "bearish"
                                     and (not FVG_FRESH_ONLY or not fvg.tested)
+                                    and (not FVG_BODY_QUALITY_ENABLED or fvg.body_pct >= FVG_BODY_MIN_PCT)
+                                    and (not FVG_SWEEP_REQUIRED or fvg.sweep)
+                                    and (not FVG_VWAP_RUBBER_BAND_ENABLED or fvg.vwap_dist_at_creation >= FVG_VWAP_MIN_EXTENSION_PTS)
+                                    and (not FVG_OVERLAP_REQUIRED or _has_fvg_overlap(fvg, active_fvgs))
                                     and price_in_fvg(fvg, current_price)):
                                 entry_fvg       = fvg
                                 entry_dir       = "short"
@@ -2960,6 +3013,13 @@ def run_backtest(
                         contracts = min(STRONG_CONTRACTS, contracts + FVG_SCORE_HIGH_SIZE_STEP)
                     elif fvg_score >= FVG_SCORE_MEDIUM_THRESHOLD:
                         contracts = min(STRONG_CONTRACTS, contracts + FVG_SCORE_MEDIUM_SIZE_STEP)
+
+            if this_entry_type == "FVG" and FVG_SCORE_CONTRACT_MAP_ENABLED:
+                fvg_score = int(fvg_quality["score"])
+                for threshold in sorted(FVG_SCORE_CONTRACT_MAP.keys(), reverse=True):
+                    if fvg_score >= threshold:
+                        contracts = FVG_SCORE_CONTRACT_MAP[threshold]
+                        break
             elif (this_entry_type == "FAILED_BREAKOUT"
                   and FB_QUALITY_SIZING_ENABLED
                   and drawdown_pct > -2.5
@@ -3073,11 +3133,20 @@ def run_backtest(
 
             # ATR constant-dollar-risk sizing: after stop is known, rescale FVG
             # contracts so the dollar exposure stays near ATR_CDR_TARGET_USD.
+            # For score-mapped contracts, scale the CDR target proportionally so
+            # per-contract risk stays constant (same $16/contract = 8-pt equivalent).
             if ATR_CDR_ENABLED and this_entry_type == "FVG" and fvg_stop != 0.0:
                 _stop_dist = abs(current_price - fvg_stop)
                 if _stop_dist > 0:
                     _risk_per_ctr = _stop_dist * MNQ_POINT_VALUE
-                    contracts = max(1, min(contracts, int(ATR_CDR_TARGET_USD / _risk_per_ctr)))
+                    _cdr_target = ATR_CDR_TARGET_USD
+                    if FVG_SCORE_CONTRACT_MAP_ENABLED:
+                        _sc = int(fvg_quality["score"])
+                        for _th in sorted(FVG_SCORE_CONTRACT_MAP.keys(), reverse=True):
+                            if _sc >= _th:
+                                _cdr_target = ATR_CDR_TARGET_USD * (FVG_SCORE_CONTRACT_MAP[_th] / STRONG_CONTRACTS)
+                                break
+                    contracts = max(1, min(contracts, int(_cdr_target / _risk_per_ctr)))
 
             if this_entry_type == "FVG":
                 entry_regime = profile["regime"]
