@@ -412,26 +412,20 @@ NFP_DATES = {
 }
 # ISM Manufacturing PMI — first business day of each month (10:00 AM ET release)
 ISM_BLACKOUT_ENABLED = True
-ISM_DATES = {
-    "2019-01-02","2019-02-01","2019-03-01","2019-04-01","2019-05-01","2019-06-03",
-    "2019-07-01","2019-08-01","2019-09-03","2019-10-01","2019-11-01","2019-12-02",
-    "2020-01-02","2020-02-03","2020-03-02","2020-04-01","2020-05-01","2020-06-01",
-    "2020-07-01","2020-08-03","2020-09-01","2020-10-01","2020-11-02","2020-12-01",
-    "2021-01-05","2021-02-01","2021-03-01","2021-04-01","2021-05-03","2021-06-01",
-    "2021-07-01","2021-08-02","2021-09-01","2021-10-01","2021-11-01","2021-12-01",
-    "2022-01-04","2022-02-01","2022-03-01","2022-04-01","2022-05-02","2022-06-01",
-    "2022-07-01","2022-08-01","2022-09-01","2022-10-03","2022-11-01","2022-12-01",
-    "2023-01-04","2023-02-01","2023-03-01","2023-04-03","2023-05-01","2023-06-01",
-    "2023-07-03","2023-08-01","2023-09-01","2023-10-02","2023-11-01","2023-12-01",
-    "2024-01-03","2024-02-01","2024-03-01","2024-04-01","2024-05-01","2024-06-03",
-    "2024-07-01","2024-08-01","2024-09-03","2024-10-01","2024-11-01","2024-12-02",
-    "2025-01-02","2025-02-03","2025-03-03","2025-04-01","2025-05-01","2025-06-02",
-    "2025-07-01","2025-08-01","2025-09-02","2025-10-01","2025-11-03","2025-12-01",
-    "2026-01-02","2026-02-02","2026-03-02","2026-04-01","2026-05-01","2026-06-01",
-    "2026-07-01","2026-08-03","2026-09-01","2026-10-01","2026-11-02","2026-12-01",
-    "2027-01-04","2027-02-01","2027-03-01","2027-04-01","2027-05-03","2027-06-01",
-    "2027-07-01","2027-08-02","2027-09-01","2027-10-01","2027-11-01","2027-12-01",
-}
+
+def _is_ism_day(session_date_str: str) -> bool:
+    """True if session_date is the first business day of its month (ISM release day).
+    Skips weekends and New Year's Day (the only federal holiday that falls on the 1st
+    of a month and can shift the first business day)."""
+    import datetime as _dt
+    try:
+        d = _dt.date.fromisoformat(str(session_date_str))
+    except ValueError:
+        return False
+    candidate = _dt.date(d.year, d.month, 1)
+    while candidate.weekday() >= 5 or (candidate.month == 1 and candidate.day == 1):
+        candidate += _dt.timedelta(days=1)
+    return candidate == d
 ALL_NEWS_DATES = FOMC_DATES | CPI_DATES | NFP_DATES
 
 # ── DATA CLASSES ──────────────────────────────────────────────────────────────
@@ -1277,7 +1271,7 @@ def _passes_strategy_filters(
 
     # ISM Manufacturing PMI releases at 10:00 AM ET on first business day of month.
     # Market makers pull quotes; block the single 5-min bar that opens at 10:00 AM ET.
-    if ISM_BLACKOUT_ENABLED and str(session_date) in ISM_DATES:
+    if ISM_BLACKOUT_ENABLED and _is_ism_day(session_date):
         ct_min = dt_ct.hour * 60 + dt_ct.minute
         if 9 * 60 <= ct_min < 9 * 60 + 5:   # 9:00–9:05 CT = 10:00–10:05 ET
             return False
