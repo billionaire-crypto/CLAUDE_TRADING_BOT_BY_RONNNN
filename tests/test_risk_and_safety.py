@@ -384,6 +384,33 @@ def test_phantom_filter_flag_and_default():
     assert bot.PHANTOM_BAR_FILTER_ENABLED is True
 
 
+# ── Orphan-order detection (E4: flat account with leftover working orders) ──────
+def test_orphan_orders_detected_when_flat_with_orders():
+    cfg = _Cfg(enable_order_routing=True, dry_run=False)
+    st = {"open_position_count": 0, "open_order_count": 1}  # flat, but an order lingers
+    assert tr._orphan_orders_detected(st, cfg) is True
+
+def test_no_orphan_when_position_open():
+    cfg = _Cfg(enable_order_routing=True, dry_run=False)
+    st = {"open_position_count": 1, "open_order_count": 1}  # order belongs to the position
+    assert tr._orphan_orders_detected(st, cfg) is False
+
+def test_no_orphan_when_flat_and_no_orders():
+    cfg = _Cfg(enable_order_routing=True, dry_run=False)
+    st = {"open_position_count": 0, "open_order_count": 0}
+    assert tr._orphan_orders_detected(st, cfg) is False
+
+def test_orphan_not_flagged_in_dry_run():
+    cfg = _Cfg(enable_order_routing=True, dry_run=True)
+    st = {"open_position_count": 0, "open_order_count": 2}
+    assert tr._orphan_orders_detected(st, cfg) is False
+
+def test_orphan_not_flagged_when_routing_disabled():
+    cfg = _Cfg(enable_order_routing=False, dry_run=False)
+    st = {"open_position_count": 0, "open_order_count": 2}
+    assert tr._orphan_orders_detected(st, cfg) is False
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))

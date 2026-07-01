@@ -1191,6 +1191,20 @@ def _unprotected_position_detected(state: Dict[str, Any], config: TopstepXConfig
     return positions > 0 and orders == 0
 
 
+def _orphan_orders_detected(state: Dict[str, Any], config: TopstepXConfig) -> bool:
+    """True when live routing is FLAT (no position) but working orders remain --
+    e.g. a take-profit filled and its sibling stop was never cancelled. Such an
+    orphan order can later fill and open an unintended, unprotected position."""
+    if not config.enable_order_routing or config.dry_run:
+        return False
+    try:
+        positions = int(state.get("open_position_count", 0) or 0)
+        orders = int(state.get("open_order_count", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return positions == 0 and orders > 0
+
+
 def reconcile_state(client: TopstepXClient, config: TopstepXConfig) -> Dict[str, Any]:
     state = _load_state()
     now = _current_ct_now()
@@ -1291,6 +1305,34 @@ def reconcile_state(client: TopstepXClient, config: TopstepXConfig) -> Dict[str,
             _flatten_account_internal(client, config, reason="unprotected_position_state_mismatch")
         except Exception as exc:
             _write_log("ERROR", f"flatten_after_state_mismatch_failed: {exc}", error_only=True)
+
+    # Orphan-order cleanup (E4): account is FLAT but working orders remain (e.g. a
+    # take-profit filled and its sibling stop was left working). Cancel the
+    # leftovers so a stale order cannot fill and open an unintended position.
+    # Guards against a mid-entry race: skip while awaiting an entry fill or within
+    # 120s of a submit, when working orders may belong to a position about to open.
+    if _orphan_orders_detected(state, config) and not state.get("awaiting_entry_fill"):
+        _since_submit = _duration_ms(state.get("last_order_submitted_at"),
+                                     datetime.now(bot.TIMEZONE).isoformat())
+        if _since_submit is None or _since_submit > 120_000:
+            cancelled = 0
+            for _o in open_orders:
+                _oid = _o.get("id") if _o.get("id") is not None else _o.get("orderId")
+                if _oid is None:
+                    continue
+                try:
+                    client.cancel_order(account_id, int(_oid))
+                    cancelled += 1
+                except Exception as exc:
+                    _write_log("ERROR", f"orphan_order_cancel_failed id={_oid}: {exc}", error_only=True)
+            if cancelled:
+                _write_log("WARN", f"orphan_orders_cancelled count={cancelled} "
+                                   f"(account flat with working orders)")
+                _send_telegram_lines([
+                    "MNQ Bot: orphan orders cancelled",
+                    f"{cancelled} working order(s) with no open position — cleaned up.",
+                ])
+                state["open_order_count"] = 0
 
     consistency = _update_consistency_state(state, config)
     reconcile = {
