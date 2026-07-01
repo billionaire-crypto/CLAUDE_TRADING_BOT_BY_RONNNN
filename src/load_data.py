@@ -1,6 +1,12 @@
 import pandas as pd
 
-def load_mes_data(filepath: str) -> pd.DataFrame:
+def load_ohlcv_csv(filepath: str) -> pd.DataFrame:
+    """Generic 1-minute OHLCV CSV loader/resampler to 5-minute RTH bars.
+
+    Instrument-agnostic: applies NO tick/point/dollar math — it only reshapes
+    OHLCV. The active instrument is whatever `filepath` points to (currently the
+    MNQ GLBX file set by bot.DATA_PATH). Formerly named load_mes_data.
+    """
     print("Loading CSV...")
     df = pd.read_csv(filepath, parse_dates=['ts_event'])
 
@@ -10,9 +16,9 @@ def load_mes_data(filepath: str) -> pd.DataFrame:
     # Convert UTC to US/Eastern
     df['ts_event'] = pd.to_datetime(df['ts_event'], utc=True).dt.tz_convert('US/Eastern')
 
-    # Filter to front-month continuous contract only
-    # Front month symbols follow pattern: MES + month code + year (e.g. MESM9, MESH5)
-    # We keep the most liquid contract at each point = lowest expiry still active
+    # Filter to front-month continuous contract only.
+    # Front-month symbols follow pattern: <ROOT> + month code + year (e.g. MNQM9).
+    # We keep the most liquid contract at each point = lowest expiry still active.
     df = df.sort_values('ts_event')
 
     # Resample 1m -> 5m
@@ -47,5 +53,6 @@ def load_mes_data(filepath: str) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    filepath = r"C:\Users\kyawz\Downloads\GLBX-20260315-XECEHWSFA6\MES_1m_bars.csv"
-    df = load_mes_data(filepath)
+    # Manual smoke test: point this at the active data file (see bot.DATA_PATH).
+    from src.bot import DATA_PATH
+    df = load_ohlcv_csv(DATA_PATH)

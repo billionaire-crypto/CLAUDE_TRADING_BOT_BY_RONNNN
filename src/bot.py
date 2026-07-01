@@ -30,7 +30,7 @@ from typing import List, Tuple, Optional, Dict
 import warnings
 warnings.filterwarnings("ignore")
 
-from src.load_data import load_mes_data
+from src.load_data import load_ohlcv_csv
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 DATA_PATH       = r"C:\Users\kyawz\Downloads\GLBX-20260331-885WT5W7KA\glbx-mdp3-20100606-20260329.ohlcv-1m.csv"
@@ -55,8 +55,11 @@ PRIOR_TRADES    = 20
 PRIOR_WIN_RATE  = 0.45
 
 # ── MNQ CONTRACT SPECS (changed from MES) ────────────────────────────────────
-COMMISSION_PER_CONTRACT = 1.34
-SLIPPAGE_TICKS          = 1.0
+COMMISSION_PER_CONTRACT  = 1.34
+SLIPPAGE_TICKS           = 1.0   # used when SLIPPAGE_SCALE_ENABLED=False or CLI override
+SLIPPAGE_SCALE_ENABLED   = True  # scale slippage with contract size (more realistic)
+# Tiers: 1-10 contracts = 1 tick, 11-20 = 2 ticks, 21+ = 3 ticks
+SLIPPAGE_SCALE_TIERS     = [(10, 1.0), (20, 2.0), (999, 3.0)]
 
 MNQ_TICK_SIZE   = 0.25          # same tick size as MES
 MNQ_TICK_VALUE  = 0.50          # $0.50/tick (MES was $1.25)
@@ -109,6 +112,22 @@ STRONG_MAX_TRADES   = 4          # V28: 1 ORB + 3 FVG
 # stays near a fixed dollar target regardless of where the structural stop lands.
 ATR_CDR_ENABLED    = True
 ATR_CDR_TARGET_USD = 80.0   # target stop-exposure in dollars per FVG trade
+
+# ── RISK-BUDGET SIZING (DLL-headroom aware) ───────────────────────────────────
+# Correct fix for the score-map DLL conflict: control DOLLAR risk, not contract
+# count. Per-trade size = min(per-score conviction budget, HEADROOM_SAFETY_FRAC
+# of remaining daily-loss headroom) / per-contract stop risk. The stop is costed
+# at the worst slippage tier so the reserve never underruns at a tier boundary.
+# This makes a single-trade DLL breach mathematically impossible while letting
+# size grow as an intraday cushion is built. When enabled it REPLACES the CDR
+# block for FVG entries. Off by default; the A/B runner toggles it.
+# Defaults = sweep config "C": keeps ~94% of baseline P&L, beats baseline Sharpe,
+# caps worst single trade at ~-$674 (leaves ~$326 for live gap-through slippage
+# before the $1,000 DLL).
+RISK_BUDGET_SIZING_ENABLED = True
+RISK_BUDGET_MAP            = {8: 900.0, 7: 675.0, 6: 350.0}  # $ stop-risk budget by FVG score
+RISK_BUDGET_DEFAULT        = 150.0   # budget for scores below the lowest key
+HEADROOM_SAFETY_FRAC       = 0.80    # max fraction of remaining DLL headroom risked per trade
 
 # V28: Explosive regime disabled (33% WR, consistently loses)
 # ATR ratio hard cap at 2.0 enforced in get_risk_profile()
@@ -171,6 +190,12 @@ FVG_SWEEP_REQUIRED           = False  # idea 4: require liquidity sweep before F
 FVG_OVERLAP_REQUIRED         = False  # idea 5: require 2+ overlapping active FVGs
 
 # ── V28: ORB SETTINGS ─────────────────────────────────────────────────────────
+# ORB is DISABLED. It was cut for a 26% WR under the shared FVG/ORB trade cap.
+# This explicit flag is the authoritative off-switch — the ORB entry block is
+# gated on it. (Previously ORB was disabled only by the obscure side effect of
+# ORB_MAX_RANGE_TICKS=0 making its range guard unsatisfiable.) Do not flip to
+# True without first separating the ORB and FVG per-day trade caps.
+ORB_ENABLED            = False
 ORB_RANGE_BARS         = 3       # 6 bars = 30 minutes (9:30-10:00 CT)
 ORB_ENTRY_WINDOW_START = (9, 30) # CT hour, minute — range starts forming
 ORB_ENTRY_WINDOW_END   = (10, 30)# CT hour, minute — last valid ORB entry
@@ -183,7 +208,7 @@ ORB_STOP_BUFFER_TICKS  = 1       # ticks beyond ORB boundary for stop
 ORB_INDEPENDENT_CONTRACTS = 3    # contracts when ORB fires without ATR confirmation
 
 # ── PDH/PDL RETEST SETTINGS ──────────────────────────────────────────────────
-PDH_RETEST_ENABLED     = True
+PDH_RETEST_ENABLED     = False
 PDH_BREAK_TICKS        = 8    # ticks price must extend beyond PDH/PDL to confirm clean break
 PDH_ENTRY_ZONE_TICKS   = 6    # enter when price pulls back within this many ticks of level
 PDH_STOP_TICKS         = 10   # stop placed this many ticks beyond the PDH/PDL level
@@ -294,7 +319,7 @@ LATE_LONG_TARGET_END_HOUR      = 11
 LATE_LONG_TARGET_TICKS         = 80
 
 # Complementary module: VWAP mean reversion V2a
-VWAP_MR_ENABLED                = True
+VWAP_MR_ENABLED                = False
 VWAP_MR_WINDOW_START           = (10, 30)  # validated in E2a holdout
 VWAP_MR_WINDOW_END             = (12, 30)  # validated in E2a holdout
 VWAP_MR_CONTRACTS              = 2
@@ -338,7 +363,7 @@ OD_DEBUG_PRINT_LIMIT            = 25
 OD_SHORT_ONLY                   = False
 
 # Complementary module: failed breakout / liquidity sweep reversal
-FAILED_BREAKOUT_ENABLED         = True
+FAILED_BREAKOUT_ENABLED         = False
 FB_WINDOW_START                 = (10, 0)
 FB_WINDOW_END                   = (13, 30)
 FB_CONTRACTS                    = 3
@@ -859,7 +884,11 @@ class RiskState:
 
 def round_turn_cost(contracts: int) -> float:
     commission = COMMISSION_PER_CONTRACT * contracts
-    slippage   = SLIPPAGE_TICKS * MNQ_TICK_VALUE * contracts * 2
+    if SLIPPAGE_SCALE_ENABLED:
+        slip_ticks = next(t for cap, t in SLIPPAGE_SCALE_TIERS if contracts <= cap)
+    else:
+        slip_ticks = SLIPPAGE_TICKS
+    slippage = slip_ticks * MNQ_TICK_VALUE * contracts * 2
     return commission + slippage
 
 
@@ -928,7 +957,36 @@ def _serialize_audit_value(value):
     return value
 
 
+def _fvg_ambition_max_contracts() -> int:
+    """Largest contract count the FVG score map will ever request (before the
+    risk-budget/CDR gate). This is the real ceiling, not STRONG_CONTRACTS."""
+    if FVG_SCORE_CONTRACT_MAP_ENABLED and FVG_SCORE_CONTRACT_MAP:
+        return int(max(FVG_SCORE_CONTRACT_MAP.values()))
+    return int(STRONG_CONTRACTS)
+
+
+def worst_modeled_trade_loss_usd() -> float:
+    """Worst-case single-trade stop loss (USD) under the ACTIVE FVG sizing model,
+    on a fresh day (daily P&L = 0). Costs the stop at the worst slippage tier.
+
+    - Risk-budget model: size is capped so stop risk <= HEADROOM_SAFETY_FRAC of
+      the fresh-day headroom (|BOT_DAILY_LOSS_LIMIT|). That fraction IS the worst
+      realized single-trade loss, independent of stop distance.
+    - Score-map / CDR model: the largest score-mapped size can take the full
+      STOP_TICKS structural stop, so worst loss = max_contracts x stop + costs.
+    """
+    worst_slip = max(t for _cap, t in SLIPPAGE_SCALE_TIERS)
+    if RISK_BUDGET_SIZING_ENABLED:
+        return HEADROOM_SAFETY_FRAC * abs(BOT_DAILY_LOSS_LIMIT)
+    max_ctr    = _fvg_ambition_max_contracts()
+    gross      = STOP_TICKS * MNQ_TICK_VALUE * max_ctr
+    commission = COMMISSION_PER_CONTRACT * max_ctr
+    slippage   = worst_slip * MNQ_TICK_VALUE * max_ctr * 2
+    return gross + commission + slippage
+
+
 def build_run_audit() -> Dict[str, object]:
+    sizing_model = "risk_budget" if RISK_BUDGET_SIZING_ENABLED else "score_map"
     return {
         "version": "V29",
         "generated_at": datetime.now(TIMEZONE).isoformat(),
@@ -939,7 +997,14 @@ def build_run_audit() -> Dict[str, object]:
         "commission_per_contract_rt": COMMISSION_PER_CONTRACT,
         "slippage_ticks_per_side": SLIPPAGE_TICKS,
         "init_cash": INIT_CASH,
-        "max_contracts_cap": STRONG_CONTRACTS,
+        "sizing_model": sizing_model,
+        "fvg_score_contract_map": FVG_SCORE_CONTRACT_MAP if FVG_SCORE_CONTRACT_MAP_ENABLED else None,
+        "max_contracts_ambition": _fvg_ambition_max_contracts(),
+        "max_contracts_cap": _fvg_ambition_max_contracts(),
+        "risk_budget_sizing_enabled": RISK_BUDGET_SIZING_ENABLED,
+        "risk_budget_map": RISK_BUDGET_MAP if RISK_BUDGET_SIZING_ENABLED else None,
+        "headroom_safety_frac": HEADROOM_SAFETY_FRAC if RISK_BUDGET_SIZING_ENABLED else None,
+        "worst_modeled_trade_loss_usd": round(worst_modeled_trade_loss_usd(), 2),
         "daily_loss_limit": BOT_DAILY_LOSS_LIMIT,
         "combine_profit_target": COMBINE_PROFIT_TARGET,
         "combine_daily_loss_limit": COMBINE_DAILY_LOSS_LIMIT,
@@ -969,8 +1034,15 @@ def run_startup_audit() -> Dict[str, object]:
               f"slippage_ticks_side={SLIPPAGE_TICKS}")
     add_check("slippage_conservative", SLIPPAGE_TICKS >= 1.0,
               f"slippage_ticks_side={SLIPPAGE_TICKS}")
-    add_check("contract_cap_valid", STRONG_CONTRACTS <= SCALING_TIER_3_CONTRACTS,
-              f"max_contracts={STRONG_CONTRACTS}, scaling_cap={SCALING_TIER_3_CONTRACTS}")
+    # Real sizing safety: the worst-case single trade under the ACTIVE model must
+    # stay under the combine DLL with margin left for live gap-through slippage.
+    _worst_trade = worst_modeled_trade_loss_usd()
+    _dll_margin  = 0.80 * abs(COMBINE_DAILY_LOSS_LIMIT)  # keep 20% for live gap slippage
+    add_check("sizing_dll_safe", _worst_trade < _dll_margin,
+              f"model={'risk_budget' if RISK_BUDGET_SIZING_ENABLED else 'score_map'} "
+              f"worst_modeled_trade=${_worst_trade:.0f} must be < ${_dll_margin:.0f} "
+              f"(80% of combine DLL ${abs(COMBINE_DAILY_LOSS_LIMIT):.0f}); "
+              f"ambition_max_contracts={_fvg_ambition_max_contracts()}")
     add_check("stop_positive", STOP_TICKS > 0, f"STOP_TICKS={STOP_TICKS}")
     add_check("target_positive", STRONG_TARGET_TICKS > 0 and FB_TARGET_TICKS > 0,
               f"STRONG_TARGET_TICKS={STRONG_TARGET_TICKS}, FB_TARGET_TICKS={FB_TARGET_TICKS}")
@@ -989,6 +1061,9 @@ def run_startup_audit() -> Dict[str, object]:
     print("  Run mode audit:")
     print(f"    mode={RUN_MODE} | profile={EXECUTION_PROFILE} | live={'ON' if LIVE_EXECUTION_ENABLED else 'OFF'}")
     print(f"    costs=commission ${COMMISSION_PER_CONTRACT:.2f} RT | slippage {SLIPPAGE_TICKS:.2f} ticks/side")
+    print(f"    sizing={audit['sizing_model']} | ambition_max={audit['max_contracts_ambition']} ctr "
+          f"| worst-case trade=${audit['worst_modeled_trade_loss_usd']:.0f} vs combine DLL "
+          f"${abs(COMBINE_DAILY_LOSS_LIMIT):.0f}")
     print(f"    startup audit={audit['status']}")
 
     if failed:
@@ -1054,7 +1129,7 @@ def fetch_data() -> pd.DataFrame:
     print("Loading data...")
     if not os.path.exists(DATA_PATH):
         raise FileNotFoundError(f"Data path does not exist: {DATA_PATH}")
-    df = load_mes_data(DATA_PATH)
+    df = load_ohlcv_csv(DATA_PATH)
     print(f"Loaded {len(df):,} 5-minute bars.")
     return df
 
@@ -2539,7 +2614,13 @@ def run_backtest(
                 if cash > day_peak_cash:   day_peak_cash   = cash
                 if cash < day_trough_cash: day_trough_cash = cash
 
-            if hit_target:
+            # Conservative intrabar resolution: when both stop and target are touched
+            # in the same bar, assume stop was hit first. Prevents the backtest from
+            # favorably assuming targets fill before stops on volatile bars.
+            if hit_stop and hit_target:
+                exit_price  = stop_px
+                exit_reason = "stop"
+            elif hit_target:
                 exit_price  = target_px
                 exit_reason = "target"
             elif hit_stop:
@@ -2653,8 +2734,10 @@ def run_backtest(
 
             # ── ORB ENTRY (priority, independent of ATR regime) ──────────────
             # ORB fires BEFORE regime gate — has its own quality filters
-            # (VWAP confirmation + breakout confirmation)
-            if (_router_allow_trend
+            # (VWAP confirmation + breakout confirmation).
+            # Gated by ORB_ENABLED (currently False). See the ORB SETTINGS block.
+            if (ORB_ENABLED
+                    and _router_allow_trend
                     and orb.formed
                     and not orb.fired_today
                     and _is_orb_window(date_ct)
@@ -3006,6 +3089,10 @@ def run_backtest(
             elif entry_dir == "short" and above_vwap_now:
                 contracts = max(2, contracts - 2)
 
+            # NOTE: this additive score-sizing step is OVERWRITTEN below whenever
+            # FVG_SCORE_CONTRACT_MAP_ENABLED is True (the map assigns `contracts`
+            # outright). With both flags True (current config) this block has no
+            # effect on final size. Kept only for the map-disabled fallback path.
             if this_entry_type == "FVG" and FVG_SCORE_SIZING_ENABLED:
                 fvg_score = int(fvg_quality["score"])
                 if drawdown_pct > -2.5:
@@ -3135,7 +3222,25 @@ def run_backtest(
             # contracts so the dollar exposure stays near ATR_CDR_TARGET_USD.
             # For score-mapped contracts, scale the CDR target proportionally so
             # per-contract risk stays constant (same $16/contract = 8-pt equivalent).
-            if ATR_CDR_ENABLED and this_entry_type == "FVG" and fvg_stop != 0.0:
+            # Risk-budget sizing (DLL-headroom aware) takes precedence when
+            # enabled; otherwise fall back to the legacy constant-dollar-risk.
+            if RISK_BUDGET_SIZING_ENABLED and this_entry_type == "FVG" and fvg_stop != 0.0:
+                _stop_dist = abs(current_price - fvg_stop)
+                if _stop_dist > 0:
+                    _worst_slip   = max(_t for _cap, _t in SLIPPAGE_SCALE_TIERS)
+                    _per_ctr_cost = COMMISSION_PER_CONTRACT + _worst_slip * MNQ_TICK_VALUE * 2
+                    _per_ctr_risk = _stop_dist * MNQ_POINT_VALUE + _per_ctr_cost
+                    _score  = int(fvg_quality["score"])
+                    _budget = RISK_BUDGET_DEFAULT
+                    for _th in sorted(RISK_BUDGET_MAP.keys(), reverse=True):
+                        if _score >= _th:
+                            _budget = RISK_BUDGET_MAP[_th]
+                            break
+                    _headroom     = state.daily_pnl_usd - BOT_DAILY_LOSS_LIMIT
+                    _headroom_cap = max(0.0, _headroom) * HEADROOM_SAFETY_FRAC
+                    _allowed_risk = min(_budget, _headroom_cap)
+                    contracts     = max(0, min(contracts, int(_allowed_risk / _per_ctr_risk)))
+            elif ATR_CDR_ENABLED and this_entry_type == "FVG" and fvg_stop != 0.0:
                 _stop_dist = abs(current_price - fvg_stop)
                 if _stop_dist > 0:
                     _risk_per_ctr = _stop_dist * MNQ_POINT_VALUE
@@ -3147,6 +3252,12 @@ def run_backtest(
                                 _cdr_target = ATR_CDR_TARGET_USD * (FVG_SCORE_CONTRACT_MAP[_th] / STRONG_CONTRACTS)
                                 break
                     contracts = max(1, min(contracts, int(_cdr_target / _risk_per_ctr)))
+
+            # Risk-budget may zero out size when headroom is nearly exhausted;
+            # skip the trade rather than force a minimum (the FVG is consumed).
+            if RISK_BUDGET_SIZING_ENABLED and this_entry_type == "FVG" and contracts < 1:
+                portfolio.append(cash)
+                continue
 
             if this_entry_type == "FVG":
                 entry_regime = profile["regime"]
@@ -4645,9 +4756,10 @@ def _parse_cli_args():
 
 
 def _apply_cli_overrides(args) -> None:
-    global SLIPPAGE_TICKS
+    global SLIPPAGE_TICKS, SLIPPAGE_SCALE_ENABLED
     if getattr(args, "slippage_ticks", None) is not None:
         SLIPPAGE_TICKS = float(args.slippage_ticks)
+        SLIPPAGE_SCALE_ENABLED = False  # flat override takes precedence over scaling
 
 
 def main(args=None):

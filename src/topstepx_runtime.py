@@ -41,6 +41,13 @@ SESSION_ROLLOVER_HOUR_CT = 17
 DEFAULT_LOOP_INTERVAL_SECONDS = 5
 DEFAULT_SESSION_VALIDATE_SECONDS = 60
 MAX_RECONNECT_BACKOFF_SECONDS = 60
+DATA_GAP_KILL_THRESHOLD = 5
+DATA_GAP_AUTO_CLEAR_MINUTES = 30
+MAX_TRANSIENT_RETRIES = 50
+TRANSIENT_ERROR_KEYWORDS = (
+    "network error", "urlopen error", "timed out", "timeout",
+    "502", "503", "504", "connection", "ssl", "winerror", "handshake", "remote host",
+)
 CONSISTENCY_WARNING_FRACTION = 0.80
 CONSISTENCY_THROTTLE_FRACTION = 0.90
 LIVE_BAR_LOOKBACK_BARS = 2500
@@ -51,6 +58,11 @@ BRACKET_VERIFY_TIMEOUT_SECONDS = 8.0
 BRACKET_VERIFY_REST_POLL_SECONDS = 1.0
 CONSISTENCY_BUFFER = 0.02
 STRATEGY_BAR_SECONDS = 300
+# Live slippage monitoring: compare intended entry price vs actual fill price.
+# The backtest assumes ~1 tick; if live fills are systematically worse the edge
+# is not real, so halt. Rolling average over the last SLIPPAGE_WINDOW entries.
+SLIPPAGE_WINDOW = 20
+SLIPPAGE_ALERT_TICKS = 3.0
 MANUAL_FLATTEN_COOLDOWN_MINUTES = 10   # block new entries for this long after a manual flatten
 
 QUARTER_MONTH_CODES = {
@@ -134,6 +146,11 @@ def _current_session_date(now: Optional[datetime] = None) -> str:
     return current.date().isoformat()
 
 
+def _is_transient_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(kw in msg for kw in TRANSIENT_ERROR_KEYWORDS)
+
+
 def _write_log(level: str, message: str, *, error_only: bool = False) -> None:
     timestamp = datetime.now(bot.TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
     line = f"[{timestamp}] [{level}] {message}"
@@ -182,6 +199,13 @@ def _default_state() -> Dict[str, Any]:
         "latency_bar_to_signal_ms": None,
         "latency_signal_to_submit_ms": None,
         "latency_submit_to_fill_ms": None,
+        "last_signal_entry_price": None,
+        "last_signal_stop_price": None,
+        "last_signal_target_price": None,
+        "awaiting_entry_fill": False,
+        "awaiting_exit_fill": False,
+        "rolling_entry_slippage_ticks": [],
+        "rolling_exit_slippage_ticks": [],
         "last_data_gap_failure": "",
         "last_known_account_balance": None,
         "last_known_account_equity": None,
@@ -201,6 +225,10 @@ def _default_state() -> Dict[str, Any]:
         "last_heavy_reconcile_at": None,
         "manual_flatten_cooldown_until": None,
         "manual_flatten_reason": "",
+        "consecutive_data_gaps": 0,
+        "last_data_gap_at": None,
+        "peak_account_balance": None,
+        "last_mll_alert_level": 0,  # 0=clear, 1=warning(<50% buffer), 2=critical(<25% buffer)
     }
 
 
@@ -254,6 +282,35 @@ def clear_kill_switch() -> None:
         print(f"Kill switch cleared: {KILL_SWITCH_PATH}")
     else:
         print("Kill switch was not active.")
+
+
+def _maybe_auto_clear_data_gap_kill_switch() -> bool:
+    """Auto-clear kill switch if it was a data gap and enough time has passed."""
+    if not _kill_switch_active():
+        return False
+    try:
+        with open(KILL_SWITCH_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("reason") != "data_integrity_failure":
+            return False
+        engaged_at = _parse_iso_timestamp(data.get("engaged_at"))
+        if engaged_at is None:
+            return False
+        elapsed_min = (_current_ct_now() - engaged_at.astimezone(bot.TIMEZONE)).total_seconds() / 60
+        if elapsed_min >= DATA_GAP_AUTO_CLEAR_MINUTES:
+            clear_kill_switch()
+            _write_log("INFO", f"data_gap_kill_switch_auto_cleared after {elapsed_min:.0f} min")
+            _send_telegram_lines([
+                "MNQ Bot: Data-gap kill switch auto-cleared",
+                f"Was active for {elapsed_min:.0f} min. Resuming normal trading.",
+            ])
+            return True
+    except Exception as exc:
+        # Fail-safe: on any error reading/parsing HALT.txt, leave the kill switch
+        # ENGAGED (return False = not auto-cleared). Log it so the swallow is visible.
+        _write_log("WARN", f"data_gap_auto_clear_check_failed (kill switch stays engaged): {exc}",
+                   error_only=True)
+    return False
 
 
 def _write_json(path: str, payload: Dict[str, Any]) -> None:
@@ -492,7 +549,12 @@ def _is_protective_stop_like_order(order: Dict[str, Any], entry_side: int, contr
 
     has_stop_descriptor = any(token in descriptor for token in ("stop", "loss", "sl"))
     has_stop_price = stop_price not in (None, "", 0, 0.0)
-    return bool(opposite_side and (has_stop_descriptor or has_stop_price))
+    # ProjectX uses numeric order-type codes; 4 = stop / stop-loss bracket. The
+    # string descriptor may be empty when only a numeric code is returned, so
+    # recognize the code directly to avoid a false "unprotected" flatten.
+    order_type_code = str(order.get("type", order.get("orderType", ""))).strip()
+    has_stop_type_code = order_type_code in ("4", "stop", "stop_limit", "stoplimit")
+    return bool(opposite_side and (has_stop_descriptor or has_stop_price or has_stop_type_code))
 
 
 def _user_hub_confirms_protective_order(event: Dict[str, Any], order_payload: Dict[str, Any]) -> bool:
@@ -808,11 +870,43 @@ def build_live_strategy_signal(
 def _apply_hub_account_update(state: Dict[str, Any], payload: Dict[str, Any]) -> None:
     metrics = _extract_account_metrics(payload, TopstepXConfig.from_env())
     if metrics.get("balance") is not None:
-        state["last_known_account_balance"] = metrics["balance"]
+        _bal = metrics["balance"]
+        state["last_known_account_balance"] = _bal
+        _peak = state.get("peak_account_balance")
+        if _peak is None or float(_bal) > float(_peak):
+            state["peak_account_balance"] = _bal
     if metrics.get("equity") is not None:
         state["last_known_account_equity"] = metrics["equity"]
     if metrics.get("total_profit") is not None:
         state["last_known_account_profit"] = metrics["total_profit"]
+
+
+def _record_slippage(window: Optional[List[float]], intended: float, actual: float) -> List[float]:
+    """Append |actual-intended| in ticks to a rolling window (last SLIPPAGE_WINDOW)."""
+    w = list(window or [])
+    w.append(round(abs(float(actual) - float(intended)) / bot.MNQ_TICK_SIZE, 2))
+    return w[-SLIPPAGE_WINDOW:]
+
+
+def _emit_slippage_log_and_halt(kind: str, window: List[float], intended: float,
+                                actual: float, halt_reason: str) -> None:
+    """Log the latest slippage sample + rolling average; halt if the average
+    exceeds SLIPPAGE_ALERT_TICKS over a full window."""
+    slip_ticks = window[-1] if window else 0.0
+    avg_slip = sum(window) / len(window) if window else 0.0
+    _write_log(
+        "INFO",
+        f"{kind}_slippage ticks={slip_ticks} rolling_avg={avg_slip:.2f} "
+        f"n={len(window)} intended={intended} actual={actual}",
+    )
+    if len(window) >= SLIPPAGE_WINDOW and avg_slip > SLIPPAGE_ALERT_TICKS:
+        _write_log(
+            "ERROR",
+            f"{halt_reason} rolling_avg={avg_slip:.2f} ticks > {SLIPPAGE_ALERT_TICKS}; "
+            f"engaging kill switch.",
+            error_only=True,
+        )
+        engage_kill_switch(halt_reason)
 
 
 def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any], config: TopstepXConfig) -> None:
@@ -882,6 +976,39 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
             latency_submit_to_fill_ms = _duration_ms(state.get("last_order_submitted_at"), fill_timestamp)
             if latency_submit_to_fill_ms is not None:
                 state["latency_submit_to_fill_ms"] = latency_submit_to_fill_ms
+
+            # ── Live slippage monitoring ───────────────────────────────────────
+            # Compare actual fill price to intended. Entry fills (awaiting_entry_fill,
+            # no realized P&L) are compared to the intended entry price. Exit fills
+            # (awaiting_exit_fill, realized P&L present) are compared to the NEARER of
+            # the intended stop / target price. The realized-P&L gate keeps entry
+            # partial-fills from being mistaken for exits. The backtest assumes ~1
+            # tick; if a rolling average exceeds SLIPPAGE_ALERT_TICKS the edge
+            # assumption is broken -> halt.
+            actual = _extract_numeric(payload, "price", "fillPrice", "averagePrice", "avgPrice")
+            if state.get("awaiting_entry_fill") and trade_pnl is None:
+                intended = state.get("last_signal_entry_price")
+                if intended and actual:
+                    state["rolling_entry_slippage_ticks"] = _record_slippage(
+                        state.get("rolling_entry_slippage_ticks"), intended, actual)
+                    state["awaiting_entry_fill"] = False
+                    state["awaiting_exit_fill"] = True   # arm exit monitoring
+                    _emit_slippage_log_and_halt(
+                        "entry", state["rolling_entry_slippage_ticks"], intended, actual,
+                        "slippage_systematic_excess")
+            elif state.get("awaiting_exit_fill") and trade_pnl is not None:
+                _stop_px = state.get("last_signal_stop_price")
+                _tgt_px = state.get("last_signal_target_price")
+                candidates = [(k, float(v)) for k, v in
+                              (("stop", _stop_px), ("target", _tgt_px)) if v]
+                if actual and candidates:
+                    exit_kind, intended = min(candidates, key=lambda c: abs(float(actual) - c[1]))
+                    state["rolling_exit_slippage_ticks"] = _record_slippage(
+                        state.get("rolling_exit_slippage_ticks"), intended, actual)
+                    state["awaiting_exit_fill"] = False
+                    _emit_slippage_log_and_halt(
+                        f"exit_{exit_kind}", state["rolling_exit_slippage_ticks"], intended, actual,
+                        "exit_slippage_systematic_excess")
             _write_log(
                 "INFO",
                 "execution_latency "
@@ -911,7 +1038,24 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
             _write_log("ERROR", f"user_hub_error {payload.get('message', '')}", error_only=True)
 
 
-def _infer_topstep_max_contracts(account: Dict[str, Any], signal: Dict[str, Any]) -> int:
+def _symbol_fallback_max_contracts(symbol: str) -> int:
+    """Symbol-aware fallback max position size when the broker API does not
+    return a maxContracts field.
+
+    Topstep expresses the $50K scaling limit as NQ-equivalent lots
+    (SCALING_TIER_3_CONTRACTS = 5). One NQ lot = 10 MNQ, so:
+      - MNQ (micro):  5 lots x 10 = 50 MNQ
+      - NQ  (mini) :  5 lots      =  5 NQ
+    MUST be checked MNQ-first because the substring "NQ" is contained in "MNQ".
+    """
+    s = (symbol or "").upper()
+    if "MNQ" in s or "MICRO" in s:
+        return bot.SCALING_TIER_3_CONTRACTS * 10   # 50 MNQ
+    return bot.SCALING_TIER_3_CONTRACTS            # 5 NQ (also the safe default)
+
+
+def _infer_topstep_max_contracts(account: Dict[str, Any], signal: Dict[str, Any],
+                                 symbol: str = "") -> int:
     candidate_keys = (
         "maxContracts",
         "maxContractSize",
@@ -929,12 +1073,15 @@ def _infer_topstep_max_contracts(account: Dict[str, Any], signal: Dict[str, Any]
                 return parsed
         except (TypeError, ValueError):
             continue
-    signal_tier_cap = signal.get("scaling_tier_at_entry", bot.SCALING_TIER_3_CONTRACTS)
-    try:
-        parsed = int(signal_tier_cap)
-    except (TypeError, ValueError):
-        parsed = bot.SCALING_TIER_3_CONTRACTS
-    return max(1, min(parsed, bot.SCALING_TIER_3_CONTRACTS))
+    # API did not provide a max-contracts field. Fall back to the symbol-aware
+    # maximum (NOT the raw NQ-lot count of 5, which would cap MNQ 10x too low).
+    fallback = _symbol_fallback_max_contracts(symbol)
+    _write_log(
+        "WARN",
+        f"maxContracts absent from broker API; using symbol-aware fallback "
+        f"symbol={symbol or 'unknown'} fallback_max_contracts={fallback}",
+    )
+    return fallback
 
 
 def _evaluate_signal_risk_halts(
@@ -1031,6 +1178,19 @@ def _topstepx_scaling_plan_limit_mnq(
     return None
 
 
+def _unprotected_position_detected(state: Dict[str, Any], config: TopstepXConfig) -> bool:
+    """True when live routing holds an open position with zero working orders
+    (i.e. no protective stop). Dry-run and routing-disabled modes never qualify."""
+    if not config.enable_order_routing or config.dry_run:
+        return False
+    try:
+        positions = int(state.get("open_position_count", 0) or 0)
+        orders = int(state.get("open_order_count", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return positions > 0 and orders == 0
+
+
 def reconcile_state(client: TopstepXClient, config: TopstepXConfig) -> Dict[str, Any]:
     state = _load_state()
     now = _current_ct_now()
@@ -1080,12 +1240,18 @@ def reconcile_state(client: TopstepXClient, config: TopstepXConfig) -> Dict[str,
     state["current_contracts"] = sum(_extract_position_size(position) for position in open_positions)
     state["open_order_count"] = len(open_orders)
     state["open_position_count"] = len(open_positions)
-    state["topstep_max_contracts"] = _infer_topstep_max_contracts(account, {})
+    state["topstep_max_contracts"] = _infer_topstep_max_contracts(
+        account, {}, symbol=config.contract_search_text)
     state["topstep_scaling_plan_limit_mnq"] = _topstepx_scaling_plan_limit_mnq(
         config,
         current_profit=metrics.get("scaling_profit"),
     )
-    state["last_known_account_balance"] = metrics.get("balance")
+    _bal = metrics.get("balance")
+    state["last_known_account_balance"] = _bal
+    if _bal is not None:
+        _peak = state.get("peak_account_balance")
+        if _peak is None or float(_bal) > float(_peak):
+            state["peak_account_balance"] = _bal
     state["last_known_account_equity"] = metrics.get("equity")
     state["last_known_account_profit"] = metrics.get("total_profit")
     state["last_seen_contract_name"] = str(contract.get("name", "")) if contract else ""
@@ -1103,6 +1269,28 @@ def reconcile_state(client: TopstepXClient, config: TopstepXConfig) -> Dict[str,
             "WARN",
             f"Broker position state changed during reconciliation. prior_in_trade={prior_in_trade} current_in_trade={state['in_trade']}",
         )
+
+    # Unprotected-position guard: a live position with ZERO working orders has no
+    # protective stop attached — the dangerous account/bot state mismatch. Halt
+    # and flatten rather than leave an unbracketed position exposed. Reconcile is
+    # periodic (outside the entry race that bracket-verification already covers),
+    # so positions>0 with orders==0 here is a genuine red flag, not a timing blip.
+    if _unprotected_position_detected(state, config):
+        _write_log(
+            "ERROR",
+            f"account_state_mismatch: {state['open_position_count']} open position(s) "
+            f"with 0 working orders (no protective stop). Engaging kill switch + flatten.",
+            error_only=True,
+        )
+        _send_telegram_lines([
+            "MNQ Bot: UNPROTECTED POSITION detected",
+            f"{state['open_position_count']} position(s), 0 working orders. Flattening + halting.",
+        ])
+        engage_kill_switch("unprotected_position_state_mismatch")
+        try:
+            _flatten_account_internal(client, config, reason="unprotected_position_state_mismatch")
+        except Exception as exc:
+            _write_log("ERROR", f"flatten_after_state_mismatch_failed: {exc}", error_only=True)
 
     consistency = _update_consistency_state(state, config)
     reconcile = {
@@ -1211,6 +1399,7 @@ def build_order_plan(
 
     account = None
     contract = None
+    order_symbol = config.contract_search_text
     topstep_max_contracts = bot.SCALING_TIER_3_CONTRACTS
     scaling_plan_limit_mnq: Optional[int] = state.get("topstep_scaling_plan_limit_mnq")
     if client is not None:
@@ -1219,7 +1408,8 @@ def build_order_plan(
         contract = client.resolve_contract(config.contract_search_text, live=config.live_data)
         if contract is None:
             raise TopstepXAPIError(f"Could not resolve contract for search text '{config.contract_search_text}'.")
-        topstep_max_contracts = _infer_topstep_max_contracts(account, signal)
+        order_symbol = str(contract.get("name") or contract.get("symbol") or config.contract_search_text)
+        topstep_max_contracts = _infer_topstep_max_contracts(account, signal, symbol=order_symbol)
         if scaling_plan_limit_mnq is None:
             metrics = _extract_account_metrics(account, config)
             scaling_plan_limit_mnq = _topstepx_scaling_plan_limit_mnq(
@@ -1244,6 +1434,45 @@ def build_order_plan(
                 f"size reduced from {final_size} to {throttled_size}."
             )
             final_size = throttled_size
+
+    # Dynamic MLL proximity guard: scale contracts proportionally to remaining trailing
+    # drawdown buffer. Buffer = current_balance - (peak_balance - $2,000).
+    # At 100% buffer → full contracts. At 50% → half contracts. At 0% → 1 contract.
+    mll_note = ""
+    if client is not None:
+        _cur_bal = float(state.get("last_known_account_balance") or 0.0)
+        _peak_bal = float(state.get("peak_account_balance") or _cur_bal)
+        _mll_total = float(bot.EOD_LOSS_BUFFER)
+        if _cur_bal > 0 and _peak_bal > 0 and _mll_total > 0:
+            _buffer = _cur_bal - (_peak_bal - _mll_total)
+            _fraction = max(0.0, min(1.0, _buffer / _mll_total))
+            _mll_size = max(1, int(final_size * _fraction))
+            if _mll_size < final_size:
+                mll_note = (
+                    f"MLL guard: buffer ${_buffer:.0f}/{_mll_total:.0f} "
+                    f"({_fraction:.0%}) — size {final_size}→{_mll_size}"
+                )
+                final_size = _mll_size
+                _last_lvl = int(state.get("last_mll_alert_level") or 0)
+                _new_lvl = 2 if _fraction < 0.25 else 1 if _fraction < 0.50 else 0
+                if _new_lvl > _last_lvl:
+                    _send_telegram_lines([
+                        f"MNQ Bot: MLL BUFFER {'CRITICAL' if _new_lvl == 2 else 'WARNING'}",
+                        f"Buffer: ${_buffer:.0f} remaining ({_fraction:.0%} of ${_mll_total:.0f})",
+                        f"Contracts scaled: {final_size} (normal: {int(signal['contracts'])})",
+                        f"Account: ${_cur_bal:.0f}  Peak: ${_peak_bal:.0f}",
+                    ])
+                    state["last_mll_alert_level"] = _new_lvl
+                elif _new_lvl < _last_lvl:
+                    state["last_mll_alert_level"] = _new_lvl
+
+    # Size audit trail before every order: requested vs broker max vs final.
+    _write_log(
+        "INFO",
+        f"order_sizing symbol={order_symbol} requested={int(signal['contracts'])} "
+        f"max_allowed={int(topstep_max_contracts)} "
+        f"scaling_plan_limit_mnq={scaling_plan_limit_mnq} final_size={int(final_size)}",
+    )
 
     payload: Dict[str, Any] = {
         "version": "V29",
@@ -1437,6 +1666,25 @@ def _submit_order_plan(
     submitted_at = datetime.now(bot.TIMEZONE).isoformat()
     state["last_order_submit_started_at"] = submit_started_at
     state["last_order_submitted_at"] = submitted_at
+    # Capture intended entry / stop / target prices so the entry fill and the
+    # exit fill can each be compared to intended for live slippage monitoring
+    # (see GatewayUserTrade handler).
+    try:
+        _entry_px = float(signal.get("entry_price", 0.0)) or None
+        _stop_px = float(signal.get("stop_price", 0.0)) or None
+        _tgt_ticks = float(signal.get("target_ticks", 0.0))
+        if _entry_px and _tgt_ticks:
+            _tgt_off = _tgt_ticks * bot.MNQ_TICK_SIZE
+            _tgt_px = (_entry_px + _tgt_off) if signal.get("direction") == "long" else (_entry_px - _tgt_off)
+        else:
+            _tgt_px = None
+    except (TypeError, ValueError):
+        _entry_px = _stop_px = _tgt_px = None
+    state["last_signal_entry_price"] = _entry_px
+    state["last_signal_stop_price"] = _stop_px
+    state["last_signal_target_price"] = _tgt_px
+    state["awaiting_entry_fill"] = _entry_px is not None
+    state["awaiting_exit_fill"] = False   # armed only after the entry fill is seen
     state["last_order_signal_id"] = signal_id
     state["last_order_custom_tag"] = str(order_payload.get("customTag", ""))
     state["latency_signal_to_submit_ms"] = _duration_ms(signal_payload.get("generated_at"), submitted_at)
@@ -1528,6 +1776,11 @@ def _verify_brackets_after_submit(
         extra={"open_orders": open_orders, "open_positions": open_positions},
     )
     _flatten_account_internal(client, config, reason="unprotected_position_after_entry")
+    # Engage the persistent kill switch: a bracket failure means the protective
+    # stop is not reliably being attached. Halt fully rather than let the run
+    # loop route another potentially-unprotected trade on the next bar. Requires
+    # a manual clear-kill-switch after the cause is understood.
+    engage_kill_switch("bracket_failure_unprotected_position")
     raise TopstepXAPIError("Bracket verification failed: open position detected without protective stop. Emergency flatten triggered.")
 
 
@@ -1769,6 +2022,7 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
 
     while True:
         state = _load_state()
+        _maybe_auto_clear_data_gap_kill_switch()
         try:
             _ensure_authenticated(client, state)
             if config.enable_user_hub and user_stream is None:
@@ -1846,6 +2100,7 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
                     signal_payload.get("generated_at"),
                 )
                 state["last_loop_minute"] = minute_key
+                state["consecutive_data_gaps"] = 0
                 _save_state(state)
                 try:
                     plan = build_order_plan(signal_payload, config, client, runtime_state=state)
@@ -1878,20 +2133,42 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
             _write_log("WARN", "run_loop interrupted by user.")
             raise
         except TopstepXAPIError as exc:
-            attempts += 1
-            _write_log("ERROR", f"run_loop broker error attempt={attempts}: {exc}", error_only=True)
-            if attempts > 10:
-                raise
-            if user_stream is not None:
-                user_stream.stop()
-                user_stream = None
-            client = TopstepXClient(config)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF_SECONDS)
+            error_str = str(exc)
+            if "DATA_INTEGRITY_FAILURE" in error_str:
+                state = _load_state()
+                gap_count = int(state.get("consecutive_data_gaps", 0) or 0) + 1
+                state["consecutive_data_gaps"] = gap_count
+                state["last_data_gap_at"] = _current_ct_now().isoformat()
+                state["last_data_gap_failure"] = error_str
+                _save_state(state)
+                _write_log("WARN", f"data_gap_soft_skip gap={gap_count}/{DATA_GAP_KILL_THRESHOLD}: {error_str[:120]}")
+                if gap_count >= DATA_GAP_KILL_THRESHOLD:
+                    _send_telegram_lines([
+                        "MNQ Bot: Data gap kill switch engaged",
+                        f"{gap_count} consecutive missing-bar errors.",
+                        f"Will auto-clear in {DATA_GAP_AUTO_CLEAR_MINUTES} min if data recovers.",
+                    ])
+                    engage_kill_switch("data_integrity_failure")
+                    raise
+                time.sleep(backoff)
+                backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF_SECONDS)
+            else:
+                attempts += 1
+                max_retries = MAX_TRANSIENT_RETRIES if _is_transient_error(exc) else 10
+                _write_log("ERROR", f"run_loop broker error attempt={attempts}/{max_retries}: {exc}", error_only=True)
+                if attempts > max_retries:
+                    raise
+                if user_stream is not None:
+                    user_stream.stop()
+                    user_stream = None
+                client = TopstepXClient(config)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF_SECONDS)
         except Exception as exc:  # pragma: no cover - defensive operational guard
             attempts += 1
-            _write_log("ERROR", f"run_loop unexpected error attempt={attempts}: {exc}", error_only=True)
-            if attempts > 10:
+            max_retries = MAX_TRANSIENT_RETRIES if _is_transient_error(exc) else 10
+            _write_log("ERROR", f"run_loop unexpected error attempt={attempts}/{max_retries}: {exc}", error_only=True)
+            if attempts > max_retries:
                 raise
             if user_stream is not None:
                 user_stream.stop()
