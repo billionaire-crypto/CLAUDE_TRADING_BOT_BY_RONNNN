@@ -411,6 +411,33 @@ def test_orphan_not_flagged_when_routing_disabled():
     assert tr._orphan_orders_detected(st, cfg) is False
 
 
+# ── Telegram command parsing (two-way control) ──────────────────────────────────
+def test_telegram_command_status():
+    for t in ("/status", "status", "STATUS", "/s", "  /Status  ", "/status now"):
+        assert tr._telegram_command_action(t) == "status", t
+
+def test_telegram_command_halt_and_resume():
+    for t in ("/halt", "stop", "KILL", "/pause"):
+        assert tr._telegram_command_action(t) == "halt", t
+    for t in ("/resume", "clear", "go", "/start"):
+        assert tr._telegram_command_action(t) == "resume", t
+
+def test_telegram_command_flatten_positions_help():
+    assert tr._telegram_command_action("/flatten") == "flatten"
+    assert tr._telegram_command_action("closeall") == "flatten"
+    assert tr._telegram_command_action("/positions") == "positions"
+    assert tr._telegram_command_action("/help") == "help"
+
+def test_telegram_command_unknown():
+    for t in ("", "/foobar", "hello", "/ 123"):
+        assert tr._telegram_command_action(t) == "unknown", t
+
+def test_status_lines_nonempty():
+    lines = tr._status_lines(tr._default_state())
+    assert isinstance(lines, list) and len(lines) >= 4
+    assert any("HALT" in l for l in lines)
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))

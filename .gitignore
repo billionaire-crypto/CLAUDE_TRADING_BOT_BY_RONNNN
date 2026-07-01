@@ -54,3 +54,7 @@ src.zip
 trade_journal.csv
 src/exports/
 
+
+# env backups (contain secrets)
+.env.bak*
+*.bak

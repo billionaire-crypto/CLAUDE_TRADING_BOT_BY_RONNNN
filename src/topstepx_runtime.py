@@ -206,6 +206,9 @@ def _default_state() -> Dict[str, Any]:
         "awaiting_exit_fill": False,
         "rolling_entry_slippage_ticks": [],
         "rolling_exit_slippage_ticks": [],
+        "telegram_update_offset": 0,
+        "telegram_poll_initialized": False,
+        "last_status_heartbeat_at": None,
         "last_data_gap_failure": "",
         "last_known_account_balance": None,
         "last_known_account_equity": None,
@@ -1993,6 +1996,10 @@ TELEGRAM_REQUEST_TIMEOUT_SECONDS = 15
 TELEGRAM_SEND_RETRIES = 3
 
 
+TELEGRAM_HEARTBEAT_MINUTES   = 15
+TELEGRAM_HEARTBEAT_WINDOW_CT = ((8, 0), (15, 15))  # only heartbeat during the session (CT)
+
+
 def _telegram_settings() -> Dict[str, str]:
     return {
         "token": os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
@@ -2052,6 +2059,152 @@ def _send_startup_telegram_alert(config: TopstepXConfig, *, auto_submit: bool) -
     )
 
 
+def _status_lines(state: Dict[str, Any]) -> List[str]:
+    halt = "ENGAGED" if _kill_switch_active() else "clear"
+    bal = state.get("last_known_account_balance")
+    return [
+        f"time {_current_ct_now().strftime('%H:%M CT')} | session {state.get('session_date','-')}",
+        f"in_trade={state.get('in_trade')} pos={state.get('current_position',0)}",
+        f"open orders/pos {state.get('open_order_count',0)}/{state.get('open_position_count',0)}",
+        f"session P&L ${float(state.get('session_daily_pnl_usd',0) or 0):.2f} | trades {state.get('session_trade_count',0)}",
+        f"balance ${bal if bal is not None else '-'} peak ${state.get('peak_account_balance','-')}",
+        f"consistency {state.get('consistency_status','-')} | HALT {halt}",
+    ]
+
+
+def _telegram_command_action(text: str) -> str:
+    """Map a raw Telegram message to a normalized action (pure / testable)."""
+    cmd = (text or "").strip().lower().lstrip("/")
+    cmd = cmd.split()[0] if cmd else ""
+    mapping = {
+        "status": "status", "s": "status", "stat": "status",
+        "positions": "positions", "pos": "positions", "p": "positions",
+        "halt": "halt", "stop": "halt", "kill": "halt", "pause": "halt",
+        "resume": "resume", "clear": "resume", "start": "resume", "go": "resume",
+        "flatten": "flatten", "close": "flatten", "closeall": "flatten",
+        "help": "help", "commands": "help", "h": "help", "?": "help",
+    }
+    return mapping.get(cmd, "unknown")
+
+
+def _telegram_get_updates(offset: int) -> List[Dict[str, Any]]:
+    s = _telegram_settings()
+    if not s.get("token"):
+        return []
+    url = f"https://api.telegram.org/bot{s['token']}/getUpdates?timeout=0&offset={int(offset)}"
+    req = request.Request(url, method="GET")
+    with request.urlopen(req, timeout=TELEGRAM_REQUEST_TIMEOUT_SECONDS) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if not data.get("ok"):
+        raise TopstepXAPIError(f"getUpdates not ok: {str(data)[:200]}")
+    return data.get("result", []) or []
+
+
+def _handle_telegram_command(text: str, client: TopstepXClient, config: TopstepXConfig,
+                             state: Dict[str, Any]) -> None:
+    action = _telegram_command_action(text)
+    if action == "status":
+        _send_telegram_lines(["MNQ Bot status"] + _status_lines(state))
+    elif action == "positions":
+        _send_telegram_lines([
+            "MNQ Bot positions",
+            f"open positions {state.get('open_position_count',0)} (pos {state.get('current_position',0)})",
+            f"open orders {state.get('open_order_count',0)}",
+        ])
+    elif action == "halt":
+        engage_kill_switch("telegram_command")
+        _send_telegram_lines(["MNQ Bot: HALT engaged via Telegram.",
+                              "New entries blocked; any open position is flattened next cycle.",
+                              "Send /resume to clear."])
+    elif action == "resume":
+        clear_kill_switch()
+        _send_telegram_lines(["MNQ Bot: HALT cleared via Telegram. Trading resumed."])
+    elif action == "flatten":
+        try:
+            _flatten_account_internal(client, config, reason="telegram_command")
+            _send_telegram_lines(["MNQ Bot: flatten executed via Telegram."])
+        except Exception as exc:
+            _send_telegram_lines([f"MNQ Bot: flatten failed: {exc}"])
+    elif action == "help":
+        _send_telegram_lines([
+            "MNQ Bot commands:",
+            "/status - positions, P&L, halt state",
+            "/positions - open positions & orders",
+            "/halt - stop trading (kill switch)",
+            "/resume - clear halt",
+            "/flatten - close everything now",
+            "/help - this list",
+        ])
+    else:
+        _send_telegram_lines([f"Unknown command '{text[:20]}'. Send /help"])
+
+
+def _process_telegram_commands(client: TopstepXClient, config: TopstepXConfig,
+                               state: Dict[str, Any]) -> None:
+    """Poll Telegram for commands from the authorized chat and act on them.
+    Robust: never raises into the run loop; skips the startup backlog so stale
+    commands (e.g. an old /halt) are not replayed after a restart."""
+    if not _telegram_ready():
+        return
+    chat_id = str(_telegram_settings().get("chat_id", ""))
+    offset = int(state.get("telegram_update_offset", 0) or 0)
+    try:
+        updates = _telegram_get_updates(offset + 1 if offset else 0)
+    except Exception as exc:
+        _write_log("WARN", f"telegram_poll_failed: {exc}", error_only=True)
+        return
+    if not updates:
+        return
+    first_init = (offset == 0) and not state.get("telegram_poll_initialized")
+    max_id = offset
+    for u in updates:
+        try:
+            uid = int(u.get("update_id", 0))
+        except (TypeError, ValueError):
+            continue
+        max_id = max(max_id, uid)
+        if first_init:
+            continue  # drain backlog without acting
+        msg = u.get("message") or u.get("channel_post") or {}
+        text = str(msg.get("text", "")).strip()
+        frm = str((msg.get("chat") or {}).get("id", ""))
+        if not text:
+            continue
+        if chat_id and frm != chat_id:
+            _write_log("WARN", f"telegram_command_unauthorized chat={frm} text={text[:30]}")
+            continue
+        _write_log("INFO", f"telegram_command_received text={text[:40]}")
+        try:
+            _handle_telegram_command(text, client, config, state)
+        except Exception as exc:
+            _write_log("ERROR", f"telegram_command_failed text={text[:30]}: {exc}", error_only=True)
+    state["telegram_update_offset"] = max_id
+    state["telegram_poll_initialized"] = True
+    _save_state(state)
+
+
+def _maybe_send_status_heartbeat(state: Dict[str, Any]) -> None:
+    """Send a status summary every TELEGRAM_HEARTBEAT_MINUTES during the session."""
+    if not _telegram_ready():
+        return
+    from datetime import time as _dtime
+    now = _current_ct_now()
+    (sh, sm), (eh, em) = TELEGRAM_HEARTBEAT_WINDOW_CT
+    if not (_dtime(sh, sm) <= now.time() <= _dtime(eh, em)):
+        return
+    last = state.get("last_status_heartbeat_at")
+    due = True
+    if last:
+        try:
+            due = (now - datetime.fromisoformat(str(last))).total_seconds() >= TELEGRAM_HEARTBEAT_MINUTES * 60
+        except ValueError:
+            due = True
+    if due:
+        _send_telegram_lines(["MNQ Bot heartbeat"] + _status_lines(state))
+        state["last_status_heartbeat_at"] = now.isoformat()
+        _save_state(state)
+
+
 def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
     config = TopstepXConfig.from_env()
     client = TopstepXClient(config)
@@ -2068,6 +2221,8 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
     while True:
         state = _load_state()
         _maybe_auto_clear_data_gap_kill_switch()
+        _process_telegram_commands(client, config, state)   # two-way Telegram control
+        _maybe_send_status_heartbeat(state)                 # 15-min status heartbeat
         try:
             _ensure_authenticated(client, state)
             if config.enable_user_hub and user_stream is None:
