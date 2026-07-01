@@ -313,6 +313,77 @@ def test_exit_slippage_state_fields_exist():
         assert k in st
 
 
+# ── Gap-through stop fills (conservative) ───────────────────────────────────────
+def test_gap_through_enabled_by_default():
+    assert bot.GAP_THROUGH_STOPS_ENABLED is True
+
+def test_gap_through_long_fills_at_open_when_gapped():
+    # Long stop at 20000. Bar opens at 19950 (gapped below) -> fill at 19950, worse.
+    stop_px, bar_open = 20000.0, 19950.0
+    fill = min(bar_open, stop_px)
+    assert fill == 19950.0
+
+def test_gap_through_long_normal_fill_at_stop():
+    # Bar opens above stop, low pierces it -> normal fill at the stop price.
+    stop_px, bar_open = 20000.0, 20010.0
+    fill = min(bar_open, stop_px)
+    assert fill == 20000.0
+
+def test_gap_through_short_fills_at_open_when_gapped():
+    # Short stop at 20000. Bar opens at 20060 (gapped above) -> fill at 20060, worse.
+    stop_px, bar_open = 20000.0, 20060.0
+    fill = max(bar_open, stop_px)
+    assert fill == 20060.0
+
+def test_gap_through_short_normal_fill_at_stop():
+    stop_px, bar_open = 20000.0, 19990.0
+    fill = max(bar_open, stop_px)
+    assert fill == 20000.0
+
+
+# ── No-client order-plan default is symbol-aware, not raw 5 ──────────────────────
+def test_no_client_default_cap_is_symbol_aware():
+    # The build_order_plan no-client default now uses the symbol fallback, so an
+    # MNQ dry-run plan defaults to 50, not the raw NQ-lot count of 5.
+    assert tr._symbol_fallback_max_contracts("MNQ") == 50
+    assert tr._symbol_fallback_max_contracts("MNQ") != bot.SCALING_TIER_3_CONTRACTS
+
+
+# ── Phantom-bar filter ──────────────────────────────────────────────────────────
+def _mk_df(closes, spread=1.0):
+    import pandas as pd
+    idx = pd.date_range("2024-01-02 09:30", periods=len(closes), freq="5min", tz="US/Eastern")
+    return pd.DataFrame({
+        "open":  closes,
+        "high":  [c + spread for c in closes],
+        "low":   [c - spread for c in closes],
+        "close": closes,
+        "volume":[10] * len(closes),
+    }, index=idx)
+
+def test_phantom_bar_floating_above_removed():
+    df = _mk_df([100, 100, 300, 100, 100])   # bar 2 floats far above both neighbors
+    out = bot.filter_phantom_bars(df)
+    assert len(out) == 4
+    assert 300 not in list(out["close"])
+
+def test_phantom_bar_floating_below_removed():
+    df = _mk_df([20000, 20000, 19000, 20000, 20000])  # bar 2 floats far below
+    out = bot.filter_phantom_bars(df)
+    assert len(out) == 4
+    assert 19000 not in list(out["close"])
+
+def test_real_trend_move_not_removed():
+    # A genuine move where price steps and the next bar CONTINUES (overlaps) is
+    # not a phantom — must be kept.
+    df = _mk_df([20000, 20010, 20025, 20040, 20055], spread=8.0)
+    out = bot.filter_phantom_bars(df)
+    assert len(out) == 5
+
+def test_phantom_filter_flag_and_default():
+    assert bot.PHANTOM_BAR_FILTER_ENABLED is True
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))

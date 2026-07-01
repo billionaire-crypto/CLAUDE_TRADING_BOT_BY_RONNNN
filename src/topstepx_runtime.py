@@ -1400,7 +1400,10 @@ def build_order_plan(
     account = None
     contract = None
     order_symbol = config.contract_search_text
-    topstep_max_contracts = bot.SCALING_TIER_3_CONTRACTS
+    # Default to the symbol-aware fallback (MNQ->50) rather than the raw NQ-lot
+    # count (5), so no-client/dry-run plans don't show a misleading 5-contract cap.
+    # Replaced with the API/account value below when a client is present.
+    topstep_max_contracts = _symbol_fallback_max_contracts(order_symbol)
     scaling_plan_limit_mnq: Optional[int] = state.get("topstep_scaling_plan_limit_mnq")
     if client is not None:
         accounts = client.search_accounts(True)

@@ -68,6 +68,20 @@ MNQ_POINT_VALUE = 2.00          # $2.00/point (MES was $5.00)
 # Stop fallback — scaled for MNQ (32 ticks = 8 NQ points, equiv to 2 ES points)
 STOP_TICKS      = 32
 
+# Gap-through stop fills: when a bar OPENS beyond the stop (a gap or fast move),
+# fill at the open (worse) instead of the exact stop price. Models real stop
+# slippage; makes the backtest conservative rather than optimistic. Set False to
+# reproduce the old exact-stop-price behavior for A/B comparison.
+GAP_THROUGH_STOPS_ENABLED = True
+
+# Phantom-bar filter: drop isolated bad-print bars whose ENTIRE range floats
+# beyond BOTH neighbours by more than this fraction of price. Real moves overlap
+# their neighbours; a bar detached above/below both is a data artifact (a spike
+# that reverts on the next bar). Without this, gap-through fills at those garbage
+# prices produce fake catastrophic losses. Conservative: only fully-detached bars.
+PHANTOM_BAR_FILTER_ENABLED = True
+PHANTOM_BAR_DETACH_PCT     = 0.004   # 0.4% margin beyond full detachment
+
 # ── TOPSTEP $50K RULES ────────────────────────────────────────────────────────
 import pytz
 TIMEZONE             = pytz.timezone("America/Chicago")
@@ -128,6 +142,21 @@ RISK_BUDGET_SIZING_ENABLED = True
 RISK_BUDGET_MAP            = {8: 900.0, 7: 675.0, 6: 350.0}  # $ stop-risk budget by FVG score
 RISK_BUDGET_DEFAULT        = 150.0   # budget for scores below the lowest key
 HEADROOM_SAFETY_FRAC       = 0.80    # max fraction of remaining DLL headroom risked per trade
+
+# ── GAP-RISK MITIGATIONS (both off by default; A/B swept) ─────────────────────
+# Option A — gap-aware budget: size the risk budget against a stop that fills
+# GAP_STOP_MULT x its width worse (models gap-through), so even a gapped fill
+# stays within budget. Self-targeting: only trims trades big enough to matter.
+# ENABLED: caps worst single trade under the $1k combine DLL (worst -$823 vs
+# -$1018), raises Sharpe 6.81->7.23, costs ~2 days to median combine pass.
+GAP_AWARE_SIZING_ENABLED = True
+GAP_STOP_MULT            = 1.5
+
+# Option B — news-day size cap: on scheduled high-impact news days (where gaps
+# cluster), cap contracts so a gap cannot breach the DLL. Leaves all other days
+# at full size, so P&L cost is confined to those few days.
+NEWS_DAY_SIZE_CAP_ENABLED = False
+NEWS_DAY_MAX_CONTRACTS    = 10
 
 # V28: Explosive regime disabled (33% WR, consistently loses)
 # ATR ratio hard cap at 2.0 enforced in get_risk_profile()
@@ -1125,11 +1154,32 @@ def save_run_audit(audit: Dict[str, object], data_summary: Optional[Dict[str, ob
         json.dump(payload, fh, indent=2, default=_serialize_audit_value)
     print("  Exported: v29_run_audit.json")
 
+def filter_phantom_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop isolated bad-print bars whose whole range floats beyond BOTH
+    neighbours (an impossible spike that reverts next bar). See PHANTOM_BAR_*."""
+    if not PHANTOM_BAR_FILTER_ENABLED or len(df) < 3:
+        return df
+    o = df["open"].values; h = df["high"].values
+    lo = df["low"].values; c = df["close"].values
+    keep = np.ones(len(df), dtype=bool)
+    for k in range(1, len(df) - 1):
+        thr = c[k - 1] * PHANTOM_BAR_DETACH_PCT
+        floats_above = lo[k] > max(h[k - 1], h[k + 1]) + thr
+        floats_below = h[k] < min(lo[k - 1], lo[k + 1]) - thr
+        if floats_above or floats_below:
+            keep[k] = False
+    removed = int((~keep).sum())
+    if removed:
+        print(f"  Phantom-bar filter: removed {removed} detached bad-print bar(s)")
+    return df[keep]
+
+
 def fetch_data() -> pd.DataFrame:
     print("Loading data...")
     if not os.path.exists(DATA_PATH):
         raise FileNotFoundError(f"Data path does not exist: {DATA_PATH}")
     df = load_ohlcv_csv(DATA_PATH)
+    df = filter_phantom_bars(df)
     print(f"Loaded {len(df):,} 5-minute bars.")
     return df
 
@@ -2228,6 +2278,7 @@ def run_backtest(
 
     trade_mfe = 0.0
     trade_mae = 0.0
+    trade_mfe_prev_bar = 0.0   # MFE through the PRIOR completed bar (breakeven uses this, no lookahead)
 
     current_day   = None
     active_fvgs:  List[FVG] = []
@@ -2273,6 +2324,16 @@ def run_backtest(
 
         session_date = date_ct.date()
         sl = session_levels.get(session_date, {})
+
+        # Last bar of this RTH session? (next bar is a new day, or end of data).
+        # Used to force an EOD flatten at THIS bar's close and to block entries
+        # that would have no intraday bar left to exit on (prevents overnight holds).
+        if i + 1 < len(df):
+            _nd = df.index[i + 1]
+            _nd_ct = _nd.astimezone(TIMEZONE) if (hasattr(_nd, "tzinfo") and _nd.tzinfo is not None) else TIMEZONE.localize(_nd)
+            is_last_session_bar = (_nd_ct.date() != session_date)
+        else:
+            is_last_session_bar = True
 
         # ── Day rollover ──────────────────────────────────────────────────────
         if current_day != session_date:
@@ -2340,6 +2401,10 @@ def run_backtest(
 
         # ── MAE/MFE update ────────────────────────────────────────────────────
         if in_trade:
+            # Snapshot MFE as of the PRIOR completed bar BEFORE folding in this
+            # bar's excursion, so breakeven can only react to information that
+            # was actually available at this bar's open (no intrabar lookahead).
+            trade_mfe_prev_bar = trade_mfe
             if direction == "long":
                 favorable   = row["high"] - entry_price
                 unfavorable = entry_price - row["low"]
@@ -2562,12 +2627,15 @@ def run_backtest(
         if in_trade:
             # Breakeven stop: once trade is +BREAKEVEN_TRIGGER_TICKS in profit,
             # move stop to entry price. Prevents a winner from becoming a loser.
+            # Uses prior-bar MFE (not the current bar's high/low) so a stop that
+            # would only be reached intrabar cannot be "moved to breakeven" using
+            # a favorable excursion the strategy could not have seen yet.
             if BREAKEVEN_TRIGGER_TICKS > 0 and not breakeven_triggered:
                 be_pts = BREAKEVEN_TRIGGER_TICKS * MNQ_TICK_SIZE
-                if direction == "long" and trade_mfe >= be_pts:
+                if direction == "long" and trade_mfe_prev_bar >= be_pts:
                     fvg_stop = max(fvg_stop, entry_price)
                     breakeven_triggered = True
-                elif direction == "short" and trade_mfe >= be_pts:
+                elif direction == "short" and trade_mfe_prev_bar >= be_pts:
                     fvg_stop = min(fvg_stop, entry_price)
                     breakeven_triggered = True
 
@@ -2579,6 +2647,8 @@ def run_backtest(
                 partial_px    = entry_price + partial_pts
                 hit_stop      = row["low"]  <= stop_px
                 hit_target    = row["high"] >= target_px
+                # Gap-through: if the bar opened below the stop, fill at the open.
+                stop_fill_px  = min(row["open"], stop_px) if GAP_THROUGH_STOPS_ENABLED else stop_px
                 hit_partial   = (PARTIAL_PROFIT_ENABLED
                                  and not partial_taken
                                  and contracts > 1
@@ -2589,6 +2659,8 @@ def run_backtest(
                 partial_px    = entry_price - partial_pts
                 hit_stop      = row["high"] >= stop_px
                 hit_target    = row["low"]  <= target_px
+                # Gap-through: if the bar opened above the stop, fill at the open.
+                stop_fill_px  = max(row["open"], stop_px) if GAP_THROUGH_STOPS_ENABLED else stop_px
                 hit_partial   = (PARTIAL_PROFIT_ENABLED
                                  and not partial_taken
                                  and contracts > 1
@@ -2618,18 +2690,26 @@ def run_backtest(
             # in the same bar, assume stop was hit first. Prevents the backtest from
             # favorably assuming targets fill before stops on volatile bars.
             if hit_stop and hit_target:
-                exit_price  = stop_px
+                exit_price  = stop_fill_px
                 exit_reason = "stop"
             elif hit_target:
                 exit_price  = target_px
                 exit_reason = "target"
             elif hit_stop:
-                exit_price  = stop_px
+                exit_price  = stop_fill_px
                 exit_reason = "stop"
             elif ((direction == "long"  and not prev_row["long_signal"]) or
                   (direction == "short" and not prev_row["short_signal"])):
                 exit_price  = row["open"]
                 exit_reason = "signal_flip"
+
+            # EOD flatten: if still in a trade on the last bar of the session,
+            # close at THIS bar's close. Prevents holding overnight and eating
+            # the next session's opening gap (the flatten window otherwise never
+            # intersects RTH-filtered data, which ends before HARD_FLATTEN time).
+            if exit_price is None and is_last_session_bar:
+                exit_price  = row["close"]
+                exit_reason = "eod_flatten"
 
             if exit_price is not None:
                 pnl_pts       = ((exit_price - entry_price) if direction == "long"
@@ -2674,6 +2754,12 @@ def run_backtest(
         # ── Entry logic ───────────────────────────────────────────────────────
         if not in_trade:
             if not _is_entry_allowed(date_ct):
+                portfolio.append(cash)
+                continue
+
+            # No entries on the last bar of the session — there is no further
+            # intraday bar to exit on, which would force an overnight hold.
+            if is_last_session_bar:
                 portfolio.append(cash)
                 continue
 
@@ -3229,7 +3315,10 @@ def run_backtest(
                 if _stop_dist > 0:
                     _worst_slip   = max(_t for _cap, _t in SLIPPAGE_SCALE_TIERS)
                     _per_ctr_cost = COMMISSION_PER_CONTRACT + _worst_slip * MNQ_TICK_VALUE * 2
-                    _per_ctr_risk = _stop_dist * MNQ_POINT_VALUE + _per_ctr_cost
+                    # Gap-aware: budget against a stop that fills GAP_STOP_MULT x
+                    # its width worse, so a gapped fill still fits the budget.
+                    _eff_stop_dist = _stop_dist * (GAP_STOP_MULT if GAP_AWARE_SIZING_ENABLED else 1.0)
+                    _per_ctr_risk = _eff_stop_dist * MNQ_POINT_VALUE + _per_ctr_cost
                     _score  = int(fvg_quality["score"])
                     _budget = RISK_BUDGET_DEFAULT
                     for _th in sorted(RISK_BUDGET_MAP.keys(), reverse=True):
@@ -3252,6 +3341,13 @@ def run_backtest(
                                 _cdr_target = ATR_CDR_TARGET_USD * (FVG_SCORE_CONTRACT_MAP[_th] / STRONG_CONTRACTS)
                                 break
                     contracts = max(1, min(contracts, int(_cdr_target / _risk_per_ctr)))
+
+            # News-day size cap: on scheduled high-impact news days (gap-prone),
+            # cap size so a gap-through fill cannot breach the DLL. Other days
+            # keep full size, so the P&L cost is confined to these few sessions.
+            if (NEWS_DAY_SIZE_CAP_ENABLED and this_entry_type == "FVG"
+                    and str(session_date) in ALL_NEWS_DATES):
+                contracts = min(contracts, NEWS_DAY_MAX_CONTRACTS)
 
             # Risk-budget may zero out size when headroom is nearly exhausted;
             # skip the trade rather than force a minimum (the FVG is consumed).
