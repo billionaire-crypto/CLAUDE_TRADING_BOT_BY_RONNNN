@@ -798,8 +798,16 @@ def _bars_to_strategy_df(bars: List[Dict[str, Any]]):
     df = df.sort_values("ts_event")
     df = df.drop_duplicates(subset="ts_event", keep="last")
     df = df.set_index("ts_event")
-    df = df.between_time("08:30", "15:15")
+    # Parity with the backtest dataset (RTH 09:30-16:00 ET = 08:30-15:00 CT).
+    # ProjectX serves bars to 15:15 CT; the backtest never saw 15:00-15:15 CT,
+    # so signals must not be generated from bars the strategy was never
+    # validated on. (Hard flatten at 15:08 CT is enforced by the run loop.)
+    df = df.between_time("08:30", "15:00")
     df = df[["open", "high", "low", "close", "volume"]]
+    # Parity with the backtest data pipeline: quarantine detached bad-print bars
+    # (the filter needs both neighbours, so the current/most-recent bar is never
+    # dropped — only interior phantoms are).
+    df = bot.filter_phantom_bars(df)
     if df.empty:
         raise TopstepXAPIError("ProjectX live bar retrieval produced an empty RTH dataset after filtering.")
     session_dates = bot.pd.Series(df.index.date, index=df.index)

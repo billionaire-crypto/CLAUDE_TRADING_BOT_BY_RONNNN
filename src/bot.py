@@ -314,10 +314,45 @@ PARTIAL_PROFIT_FRACTION = 0.60   # close 60% of contracts, let 40% run
 # Breakeven stop: once +N ticks in profit, move stop to entry (set 0 to disable)
 BREAKEVEN_TRIGGER_TICKS = 20
 
-# FOMC announcement blackout: skip entries in a 45-min window around the 2 PM ET release
+# ── EXIT / REGIME RESEARCH TOGGLES (default OFF; flipped by research sweeps) ──
+# All decisions use PRIOR-bar information only (no intrabar lookahead).
+TIME_STOP_ENABLED       = False  # kill dead trades to free the one-position slot
+TIME_STOP_BARS          = 24     # bars in trade before the time stop is eligible (2h)
+TIME_STOP_MIN_MFE_TICKS = 8      # only exit if prior-bar MFE never reached this
+# TRAIL: DO NOT ENABLE FOR LIVE TRADING YET. The live runtime places STATIC
+# brackets and never modifies a stop after entry — a backtest with trailing
+# stops books profits the live system cannot take (live/backtest mismatch).
+# Validated in research (with ATR targets: WR 49%, PF 4.0, net $309.5k) and
+# ready to enable ONLY after runtime stop-modification (safe cancel/replace)
+# is implemented and tested.
+TRAIL_AFTER_MFE_ENABLED = False  # once a runner, trail the stop behind peak MFE
+TRAIL_TRIGGER_TICKS     = 60     # prior-bar MFE that arms the trail
+TRAIL_GAP_TICKS         = 40     # stop trails this far behind prior-bar peak MFE
+BE_OFFSET_TICKS         = 0      # breakeven stop = entry +/- offset (covers costs)
+ATR_FLOOR_PCT_ENABLED   = False  # normalize the strong-gate 1.5-pt ATR floor by price
+ATR_FLOOR_PCT           = 0.0002 # = 1.5 pts at ~7,600 (2019 calibration)
+# ATR-scaled FVG targets — SHIPPING (2026-07-02). The fixed 100-tick target
+# (25 pts) was ~3-5x ATR in 2019 but only ~0.7x ATR by 2025 (index tripled;
+# tick-denominated geometry drifted). Scaling by ATR restores constant reward
+# geometry. Validated: net +40% ($320.9k vs $228.7k/7yr), PF 3.89, avg trade
+# $143 vs $101, better in ALL 8 years, tails IDENTICAL (worst trade/day/trough
+# -$823/-$915/-$915), combine sim P(pass) 98.3% with median 21d vs 24d.
+# The 240-tick cap is load-bearing: uncapped targets held positions through
+# violent bars (worst trade -$3,613). Do not raise the cap without re-running
+# research batches 3-5.
+ATR_TARGET_ENABLED      = True
+ATR_TARGET_MULT         = 2.0
+ATR_TARGET_MIN_TICKS    = 60
+ATR_TARGET_MAX_TICKS    = 240
+
+# FOMC announcement blackout. Statement drops 2:00 PM ET = 13:00 CT; press
+# conference 2:30-3:30 PM ET = 13:30-14:30 CT. The old window (13:45-14:30 CT)
+# was a timezone slip — it STARTED 45 minutes after the statement and left the
+# most violent bar of the day tradeable. Corrected to cover pre-statement
+# through the end of the press conference.
 FOMC_BLACKOUT_ENABLED  = True
-FOMC_BLACKOUT_START_CT = (13, 45)  # 1:45 PM CT — 15 min before announcement
-FOMC_BLACKOUT_END_CT   = (14, 30)  # 2:30 PM CT — 30 min after announcement
+FOMC_BLACKOUT_START_CT = (12, 40)  # 20 min before the 13:00 CT statement
+FOMC_BLACKOUT_END_CT   = (14, 30)  # end of press conference (3:30 PM ET)
 
 # One-account optimization filters
 SKIP_FOMC_ENTRIES              = False
@@ -437,6 +472,11 @@ FOMC_DATES = {
     "2024-07-31","2024-09-18","2024-11-07","2024-12-18","2025-01-29",
     "2025-03-19","2025-05-07","2025-06-18","2025-07-30","2025-09-17",
     "2025-11-05","2025-12-17","2026-01-28","2026-03-18",
+    # Remaining 2026 meetings (announcement day = second meeting day), from the
+    # Fed's published tentative schedule. VERIFY against federalreserve.gov
+    # before each meeting — a rescheduled meeting with a stale date here means
+    # an unprotected 13:00 CT statement bar.
+    "2026-04-29","2026-06-17","2026-07-29","2026-09-16","2026-10-28","2026-12-09",
 }
 CPI_DATES = {
     "2019-01-11","2019-02-13","2019-03-12","2019-04-10","2019-05-10",
@@ -478,6 +518,23 @@ NFP_DATES = {
     "2025-09-05","2025-10-03","2025-11-07","2025-12-05","2026-01-09",
     "2026-02-06","2026-03-06",
 }
+
+# NFP releases on the first Friday of the month (8:30 ET, pre-session for this
+# bot). The hardcoded list above went stale after 2026-03; auto-extend with
+# first-Fridays so is_nfp_day tagging and the news-day size cap never silently
+# lapse again. (CPI has no fixed rule — its list is maintained manually and is
+# stale after 2026-03; CPI releases pre-open so no in-session exposure.)
+def _first_fridays(start_year: int, end_year: int) -> set:
+    import datetime as _dt
+    out = set()
+    for y in range(start_year, end_year + 1):
+        for m in range(1, 13):
+            d = _dt.date(y, m, 1)
+            d += _dt.timedelta(days=(4 - d.weekday()) % 7)  # first Friday
+            out.add(d.isoformat())
+    return out
+
+NFP_DATES |= _first_fridays(2026, 2027)
 # ISM Manufacturing PMI — first business day of each month (10:00 AM ET release)
 ISM_BLACKOUT_ENABLED = True
 
@@ -953,8 +1010,14 @@ def get_risk_profile(row) -> dict:
     if ratio < CALM_ATR_RATIO:
         return {"regime": "calm", "contracts": 0, "target_ticks": 0, "max_trades": 0}
 
-    elif (ratio >= STRONG_ATR_RATIO
-          and row["atr"] >= 1.5
+    # ATR floor: 1.5 raw points was calibrated at ~7,600 (2019). At today's
+    # index levels a fixed 1.5 is nearly always true (gate drift). The pct
+    # toggle re-normalizes the floor by price so "enough volatility to reach
+    # the target" means the same thing across eras.
+    _atr_floor = (row["close"] * ATR_FLOOR_PCT) if ATR_FLOOR_PCT_ENABLED else 1.5
+
+    if (ratio >= STRONG_ATR_RATIO
+          and row["atr"] >= _atr_floor
           and row["adx"] >= ADX_STRONG_THRESHOLD):
         return {
             "regime": "strong",
@@ -962,7 +1025,7 @@ def get_risk_profile(row) -> dict:
             "target_ticks": STRONG_TARGET_TICKS,
             "max_trades": STRONG_MAX_TRADES,
         }
-    elif row["atr"] >= 1.5:
+    elif row["atr"] >= _atr_floor:
         # Normal: volatility is sufficient but ADX is weak — trade at reduced size.
         # Previously returned 0 contracts (curve-fitted off); restored with conservative sizing.
         return {
@@ -2333,7 +2396,13 @@ def run_backtest(
             _nd_ct = _nd.astimezone(TIMEZONE) if (hasattr(_nd, "tzinfo") and _nd.tzinfo is not None) else TIMEZONE.localize(_nd)
             is_last_session_bar = (_nd_ct.date() != session_date)
         else:
-            is_last_session_bar = True
+            # End of data is NOT a known session boundary. Critically, in LIVE
+            # signal generation the current bar is always the final bar of the
+            # window — flagging it as last-session-bar would block entry
+            # evaluation there and silence live signals entirely (the sink at
+            # the bottom of run_backtest only emits when in_trade on the final
+            # bar). Only an OBSERVED date change blocks entries / EOD-flattens.
+            is_last_session_bar = False
 
         # ── Day rollover ──────────────────────────────────────────────────────
         if current_day != session_date:
@@ -2631,13 +2700,25 @@ def run_backtest(
             # would only be reached intrabar cannot be "moved to breakeven" using
             # a favorable excursion the strategy could not have seen yet.
             if BREAKEVEN_TRIGGER_TICKS > 0 and not breakeven_triggered:
-                be_pts = BREAKEVEN_TRIGGER_TICKS * MNQ_TICK_SIZE
+                be_pts  = BREAKEVEN_TRIGGER_TICKS * MNQ_TICK_SIZE
+                be_off  = BE_OFFSET_TICKS * MNQ_TICK_SIZE
                 if direction == "long" and trade_mfe_prev_bar >= be_pts:
-                    fvg_stop = max(fvg_stop, entry_price)
+                    fvg_stop = max(fvg_stop, entry_price + be_off)
                     breakeven_triggered = True
                 elif direction == "short" and trade_mfe_prev_bar >= be_pts:
-                    fvg_stop = min(fvg_stop, entry_price)
+                    fvg_stop = min(fvg_stop, entry_price - be_off)
                     breakeven_triggered = True
+
+            # Trail after MFE: once the trade has run TRAIL_TRIGGER_TICKS (per
+            # PRIOR-bar MFE), trail the stop TRAIL_GAP_TICKS behind the peak so
+            # a big winner cannot round-trip back to breakeven/stop.
+            if TRAIL_AFTER_MFE_ENABLED and trade_mfe_prev_bar >= TRAIL_TRIGGER_TICKS * MNQ_TICK_SIZE:
+                _lock = trade_mfe_prev_bar - TRAIL_GAP_TICKS * MNQ_TICK_SIZE
+                if _lock > 0:
+                    if direction == "long":
+                        fvg_stop = max(fvg_stop, entry_price + _lock)
+                    else:
+                        fvg_stop = min(fvg_stop, entry_price - _lock)
 
             target_pts  = target_ticks * MNQ_TICK_SIZE
             partial_pts = PARTIAL_PROFIT_TICKS * MNQ_TICK_SIZE
@@ -2702,6 +2783,14 @@ def run_backtest(
                   (direction == "short" and not prev_row["short_signal"])):
                 exit_price  = row["open"]
                 exit_reason = "signal_flip"
+            elif (TIME_STOP_ENABLED
+                  and (i - entry_bar_idx) >= TIME_STOP_BARS
+                  and trade_mfe_prev_bar < TIME_STOP_MIN_MFE_TICKS * MNQ_TICK_SIZE):
+                # Dead trade: N bars in and it never moved. Free the single
+                # position slot for the next setup instead of waiting for the
+                # stop. Decision uses prior-bar MFE only; fill at current open.
+                exit_price  = row["open"]
+                exit_reason = "time_stop"
 
             # EOD flatten: if still in a trade on the last bar of the session,
             # close at THIS bar's close. Prevents holding overnight and eating
@@ -3302,6 +3391,12 @@ def run_backtest(
                         entry_dir=entry_dir,
                         entry_type=this_entry_type,
                     )
+                    # ATR-scaled target (research toggle): constant reward
+                    # geometry across price eras instead of fixed ticks.
+                    if ATR_TARGET_ENABLED and not pd.isna(prev_row["atr"]):
+                        target_ticks = int(min(max(
+                            ATR_TARGET_MULT * float(prev_row["atr"]) / MNQ_TICK_SIZE,
+                            ATR_TARGET_MIN_TICKS), ATR_TARGET_MAX_TICKS))
                     active_fvgs  = [f for f in active_fvgs if f is not entry_fvg]
 
             # ATR constant-dollar-risk sizing: after stop is known, rescale FVG

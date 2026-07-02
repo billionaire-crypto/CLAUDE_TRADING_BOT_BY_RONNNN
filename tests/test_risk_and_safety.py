@@ -438,6 +438,29 @@ def test_status_lines_nonempty():
     assert any("HALT" in l for l in lines)
 
 
+# ── News-protection regressions (2026-07-01 audit fixes) ────────────────────────
+def test_fomc_blackout_covers_statement_bar():
+    # FOMC statement = 2:00 PM ET = 13:00 CT. The old window (13:45-14:30 CT)
+    # started 45 minutes AFTER the statement (timezone slip).
+    assert bot.FOMC_BLACKOUT_START_CT <= (13, 0) <= bot.FOMC_BLACKOUT_END_CT
+
+def test_fomc_dates_cover_2026_h2():
+    assert "2026-07-29" in bot.FOMC_DATES
+    assert "2026-09-16" in bot.FOMC_DATES
+    assert "2026-12-09" in bot.FOMC_DATES
+
+def test_nfp_dates_autogenerate_forward():
+    # First Fridays of 2026 H2 must exist even though the hardcoded list ended 2026-03.
+    assert "2026-07-03" in bot.NFP_DATES   # first Friday of July 2026
+    assert "2026-08-07" in bot.NFP_DATES
+    assert "2027-01-01" in bot.NFP_DATES   # 2027-01-01 is a Friday
+
+def test_first_fridays_helper():
+    fs = bot._first_fridays(2026, 2026)
+    assert len(fs) == 12
+    assert "2026-02-06" in fs
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
