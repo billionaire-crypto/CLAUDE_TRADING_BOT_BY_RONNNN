@@ -470,3 +470,104 @@ if __name__ == "__main__":
 def test_stress_toggles_default_off():
     assert bot.MISS_FILL_PROB == 0.0
     assert bot.STOP_EXTRA_SLIP_TICKS == 0
+
+
+# ── Live stop management (breakeven/trail unlock) ───────────────────────────────
+def test_desired_stop_breakeven_long():
+    # 20t trigger, prior-bar MFE 6 pts (=24t) -> stop ratchets to entry (+offset 0)
+    assert bot.desired_stop_price("long", 20000.0, 19992.0, 6.0) == 20000.0
+
+def test_desired_stop_no_move_below_trigger():
+    # MFE 4 pts = 16t < 20t trigger -> unchanged
+    assert bot.desired_stop_price("long", 20000.0, 19992.0, 4.0) == 19992.0
+
+def test_desired_stop_never_retreats():
+    # Stop already above breakeven -> stays put (ratchet)
+    assert bot.desired_stop_price("long", 20000.0, 20005.0, 6.0) == 20005.0
+
+def test_desired_stop_short_symmetry():
+    assert bot.desired_stop_price("short", 20000.0, 20008.0, 6.0) == 20000.0
+
+def test_desired_stop_trail_when_enabled():
+    saved = bot.TRAIL_AFTER_MFE_ENABLED
+    try:
+        bot.TRAIL_AFTER_MFE_ENABLED = True
+        # MFE 20 pts (=80t) >= 60t trigger; lock = 20 - 10 (40t) = +10 pts
+        assert bot.desired_stop_price("long", 20000.0, 19992.0, 20.0) == 20010.0
+        assert bot.desired_stop_price("short", 20000.0, 20008.0, 20.0) == 19990.0
+    finally:
+        bot.TRAIL_AFTER_MFE_ENABLED = saved
+
+def test_trail_flag_still_off_for_staged_rollout():
+    assert bot.TRAIL_AFTER_MFE_ENABLED is False
+
+def test_pick_protective_stop_nearest():
+    orders = [
+        {"id": 1, "contractId": "X", "side": 1, "type": 4, "stopPrice": 19980.0},
+        {"id": 2, "contractId": "X", "side": 1, "type": 4, "stopPrice": 19995.0},
+        {"id": 3, "contractId": "Y", "side": 1, "type": 4, "stopPrice": 19999.0},
+    ]
+    pick = tr._pick_protective_stop(orders, entry_side=0, contract_id="X")
+    assert pick["id"] == 2  # nearest below market for a long
+    assert tr._pick_protective_stop([], 0, "X") is None
+
+def test_live_mfe_excludes_entry_bar():
+    import pandas as pd
+    idx = pd.date_range("2026-07-06 09:30", periods=3, freq="5min", tz="America/Chicago")
+    df = pd.DataFrame({"high": [20050.0, 20010.0, 20020.0],
+                       "low": [19990.0, 19995.0, 20000.0]}, index=idx)
+    # entry on the first bar: its 20050 spike must NOT count (backtest parity)
+    mfe = tr._live_mfe_pts(df, idx[0], 20000.0, "long")
+    assert mfe == 20.0  # max(20010,20020)-20000, not 50
+    assert tr._live_mfe_pts(df[df.index <= idx[0]], idx[0], 20000.0, "long") is None
+
+
+class _FakeStopClient:
+    def __init__(self, modify_ok=True, confirm=True, cancel_ok=True):
+        self.modify_ok = modify_ok; self.confirm = confirm; self.cancel_ok = cancel_ok
+        self.calls = []
+    def modify_order(self, account_id, order_id, **kw):
+        self.calls.append(("modify", order_id, kw.get("stop_price")))
+        if not self.modify_ok:
+            raise tr.TopstepXAPIError("modify unsupported")
+        return {"success": True}
+    def place_order(self, **kw):
+        self.calls.append(("place", kw.get("order_type"), kw.get("stop_price")))
+        return {"orderId": 999}
+    def search_open_orders(self, account_id):
+        self.calls.append(("search", None, None))
+        return [{"id": 999}] if self.confirm else []
+    def cancel_order(self, account_id, order_id):
+        self.calls.append(("cancel", order_id, None))
+        if not self.cancel_ok and order_id == 5:
+            raise tr.TopstepXAPIError("cancel rejected")
+        return {"success": True}
+
+def _mv(cli):
+    return tr._move_protective_stop(cli, None, account_id=1, contract_id="X",
+                                    entry_side=0, old_order_id=5, size=3, new_stop=20000.0)
+
+def test_move_stop_atomic_modify():
+    cli = _FakeStopClient(modify_ok=True)
+    assert _mv(cli) == "modify"
+    assert [c[0] for c in cli.calls] == ["modify"]  # no place, no cancel
+
+def test_move_stop_fallback_place_confirm_then_cancel():
+    cli = _FakeStopClient(modify_ok=False, confirm=True, cancel_ok=True)
+    assert _mv(cli) == "replace"
+    kinds = [c[0] for c in cli.calls]
+    # NEVER cancel-first: the cancel of the old stop must come after place+confirm
+    assert kinds.index("place") < kinds.index("cancel")
+    assert ("cancel", 5, None) in cli.calls
+
+def test_move_stop_unconfirmed_replacement_keeps_old():
+    cli = _FakeStopClient(modify_ok=False, confirm=False)
+    import pytest
+    with pytest.raises(tr.TopstepXAPIError):
+        _mv(cli)
+    # old stop (id 5) must NOT have been cancelled
+    assert ("cancel", 5, None) not in cli.calls
+
+def test_move_stop_old_cancel_failure_reports_two_stops():
+    cli = _FakeStopClient(modify_ok=False, confirm=True, cancel_ok=False)
+    assert _mv(cli) == "replace_old_uncancelled"

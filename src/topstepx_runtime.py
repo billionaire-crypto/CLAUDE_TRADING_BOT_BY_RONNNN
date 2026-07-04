@@ -202,6 +202,9 @@ def _default_state() -> Dict[str, Any]:
         "last_signal_entry_price": None,
         "last_signal_stop_price": None,
         "last_signal_target_price": None,
+        "last_entry_fill_price": None,
+        "stop_mgmt_last_bar": "",
+        "stop_moves_this_trade": 0,
         "awaiting_entry_fill": False,
         "awaiting_exit_fill": False,
         "rolling_entry_slippage_ticks": [],
@@ -1004,6 +1007,7 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
                         state.get("rolling_entry_slippage_ticks"), intended, actual)
                     state["awaiting_entry_fill"] = False
                     state["awaiting_exit_fill"] = True   # arm exit monitoring
+                    state["last_entry_fill_price"] = float(actual)  # anchor for live stop mgmt
                     _emit_slippage_log_and_halt(
                         "entry", state["rolling_entry_slippage_ticks"], intended, actual,
                         "slippage_systematic_excess")
@@ -1741,6 +1745,9 @@ def _submit_order_plan(
     state["last_signal_target_price"] = _tgt_px
     state["awaiting_entry_fill"] = _entry_px is not None
     state["awaiting_exit_fill"] = False   # armed only after the entry fill is seen
+    state["last_entry_fill_price"] = None  # set by the entry-fill event
+    state["stop_moves_this_trade"] = 0
+    state["stop_mgmt_last_bar"] = ""       # fresh trade -> fresh stop-mgmt cycle
     state["last_order_signal_id"] = signal_id
     state["last_order_custom_tag"] = str(order_payload.get("customTag", ""))
     state["latency_signal_to_submit_ms"] = _duration_ms(signal_payload.get("generated_at"), submitted_at)
@@ -2067,6 +2074,191 @@ def _send_startup_telegram_alert(config: TopstepXConfig, *, auto_submit: bool) -
     )
 
 
+# ── LIVE STOP MANAGEMENT (breakeven / trail via shared bot.desired_stop_price) ──
+STOP_MGMT_MIN_IMPROVE_TICKS = 1
+STOP_MGMT_CONFIRM_TIMEOUT_SECONDS = 5.0
+
+
+def _stop_mgmt_enabled() -> bool:
+    return os.getenv("TOPSTEPX_STOP_MGMT", "true").strip().lower() != "false"
+
+
+def _pick_protective_stop(open_orders: List[Dict[str, Any]], entry_side: int,
+                          contract_id: str) -> Optional[Dict[str, Any]]:
+    """Nearest-to-market protective stop for the position (there should be one;
+    if duplicates exist from a fallback, manage the nearest and let orphan
+    cleanup collect the rest once flat)."""
+    stops = [o for o in open_orders
+             if _is_protective_stop_like_order(o, entry_side=entry_side, contract_id=contract_id)
+             and o.get("stopPrice") not in (None, "", 0, 0.0)]
+    if not stops:
+        return None
+    # long entry (side 0) -> sell stop BELOW market: nearest = highest stopPrice.
+    return max(stops, key=lambda o: float(o["stopPrice"])) if entry_side == 0 \
+        else min(stops, key=lambda o: float(o["stopPrice"]))
+
+
+def _live_mfe_pts(bars_df, entry_bar_ts, entry_px: float, direction: str) -> Optional[float]:
+    """MFE in points over COMPLETED bars strictly AFTER the entry bar — mirrors
+    the backtest, which never counts the entry bar's own excursion and always
+    acts on prior-completed-bar MFE (no lookahead)."""
+    post = bars_df[bars_df.index > entry_bar_ts]
+    if post.empty:
+        return None
+    if direction == "long":
+        return max(0.0, float(post["high"].max()) - float(entry_px))
+    return max(0.0, float(entry_px) - float(post["low"].min()))
+
+
+def _move_protective_stop(client: TopstepXClient, config: TopstepXConfig, *,
+                          account_id: int, contract_id: str, entry_side: int,
+                          old_order_id: int, size: int, new_stop: float) -> str:
+    """Move a working protective stop. Returns the method used.
+
+    Order of preference:
+      1) atomic in-place modify (no unprotected instant)
+      2) place NEW stop -> confirm it is working -> cancel old
+         (briefly two stops; NEVER zero; never cancel-first)
+    Raises TopstepXAPIError only if the position could not be given the better
+    stop at all (old stop is then still working -> still protected).
+    """
+    try:
+        client.modify_order(account_id, int(old_order_id), stop_price=float(new_stop))
+        return "modify"
+    except Exception as exc:
+        _write_log("WARN", f"stop_modify_failed order={old_order_id}: {exc}; "
+                           f"falling back to place-then-cancel")
+    # Fallback: place replacement first.
+    resp = client.place_order(
+        account_id=account_id, contract_id=contract_id,
+        side=1 - int(entry_side), size=int(size), order_type=4,
+        stop_price=float(new_stop), custom_tag="V29-stop-mgmt-replace",
+    )
+    new_id = resp.get("orderId") or resp.get("id")
+    deadline = time.monotonic() + STOP_MGMT_CONFIRM_TIMEOUT_SECONDS
+    confirmed = False
+    while time.monotonic() < deadline:
+        working = client.search_open_orders(account_id)
+        if any(str(o.get("id")) == str(new_id) for o in working):
+            confirmed = True
+            break
+        time.sleep(0.5)
+    if not confirmed:
+        # Replacement not visible: try to cancel it (avoid duplicates) and keep old.
+        if new_id is not None:
+            try:
+                client.cancel_order(account_id, int(new_id))
+            except Exception:
+                pass
+        raise TopstepXAPIError("Replacement stop not confirmed; keeping original stop.")
+    # New stop confirmed working -> retire the old one.
+    for attempt in range(3):
+        try:
+            client.cancel_order(account_id, int(old_order_id))
+            return "replace"
+        except Exception as exc:
+            _write_log("ERROR", f"old_stop_cancel_failed attempt={attempt+1} "
+                                f"order={old_order_id}: {exc}", error_only=True)
+            time.sleep(1.0)
+    _send_telegram_lines([
+        "MNQ Bot: WARNING - two protective stops working",
+        f"New stop {new_stop} confirmed but old order {old_order_id} would not cancel.",
+        "Position remains protected; orphan cleanup will collect the extra order.",
+    ])
+    return "replace_old_uncancelled"
+
+
+def _manage_position_stops(client: TopstepXClient, config: TopstepXConfig,
+                           state: Dict[str, Any]) -> None:
+    """Once per completed 5-min bar while a position is open: recompute the
+    desired stop (breakeven/trail, shared math with the backtest) and move the
+    working stop if it improves by >= 1 tick. Never widens a stop."""
+    if not _stop_mgmt_enabled() or config.dry_run or not config.enable_order_routing:
+        return
+    if _kill_switch_active():
+        return
+    try:
+        pos = int(state.get("current_position", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    if pos == 0:
+        state["stop_moves_this_trade"] = 0
+        return
+    entry_px = state.get("last_entry_fill_price") or state.get("last_signal_entry_price")
+    submitted_at = state.get("last_order_submitted_at")
+    if not entry_px or not submitted_at:
+        return
+    direction = "long" if pos > 0 else "short"
+    entry_side = 0 if pos > 0 else 1
+
+    account = _require_single_account(client.search_accounts(True), config.account_name)
+    account_id = int(account["id"])
+    contract = client.resolve_contract(config.contract_search_text, live=config.live_data)
+    if contract is None:
+        return
+    contract_id = str(contract["id"])
+
+    now_utc = datetime.utcnow()
+    bars = client.retrieve_bars(
+        contract_id=contract_id,
+        start_time=(now_utc - timedelta(days=2)).replace(microsecond=0).isoformat() + "Z",
+        end_time=now_utc.replace(microsecond=0).isoformat() + "Z",
+        live=config.live_data, unit=2, unit_number=5, limit=600,
+        include_partial_bar=False,
+    )
+    df = _bars_to_strategy_df(bars)
+    if df.empty:
+        return
+    last_bar_key = str(df.index[-1])
+    if state.get("stop_mgmt_last_bar") == last_bar_key:
+        return  # already evaluated this completed bar
+    state["stop_mgmt_last_bar"] = last_bar_key
+
+    entry_dt = datetime.fromisoformat(str(submitted_at))
+    # Entry bar label = submit time floored to 5 min; exclude that bar (parity).
+    entry_bar_ts = bot.pd.Timestamp(entry_dt).floor("5min").tz_convert(df.index.tz)
+    mfe_pts = _live_mfe_pts(df, entry_bar_ts, float(entry_px), direction)
+    if mfe_pts is None:
+        _save_state(state)
+        return
+
+    open_orders = client.search_open_orders(account_id)
+    stop_order = _pick_protective_stop(open_orders, entry_side, contract_id)
+    if stop_order is None:
+        _save_state(state)
+        return  # unprotected-position guard elsewhere owns this case
+    current_stop = float(stop_order["stopPrice"])
+
+    desired = bot.desired_stop_price(direction, float(entry_px), current_stop, float(mfe_pts))
+    desired = round(desired / bot.MNQ_TICK_SIZE) * bot.MNQ_TICK_SIZE  # tick grid
+    improve_ticks = (desired - current_stop) / bot.MNQ_TICK_SIZE if direction == "long" \
+        else (current_stop - desired) / bot.MNQ_TICK_SIZE
+    if improve_ticks < STOP_MGMT_MIN_IMPROVE_TICKS:
+        _save_state(state)
+        return
+
+    size = _extract_position_size({"size": abs(pos)}) or abs(pos)
+    try:
+        method = _move_protective_stop(
+            client, config, account_id=account_id, contract_id=contract_id,
+            entry_side=entry_side, old_order_id=int(stop_order.get("id")),
+            size=int(size), new_stop=float(desired),
+        )
+        moves = int(state.get("stop_moves_this_trade", 0) or 0) + 1
+        state["stop_moves_this_trade"] = moves
+        state["last_signal_stop_price"] = float(desired)  # exit-slippage anchor follows
+        _write_log("INFO", f"stop_moved method={method} {direction} entry={entry_px} "
+                           f"old={current_stop} new={desired} mfe_pts={mfe_pts:.2f} move#{moves}")
+        if moves == 1:
+            _send_telegram_lines([
+                "MNQ Bot: stop moved to protect trade",
+                f"{direction} from {entry_px} - stop {current_stop} -> {desired} ({method})",
+            ])
+    except Exception as exc:
+        _write_log("ERROR", f"stop_move_failed (old stop still working): {exc}", error_only=True)
+    _save_state(state)
+
+
 def _status_lines(state: Dict[str, Any]) -> List[str]:
     halt = "ENGAGED" if _kill_switch_active() else "clear"
     bal = state.get("last_known_account_balance")
@@ -2299,6 +2491,14 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
                 continue
 
             if state.get("last_loop_minute") != minute_key:
+                # Live stop management first: while in a position, ratchet the
+                # protective stop (breakeven/trail) per completed 5-min bar.
+                # Never raises into the loop; no-op when flat or disabled.
+                try:
+                    _manage_position_stops(client, config, state)
+                except Exception as exc:
+                    _write_log("ERROR", f"stop_mgmt_error: {exc}", error_only=True)
+
                 signal_payload = build_live_strategy_signal(client, config)
                 state = _load_state()
                 state["last_signal_built_at"] = signal_payload.get("generated_at")

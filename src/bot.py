@@ -325,12 +325,13 @@ BREAKEVEN_TRIGGER_TICKS = 20
 TIME_STOP_ENABLED       = False  # kill dead trades to free the one-position slot
 TIME_STOP_BARS          = 24     # bars in trade before the time stop is eligible (2h)
 TIME_STOP_MIN_MFE_TICKS = 8      # only exit if prior-bar MFE never reached this
-# TRAIL: DO NOT ENABLE FOR LIVE TRADING YET. The live runtime places STATIC
-# brackets and never modifies a stop after entry — a backtest with trailing
-# stops books profits the live system cannot take (live/backtest mismatch).
-# Validated in research (with ATR targets: WR 49%, PF 4.0, net $309.5k) and
-# ready to enable ONLY after runtime stop-modification (safe cancel/replace)
-# is implemented and tested.
+# TRAIL: live stop-modification now EXISTS (_manage_position_stops in
+# topstepx_runtime.py: atomic modify, else place-new-confirm-then-cancel-old;
+# shares this exact math via desired_stop_price()). STAGED ROLLOUT: the flag
+# stays OFF until the machinery is proven on real live fills — breakeven moves
+# (already modeled by the backtest) exercise the same code path first. Flip to
+# True only after observing clean live stop-moves; then backtest and live are
+# consistent by construction. Validated with ATR targets: WR 49%, PF 4.0.
 TRAIL_AFTER_MFE_ENABLED = False  # once a runner, trail the stop behind peak MFE
 TRAIL_TRIGGER_TICKS     = 60     # prior-bar MFE that arms the trail
 TRAIL_GAP_TICKS         = 40     # stop trails this far behind prior-bar peak MFE
@@ -987,6 +988,34 @@ def round_turn_cost(contracts: int) -> float:
         slip_ticks = SLIPPAGE_TICKS
     slippage = slip_ticks * MNQ_TICK_VALUE * contracts * 2
     return commission + slippage
+
+
+# ── SHARED STOP MANAGEMENT (backtest engine AND live stop manager) ───────────
+
+def desired_stop_price(direction: str, entry_price: float, current_stop: float,
+                       mfe_prev_bar_pts: float) -> float:
+    """Single source of truth for post-entry stop management (breakeven + trail).
+
+    Called by the backtest engine each bar AND by the live stop manager each
+    completed 5-min bar, so live behavior mirrors the backtest by construction.
+
+    mfe_prev_bar_pts: max favorable excursion in POINTS through the PRIOR
+    completed bar — never the current/forming bar (no lookahead, live or
+    backtest).
+
+    Ratchet-only: the returned stop is never worse than current_stop.
+    """
+    stop = float(current_stop)
+    if BREAKEVEN_TRIGGER_TICKS > 0 and mfe_prev_bar_pts >= BREAKEVEN_TRIGGER_TICKS * MNQ_TICK_SIZE:
+        be = entry_price + BE_OFFSET_TICKS * MNQ_TICK_SIZE if direction == "long" \
+            else entry_price - BE_OFFSET_TICKS * MNQ_TICK_SIZE
+        stop = max(stop, be) if direction == "long" else min(stop, be)
+    if TRAIL_AFTER_MFE_ENABLED and mfe_prev_bar_pts >= TRAIL_TRIGGER_TICKS * MNQ_TICK_SIZE:
+        lock = mfe_prev_bar_pts - TRAIL_GAP_TICKS * MNQ_TICK_SIZE
+        if lock > 0:
+            tgt = entry_price + lock if direction == "long" else entry_price - lock
+            stop = max(stop, tgt) if direction == "long" else min(stop, tgt)
+    return stop
 
 
 # ── SCALING TIER ──────────────────────────────────────────────────────────────
@@ -2723,26 +2752,9 @@ def run_backtest(
             # Uses prior-bar MFE (not the current bar's high/low) so a stop that
             # would only be reached intrabar cannot be "moved to breakeven" using
             # a favorable excursion the strategy could not have seen yet.
-            if BREAKEVEN_TRIGGER_TICKS > 0 and not breakeven_triggered:
-                be_pts  = BREAKEVEN_TRIGGER_TICKS * MNQ_TICK_SIZE
-                be_off  = BE_OFFSET_TICKS * MNQ_TICK_SIZE
-                if direction == "long" and trade_mfe_prev_bar >= be_pts:
-                    fvg_stop = max(fvg_stop, entry_price + be_off)
-                    breakeven_triggered = True
-                elif direction == "short" and trade_mfe_prev_bar >= be_pts:
-                    fvg_stop = min(fvg_stop, entry_price - be_off)
-                    breakeven_triggered = True
-
-            # Trail after MFE: once the trade has run TRAIL_TRIGGER_TICKS (per
-            # PRIOR-bar MFE), trail the stop TRAIL_GAP_TICKS behind the peak so
-            # a big winner cannot round-trip back to breakeven/stop.
-            if TRAIL_AFTER_MFE_ENABLED and trade_mfe_prev_bar >= TRAIL_TRIGGER_TICKS * MNQ_TICK_SIZE:
-                _lock = trade_mfe_prev_bar - TRAIL_GAP_TICKS * MNQ_TICK_SIZE
-                if _lock > 0:
-                    if direction == "long":
-                        fvg_stop = max(fvg_stop, entry_price + _lock)
-                    else:
-                        fvg_stop = min(fvg_stop, entry_price - _lock)
+            # Breakeven + trail via the SHARED stop-management function (same
+            # code path the live stop manager uses -> parity by construction).
+            fvg_stop = desired_stop_price(direction, entry_price, fvg_stop, trade_mfe_prev_bar)
 
             target_pts  = target_ticks * MNQ_TICK_SIZE
             partial_pts = PARTIAL_PROFIT_TICKS * MNQ_TICK_SIZE
