@@ -2294,6 +2294,7 @@ def _telegram_command_action(text: str) -> str:
         "halt": "halt", "stop": "halt", "kill": "halt", "pause": "halt",
         "resume": "resume", "clear": "resume", "start": "resume", "go": "resume",
         "flatten": "flatten", "close": "flatten", "closeall": "flatten",
+        "test": "test", "sample": "test", "demo": "test", "testalert": "test",
         "help": "help", "commands": "help", "h": "help", "?": "help",
     }
     return mapping.get(cmd, "unknown")
@@ -2312,43 +2313,67 @@ def _telegram_get_updates(offset: int) -> List[Dict[str, Any]]:
     return data.get("result", []) or []
 
 
+def _send_test_alerts(state: Dict[str, Any]) -> None:
+    """Send a clearly-labeled sample of each real alert type. Lets the user see
+    what live alerts look like on demand (via /test) WITHOUT the confusion of
+    unlabeled test values. Every line is stamped TEST."""
+    _send_telegram_lines(["🧪 TEST — the next messages are SAMPLES, not real events."])
+    _send_telegram_lines([
+        "🔒 [TEST] Trade protected (break-even)",
+        "Your LONG is in profit, so I moved the stop up to your entry.",
+        "This trade can no longer become a real loss.",
+        "Stop: 20000.00 → 20008.00",
+    ])
+    _send_telegram_lines([
+        "⚠️ [TEST] Getting close to the daily loss limit",
+        "Buffer left: $450 (about 25%). I'm trading smaller to stay safe.",
+    ])
+    _send_telegram_lines(["🧪 [TEST] Your /status looks like this:"] + _status_lines(state))
+    _send_telegram_lines(["✅ TEST complete. Real alerts are NOT stamped with TEST."])
+
+
 def _handle_telegram_command(text: str, client: TopstepXClient, config: TopstepXConfig,
                              state: Dict[str, Any]) -> None:
     action = _telegram_command_action(text)
     if action == "status":
-        _send_telegram_lines(["MNQ Bot status"] + _status_lines(state))
+        _send_telegram_lines(["📊 MNQ Bot status"] + _status_lines(state))
     elif action == "positions":
+        pos = int(state.get("current_position", 0) or 0)
+        where = "no open trade" if pos == 0 else (f"LONG {abs(pos)}" if pos > 0 else f"SHORT {abs(pos)}")
         _send_telegram_lines([
-            "MNQ Bot positions",
-            f"open positions {state.get('open_position_count',0)} (pos {state.get('current_position',0)})",
-            f"open orders {state.get('open_order_count',0)}",
+            "📊 MNQ Bot positions",
+            f"Right now: {where}",
+            f"Working orders: {state.get('open_order_count', 0)}",
         ])
     elif action == "halt":
         engage_kill_switch("telegram_command")
-        _send_telegram_lines(["MNQ Bot: HALT engaged via Telegram.",
-                              "New entries blocked; any open position is flattened next cycle.",
-                              "Send /resume to clear."])
+        _send_telegram_lines(["⛔ MNQ Bot HALTED.",
+                              "No new trades; any open trade is closed next cycle.",
+                              "Send /resume when you want it trading again."])
     elif action == "resume":
         clear_kill_switch()
-        _send_telegram_lines(["MNQ Bot: HALT cleared via Telegram. Trading resumed."])
+        _send_telegram_lines(["✅ MNQ Bot resumed — back to watching the market."])
     elif action == "flatten":
         try:
             _flatten_account_internal(client, config, reason="telegram_command")
-            _send_telegram_lines(["MNQ Bot: flatten executed via Telegram."])
+            _send_telegram_lines(["✅ MNQ Bot: closed everything as requested."])
         except Exception as exc:
-            _send_telegram_lines([f"MNQ Bot: flatten failed: {exc}"])
+            _send_telegram_lines([f"⚠️ MNQ Bot: could not close — {exc}"])
+    elif action == "test":
+        _send_test_alerts(state)
     elif action == "help":
         _send_telegram_lines([
-            "MNQ Bot commands:",
-            "/status - positions, P&L, halt state",
-            "/positions - open positions & orders",
-            "/halt - stop trading (kill switch)",
-            "/resume - clear halt",
-            "/flatten - close everything now",
-            "/help - this list",
+            "🤖 MNQ Bot — what you can send me:",
+            "/status — how the bot is doing right now",
+            "/positions — what trade (if any) is open",
+            "/halt — stop trading immediately",
+            "/resume — start trading again",
+            "/flatten — close everything now",
+            "/test — send sample alerts (labeled TEST)",
+            "/help — this list",
         ])
     else:
-        _send_telegram_lines([f"Unknown command '{text[:20]}'. Send /help"])
+        _send_telegram_lines([f"🤔 I didn't understand '{text[:20]}'. Send /help"])
 
 
 def _process_telegram_commands(client: TopstepXClient, config: TopstepXConfig,
@@ -2612,6 +2637,7 @@ def parse_args() -> argparse.Namespace:
     engage = sub.add_parser("engage-kill-switch", help="Create HALT.txt to block new routing.")
     engage.add_argument("--reason", default="manual", help="Short reason stored in the halt file.")
     sub.add_parser("clear-kill-switch", help="Remove HALT.txt and allow routing again.")
+    sub.add_parser("send-test-alerts", help="Send labeled sample Telegram alerts (TEST).")
     payout = sub.add_parser("reset-payout-window", help="Reset the tracked payout-cycle metrics in local state.")
     payout.add_argument("--reason", default="manual", help="Short reason recorded in the log.")
 
@@ -2675,6 +2701,8 @@ def main() -> None:
             engage_kill_switch(reason=str(args.reason))
         elif args.command == "clear-kill-switch":
             clear_kill_switch()
+        elif args.command == "send-test-alerts":
+            _send_test_alerts(_load_state())
         elif args.command == "reset-payout-window":
             reset_payout_window(reason=str(args.reason))
         elif args.command == "submit-signal":
