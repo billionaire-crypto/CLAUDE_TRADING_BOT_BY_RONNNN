@@ -34,6 +34,12 @@ from src.load_data import load_ohlcv_csv
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 DATA_PATH       = r"C:\Users\kyawz\Downloads\GLBX-20260331-885WT5W7KA\glbx-mdp3-20100606-20260329.ohlcv-1m.csv"
+# Additional bar files appended to the base dataset (deduped on the overlap).
+# Same GLBX.MDP3 OHLCV-1m format; verified bar-identical to the live ProjectX
+# feed. Extends the backtest past the base file's 2026-03-27 end.
+DATA_PATH_EXTENSIONS = [
+    r"C:\Users\kyawz\Downloads\databento_mnq_2026_apr_jul.csv",
+]
 INIT_CASH       = 50_000.0
 RUN_MODE        = "BACKTEST"
 EXECUTION_PROFILE = "CONSERVATIVE"
@@ -1243,6 +1249,16 @@ def fetch_data() -> pd.DataFrame:
         raise FileNotFoundError(f"Data path does not exist: {DATA_PATH}")
     df = load_ohlcv_csv(DATA_PATH)
     df = filter_phantom_bars(df)
+    for ext_path in DATA_PATH_EXTENSIONS:
+        if not os.path.exists(ext_path):
+            print(f"  (extension not found, skipped: {ext_path})")
+            continue
+        ext = filter_phantom_bars(load_ohlcv_csv(ext_path))
+        before = len(df)
+        df = pd.concat([df, ext])
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        print(f"  Extended with {os.path.basename(ext_path)}: "
+              f"+{len(df)-before:,} bars -> {len(df):,} total, to {df.index[-1]}")
     print(f"Loaded {len(df):,} 5-minute bars.")
     return df
 
