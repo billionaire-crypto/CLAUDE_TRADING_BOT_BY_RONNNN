@@ -464,3 +464,9 @@ def test_first_fridays_helper():
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# -- Stress toggles must ship OFF (they distort fills when on) -------------------
+def test_stress_toggles_default_off():
+    assert bot.MISS_FILL_PROB == 0.0
+    assert bot.STOP_EXTRA_SLIP_TICKS == 0

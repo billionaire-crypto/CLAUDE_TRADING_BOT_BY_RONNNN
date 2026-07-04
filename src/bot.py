@@ -351,6 +351,11 @@ ATR_TARGET_MULT         = 2.0
 ATR_TARGET_MIN_TICKS    = 60
 ATR_TARGET_MAX_TICKS    = 240
 
+# ── STRESS-TEST TOGGLES (default OFF; flipped only by robustness batteries) ──
+MISS_FILL_PROB        = 0.0   # probability an entry is randomly skipped (latency/missed-fill stress)
+MISS_FILL_SEED        = 1     # RNG seed so missed-fill runs are reproducible
+STOP_EXTRA_SLIP_TICKS = 0     # extra adverse ticks on EVERY stop fill (gap/news shock stress)
+
 # FOMC announcement blackout. Statement drops 2:00 PM ET = 13:00 CT; press
 # conference 2:30-3:30 PM ET = 13:30-14:30 CT. The old window (13:45-14:30 CT)
 # was a timezone slip — it STARTED 45 minutes after the statement and left the
@@ -2336,6 +2341,9 @@ def run_backtest(
     live_signal_sink: Optional[Dict[str, object]] = None,
 ) -> Tuple[pd.DataFrame, List[TradeRecord], List[DailyRecord], RiskState]:
 
+    import random as _random
+    _miss_rng = _random.Random(MISS_FILL_SEED)  # missed-fill stress RNG (inert unless MISS_FILL_PROB>0)
+
     state   = RiskState()
     trades:        List[TradeRecord] = []
     daily_records: List[DailyRecord] = []
@@ -2746,6 +2754,7 @@ def run_backtest(
                 hit_target    = row["high"] >= target_px
                 # Gap-through: if the bar opened below the stop, fill at the open.
                 stop_fill_px  = min(row["open"], stop_px) if GAP_THROUGH_STOPS_ENABLED else stop_px
+                stop_fill_px -= STOP_EXTRA_SLIP_TICKS * MNQ_TICK_SIZE  # stress: worse long-stop fill
                 hit_partial   = (PARTIAL_PROFIT_ENABLED
                                  and not partial_taken
                                  and contracts > 1
@@ -2758,6 +2767,7 @@ def run_backtest(
                 hit_target    = row["low"]  <= target_px
                 # Gap-through: if the bar opened above the stop, fill at the open.
                 stop_fill_px  = max(row["open"], stop_px) if GAP_THROUGH_STOPS_ENABLED else stop_px
+                stop_fill_px += STOP_EXTRA_SLIP_TICKS * MNQ_TICK_SIZE  # stress: worse short-stop fill
                 hit_partial   = (PARTIAL_PROFIT_ENABLED
                                  and not partial_taken
                                  and contracts > 1
@@ -3488,6 +3498,12 @@ def run_backtest(
                 entry_regime = profile["regime"]
             else:
                 entry_regime = vwap_mr_setup["regime"]
+            # Missed-fill stress: randomly skip a committed entry (models latency /
+            # rejected orders / setup gone). Default off; seeded for reproducibility.
+            if MISS_FILL_PROB > 0.0 and _miss_rng.random() < MISS_FILL_PROB:
+                portfolio.append(cash)
+                continue
+
             # ADX-based bar regime (used by consistency scorecard to filter chop subset)
             entry_bar_adx_regime = classify_regime_adx(prev_row)
             in_trade             = True
