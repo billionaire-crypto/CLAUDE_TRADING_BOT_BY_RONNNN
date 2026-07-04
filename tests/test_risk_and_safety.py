@@ -642,3 +642,33 @@ def test_manage_position_stops_noop_when_flat(monkeypatch):
     state = tr._default_state(); state["current_position"] = 0
     tr._manage_position_stops(cli, _CfgFull(), state)
     assert cli.modified == []   # nothing to manage when flat
+
+
+# ── Observability: fill forensics + EOD summary (logging only, no trade impact) ──
+def test_fill_forensics_writes_row_and_computes_slippage(monkeypatch, tmp_path):
+    monkeypatch.setattr(tr, "FILL_FORENSICS_CSV_PATH", str(tmp_path / "ff.csv"))
+    st = tr._default_state(); st["session_date"] = "2026-07-06"; st["session_daily_pnl_usd"] = 120.0
+    row = tr._log_fill_forensics(st, kind="entry", contract="MNQU6", direction="long",
+                                 size=3, intended=20000.0, actual=20000.75, trade_pnl=None)
+    assert row["slippage_ticks"] == 3.0                 # 0.75 / 0.25
+    assert row["slippage_usd"] == 3.0 * tr.bot.MNQ_TICK_VALUE * 3   # 3t * $0.50 * 3 = $4.50
+    import csv as _csv
+    with open(tr.FILL_FORENSICS_CSV_PATH, encoding="utf-8") as fh:
+        rows = list(_csv.DictReader(fh))
+    assert len(rows) == 1 and rows[0]["kind"] == "entry"
+
+def test_eod_summary_sends_once_and_reads_exits(monkeypatch, tmp_path):
+    sent = []
+    monkeypatch.setattr(tr, "_send_telegram_lines", lambda lines: sent.append(lines) or True)
+    monkeypatch.setattr(tr, "_save_state", lambda s: None)
+    monkeypatch.setattr(tr, "FILL_FORENSICS_CSV_PATH", str(tmp_path / "ff.csv"))
+    st = tr._default_state(); st["session_date"] = "2026-07-06"; st["session_daily_pnl_usd"] = 240.0
+    tr._log_fill_forensics(st, kind="exit_target", contract="X", direction="long",
+                           size=3, intended=20010.0, actual=20010.0, trade_pnl=240.0)
+    tr._send_eod_summary(st)
+    assert sent, "EOD summary should send"
+    assert any("end of day" in l for l in sent[-1])
+    assert st["eod_summary_sent_date"] == "2026-07-06"
+    sent.clear()
+    tr._send_eod_summary(st)          # second call same day -> no-op
+    assert not sent

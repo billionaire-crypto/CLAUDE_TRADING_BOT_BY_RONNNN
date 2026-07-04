@@ -33,6 +33,13 @@ SIGNAL_EXPORT_PATH = os.path.join(bot.EXPORT_DIR, "v29_topstep_signal.json")
 ORDER_PLAN_EXPORT_PATH = os.path.join(bot.EXPORT_DIR, "v29_topstep_order_plan.json")
 TELEMETRY_JSONL_PATH = os.path.join(bot.EXPORT_DIR, "v29_topstep_telemetry.jsonl")
 TRADE_NOTES_CSV_PATH = os.path.join(bot.EXPORT_DIR, "v29_topstep_trade_notes.csv")
+FILL_FORENSICS_CSV_PATH = os.path.join(bot.EXPORT_DIR, "v29_fill_forensics.csv")
+FILL_FORENSICS_FIELDS = [
+    "ts", "session_date", "kind", "contract", "size", "direction",
+    "intended_price", "actual_price", "slippage_ticks", "slippage_usd",
+    "trade_pnl", "session_pnl_after",
+    "bar_to_signal_ms", "signal_to_submit_ms", "submit_to_fill_ms",
+]
 STATE_PATH = os.path.join(bot.EXPORT_DIR, "v29_topstep_runtime_state.json")
 KILL_SWITCH_PATH = os.path.join(bot.EXPORT_DIR, "HALT.txt")
 ERROR_LOG_PATH = os.path.join(bot.EXPORT_DIR, "live_errors.txt")
@@ -212,6 +219,7 @@ def _default_state() -> Dict[str, Any]:
         "telegram_update_offset": 0,
         "telegram_poll_initialized": False,
         "last_status_heartbeat_at": None,
+        "eod_summary_sent_date": "",
         "last_data_gap_failure": "",
         "last_known_account_balance": None,
         "last_known_account_equity": None,
@@ -677,6 +685,102 @@ def _finalize_session_if_needed(state: Dict[str, Any]) -> None:
     state["last_session_finalize_date"] = session_date
 
 
+def _log_fill_forensics(state: Dict[str, Any], *, kind: str, contract: str, direction: str,
+                        size, intended, actual, trade_pnl) -> Dict[str, Any]:
+    """Append one structured forensics row per fill (intended vs actual, slippage
+    in ticks AND dollars, full latency chain) and return a concise summary for a
+    live alert. Pure observability -- never affects trading decisions."""
+    row: Dict[str, Any] = {
+        "ts": datetime.now(bot.TIMEZONE).isoformat(),
+        "session_date": state.get("session_date", ""),
+        "kind": kind, "contract": contract, "size": size, "direction": direction,
+        "intended_price": intended, "actual_price": actual,
+        "trade_pnl": trade_pnl,
+        "session_pnl_after": round(float(state.get("session_daily_pnl_usd", 0.0) or 0.0), 2),
+        "bar_to_signal_ms": state.get("latency_bar_to_signal_ms"),
+        "signal_to_submit_ms": state.get("latency_signal_to_submit_ms"),
+        "submit_to_fill_ms": state.get("latency_submit_to_fill_ms"),
+    }
+    slip_ticks = slip_usd = None
+    if intended and actual:
+        slip_ticks = round(abs(float(actual) - float(intended)) / bot.MNQ_TICK_SIZE, 2)
+        try:
+            slip_usd = round(slip_ticks * bot.MNQ_TICK_VALUE * abs(int(size or 0)), 2)
+        except (TypeError, ValueError):
+            slip_usd = None
+    row["slippage_ticks"] = slip_ticks
+    row["slippage_usd"] = slip_usd
+    try:
+        os.makedirs(os.path.dirname(FILL_FORENSICS_CSV_PATH), exist_ok=True)
+        exists = os.path.exists(FILL_FORENSICS_CSV_PATH)
+        with open(FILL_FORENSICS_CSV_PATH, "a", encoding="utf-8", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=FILL_FORENSICS_FIELDS)
+            if not exists:
+                w.writeheader()
+            w.writerow({f: row.get(f, "") for f in FILL_FORENSICS_FIELDS})
+    except Exception as exc:
+        _write_log("ERROR", f"fill_forensics_write_failed: {exc}", error_only=True)
+    _write_log("INFO", f"fill_forensics kind={kind} size={size} intended={intended} "
+                       f"actual={actual} slip_ticks={slip_ticks} slip_usd={slip_usd} "
+                       f"latency_ms={row['submit_to_fill_ms']}")
+    return row
+
+
+def _alert_fill(kind: str, row: Dict[str, Any]) -> None:
+    """Concise live Telegram on each fill so the user sees trades as they happen."""
+    slip = f"{row.get('slippage_ticks')}t (${row.get('slippage_usd')})" if row.get("slippage_ticks") is not None else "n/a"
+    if kind == "entry":
+        _send_telegram_lines([
+            f"📥 Entered {str(row.get('direction','')).upper()} {row.get('size')} @ {row.get('actual_price')}",
+            f"Slippage vs plan: {slip} · fill latency: {row.get('submit_to_fill_ms')} ms",
+        ])
+    else:
+        pnl = row.get("trade_pnl")
+        emoji = "🟢" if (pnl is not None and float(pnl) > 0) else "🔴"
+        _send_telegram_lines([
+            f"📤 Exit ({kind.replace('exit_','')}) — {emoji} ${pnl}",
+            f"Slippage vs plan: {slip} · today's P&L: ${row.get('session_pnl_after')}",
+        ])
+
+
+def _send_eod_summary(state: Dict[str, Any]) -> None:
+    """Once per day after the flatten time: read today's fills and send a plain
+    end-of-day digest (trades, P&L, win/loss, avg slippage, worst trade)."""
+    session_date = str(state.get("session_date", ""))
+    if not session_date or state.get("eod_summary_sent_date") == session_date:
+        return
+    exits = []
+    try:
+        if os.path.exists(FILL_FORENSICS_CSV_PATH):
+            with open(FILL_FORENSICS_CSV_PATH, encoding="utf-8", newline="") as fh:
+                for r in csv.DictReader(fh):
+                    if r.get("session_date") == session_date and str(r.get("kind", "")).startswith("exit"):
+                        exits.append(r)
+    except Exception as exc:
+        _write_log("ERROR", f"eod_summary_read_failed: {exc}", error_only=True)
+
+    pnls = [float(r["trade_pnl"]) for r in exits if r.get("trade_pnl") not in (None, "", "None")]
+    slips = [float(r["slippage_ticks"]) for r in exits if r.get("slippage_ticks") not in (None, "", "None")]
+    net = float(state.get("session_daily_pnl_usd", 0.0) or 0.0)
+    wins = sum(1 for p in pnls if p > 0)
+    day_emoji = "🟢" if net > 0 else ("🔴" if net < 0 else "⚪")
+    lines = [
+        f"{day_emoji} MNQ Bot — end of day {session_date}",
+        f"Net P&L: ${net:,.2f}",
+        f"Trades: {len(pnls)}  (wins {wins} / losses {len(pnls) - wins})",
+    ]
+    if pnls:
+        lines.append(f"Best ${max(pnls):,.0f} · worst ${min(pnls):,.0f}")
+    if slips:
+        lines.append(f"Avg slippage: {sum(slips) / len(slips):.2f} ticks (backtest assumes ~1)")
+    if not pnls:
+        lines.append("No trades today — a quiet session (normal).")
+    _send_telegram_lines(lines)
+    state["eod_summary_sent_date"] = session_date
+    _save_state(state)
+    _write_log("INFO", f"eod_summary_sent date={session_date} net={net:.2f} trades={len(pnls)}")
+
+
 def _start_new_session(state: Dict[str, Any], session_date: str, current_profit: Optional[float]) -> None:
     state["session_date"] = session_date
     state["session_start_total_profit"] = float(current_profit) if current_profit is not None else 0.0
@@ -1000,6 +1104,7 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
             # tick; if a rolling average exceeds SLIPPAGE_ALERT_TICKS the edge
             # assumption is broken -> halt.
             actual = _extract_numeric(payload, "price", "fillPrice", "averagePrice", "avgPrice")
+            _fill_dir = "long" if int(state.get("current_position", 0) or 0) > 0 else "short"
             if state.get("awaiting_entry_fill") and trade_pnl is None:
                 intended = state.get("last_signal_entry_price")
                 if intended and actual:
@@ -1008,6 +1113,10 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
                     state["awaiting_entry_fill"] = False
                     state["awaiting_exit_fill"] = True   # arm exit monitoring
                     state["last_entry_fill_price"] = float(actual)  # anchor for live stop mgmt
+                    _row = _log_fill_forensics(state, kind="entry",
+                        contract=str(payload.get("contractId", "")), direction=_fill_dir,
+                        size=payload.get("size"), intended=intended, actual=actual, trade_pnl=None)
+                    _alert_fill("entry", _row)
                     _emit_slippage_log_and_halt(
                         "entry", state["rolling_entry_slippage_ticks"], intended, actual,
                         "slippage_systematic_excess")
@@ -1021,6 +1130,10 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
                     state["rolling_exit_slippage_ticks"] = _record_slippage(
                         state.get("rolling_exit_slippage_ticks"), intended, actual)
                     state["awaiting_exit_fill"] = False
+                    _row = _log_fill_forensics(state, kind=f"exit_{exit_kind}",
+                        contract=str(payload.get("contractId", "")), direction=_fill_dir,
+                        size=payload.get("size"), intended=intended, actual=actual, trade_pnl=trade_pnl)
+                    _alert_fill(f"exit_{exit_kind}", _row)
                     _emit_slippage_log_and_halt(
                         f"exit_{exit_kind}", state["rolling_exit_slippage_ticks"], intended, actual,
                         "exit_slippage_systematic_excess")
@@ -2519,6 +2632,10 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
             if (now.hour, now.minute) >= (bot.HARD_FLATTEN_H, bot.HARD_FLATTEN_M):
                 if state.get("open_order_count") or state.get("open_position_count"):
                     _flatten_account_internal(client, config, reason="hard_flatten_time")
+                try:
+                    _send_eod_summary(state)   # once-per-day end-of-day digest
+                except Exception as exc:
+                    _write_log("ERROR", f"eod_summary_error: {exc}", error_only=True)
                 state["last_loop_minute"] = minute_key
                 _save_state(state)
                 time.sleep(interval_seconds)
