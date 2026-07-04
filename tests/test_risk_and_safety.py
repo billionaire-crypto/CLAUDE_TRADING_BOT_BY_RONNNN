@@ -571,3 +571,59 @@ def test_move_stop_unconfirmed_replacement_keeps_old():
 def test_move_stop_old_cancel_failure_reports_two_stops():
     cli = _FakeStopClient(modify_ok=False, confirm=True, cancel_ok=False)
     assert _mv(cli) == "replace_old_uncancelled"
+
+
+# ── End-to-end: _manage_position_stops fires breakeven on a live-shaped position ─
+class _FakeMgrClient:
+    """Mimics the broker for a long position that has run +24t past entry."""
+    def __init__(self):
+        self.modified = []
+        self.account = {"id": 1, "name": "acct"}
+    def search_accounts(self, active=True):
+        return [self.account]
+    def resolve_contract(self, text, live=None):
+        return {"id": "X", "name": "MNQU6"}
+    def retrieve_bars(self, **kw):
+        # 5-min bars, UTC. Entry bar 15:00Z (10:00 CT) spikes high 20050 (must be
+        # EXCLUDED). Post-entry bars top out at 20006 -> MFE 6pts=24t >= 20t.
+        return [
+            {"t": "2026-07-06T15:00:00Z", "o": 20000, "h": 20050, "l": 19999, "c": 20000, "v": 100},
+            {"t": "2026-07-06T15:05:00Z", "o": 20000, "h": 20003, "l": 19998, "c": 20002, "v": 100},
+            {"t": "2026-07-06T15:10:00Z", "o": 20002, "h": 20006, "l": 20001, "c": 20005, "v": 100},
+        ]
+    def search_open_orders(self, account_id):
+        return [{"id": 5, "contractId": "X", "side": 1, "type": 4, "stopPrice": 19992.0}]
+    def modify_order(self, account_id, order_id, **kw):
+        self.modified.append((order_id, kw.get("stop_price")))
+        return {"success": True}
+
+class _CfgFull:
+    enable_order_routing = True
+    dry_run = False
+    contract_search_text = "MNQ"
+    live_data = False
+    account_name = "acct"
+
+def test_manage_position_stops_moves_to_breakeven_end_to_end(monkeypatch):
+    monkeypatch.setattr(tr, "_save_state", lambda s: None)
+    monkeypatch.setattr(tr, "_kill_switch_active", lambda: False)
+    cli = _FakeMgrClient()
+    state = tr._default_state()
+    state.update({
+        "current_position": 3,                      # long 3 lots
+        "last_entry_fill_price": 20000.0,
+        "last_order_submitted_at": "2026-07-06T10:00:00-05:00",  # 10:00 CT
+        "stop_mgmt_last_bar": "",                    # not yet evaluated this bar
+    })
+    tr._manage_position_stops(cli, _CfgFull(), state)
+    # It must have moved the stop from 19992 up to breakeven (entry 20000).
+    assert cli.modified == [(5, 20000.0)], cli.modified
+    assert state["stop_moves_this_trade"] == 1
+
+def test_manage_position_stops_noop_when_flat(monkeypatch):
+    monkeypatch.setattr(tr, "_save_state", lambda s: None)
+    monkeypatch.setattr(tr, "_kill_switch_active", lambda: False)
+    cli = _FakeMgrClient()
+    state = tr._default_state(); state["current_position"] = 0
+    tr._manage_position_stops(cli, _CfgFull(), state)
+    assert cli.modified == []   # nothing to manage when flat
