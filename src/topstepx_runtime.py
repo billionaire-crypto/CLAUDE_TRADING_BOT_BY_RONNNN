@@ -2062,14 +2062,15 @@ def _send_telegram_lines(lines: List[str]) -> bool:
 
 
 def _send_startup_telegram_alert(config: TopstepXConfig, *, auto_submit: bool) -> None:
+    live = auto_submit and not config.dry_run and config.enable_order_routing
     _send_telegram_lines(
         [
-            "MNQ Bot Started",
-            f"Session date: {_current_session_date()}",
+            "✅ MNQ Bot started — watching the market",
+            f"Date: {_current_session_date()}",
             f"Account: {config.account_name}",
-            f"Auto-submit: {auto_submit}",
-            f"Dry run: {config.dry_run}",
-            f"Routing enabled: {config.enable_order_routing}",
+            "Mode: LIVE — will place real orders" if live
+            else "Mode: PRACTICE — will not place real orders",
+            "Send /status any time, or /halt to stop it.",
         ]
     )
 
@@ -2161,9 +2162,10 @@ def _move_protective_stop(client: TopstepXClient, config: TopstepXConfig, *,
                                 f"order={old_order_id}: {exc}", error_only=True)
             time.sleep(1.0)
     _send_telegram_lines([
-        "MNQ Bot: WARNING - two protective stops working",
-        f"New stop {new_stop} confirmed but old order {old_order_id} would not cancel.",
-        "Position remains protected; orphan cleanup will collect the extra order.",
+        "ℹ️ MNQ Bot: minor housekeeping (nothing to do)",
+        "I added a new stop-loss but couldn't remove the old one.",
+        "Your trade is STILL fully protected — this is extra safety, not less.",
+        "I'll tidy up the leftover order automatically.",
     ])
     return "replace_old_uncancelled"
 
@@ -2251,8 +2253,10 @@ def _manage_position_stops(client: TopstepXClient, config: TopstepXConfig,
                            f"old={current_stop} new={desired} mfe_pts={mfe_pts:.2f} move#{moves}")
         if moves == 1:
             _send_telegram_lines([
-                "MNQ Bot: stop moved to protect trade",
-                f"{direction} from {entry_px} - stop {current_stop} -> {desired} ({method})",
+                "🔒 MNQ Bot: trade protected (break-even)",
+                f"Your {direction.upper()} is in profit, so I moved the stop up to your entry.",
+                "This trade can no longer become a real loss — worst case is now roughly break-even.",
+                f"Stop: {current_stop:.2f} → {desired:.2f}",
             ])
     except Exception as exc:
         _write_log("ERROR", f"stop_move_failed (old stop still working): {exc}", error_only=True)
@@ -2260,15 +2264,23 @@ def _manage_position_stops(client: TopstepXClient, config: TopstepXConfig,
 
 
 def _status_lines(state: Dict[str, Any]) -> List[str]:
-    halt = "ENGAGED" if _kill_switch_active() else "clear"
+    halted = _kill_switch_active()
     bal = state.get("last_known_account_balance")
+    pos = int(state.get("current_position", 0) or 0)
+    pnl = float(state.get("session_daily_pnl_usd", 0) or 0)
+    if halted:
+        trading = "⛔ HALTED (send /resume to restart)"
+    elif pos > 0:
+        trading = f"📈 in a LONG trade ({abs(pos)} contracts)"
+    elif pos < 0:
+        trading = f"📉 in a SHORT trade ({abs(pos)} contracts)"
+    else:
+        trading = "✅ running, waiting for a setup (no trade open)"
     return [
-        f"time {_current_ct_now().strftime('%H:%M CT')} | session {state.get('session_date','-')}",
-        f"in_trade={state.get('in_trade')} pos={state.get('current_position',0)}",
-        f"open orders/pos {state.get('open_order_count',0)}/{state.get('open_position_count',0)}",
-        f"session P&L ${float(state.get('session_daily_pnl_usd',0) or 0):.2f} | trades {state.get('session_trade_count',0)}",
-        f"balance ${bal if bal is not None else '-'} peak ${state.get('peak_account_balance','-')}",
-        f"consistency {state.get('consistency_status','-')} | HALT {halt}",
+        f"🕒 {_current_ct_now().strftime('%I:%M %p CT')}",
+        trading,
+        f"Today's P&L: ${pnl:,.2f}  ({state.get('session_trade_count', 0)} trades)",
+        f"Balance: ${bal if bal is not None else '-'}",
     ]
 
 

@@ -17,6 +17,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src import bot
 from src import topstepx_runtime as tr
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_real_telegram(monkeypatch):
+    """Hard guard: tests must NEVER reach the live Telegram chat. Neutralizes
+    both the line sender and the raw HTTP call regardless of env credentials."""
+    monkeypatch.setattr(tr, "_send_telegram_lines", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(tr, "_send_telegram_message", lambda *a, **k: None, raising=False)
+
 
 # ── round_turn_cost: tiered slippage (1 tk <=10, 2 tk 11-20, 3 tk 21+) ──────────
 def _expected_cost(contracts, slip_ticks):
@@ -435,7 +445,12 @@ def test_telegram_command_unknown():
 def test_status_lines_nonempty():
     lines = tr._status_lines(tr._default_state())
     assert isinstance(lines, list) and len(lines) >= 4
-    assert any("HALT" in l for l in lines)
+    assert any("P&L" in l for l in lines)
+
+def test_status_lines_show_halt_when_engaged(monkeypatch):
+    monkeypatch.setattr(tr, "_kill_switch_active", lambda: True)
+    lines = tr._status_lines(tr._default_state())
+    assert any("HALT" in l.upper() for l in lines)
 
 
 # ── News-protection regressions (2026-07-01 audit fixes) ────────────────────────
