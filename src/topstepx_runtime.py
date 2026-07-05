@@ -7,7 +7,7 @@ import socket
 import ssl
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as _dt_timezone
 from typing import Any, Dict, List, Optional
 from urllib import error, parse, request
 
@@ -54,6 +54,7 @@ MAX_TRANSIENT_RETRIES = 50
 TRANSIENT_ERROR_KEYWORDS = (
     "network error", "urlopen error", "timed out", "timeout",
     "502", "503", "504", "connection", "ssl", "winerror", "handshake", "remote host",
+    "429", "too many requests", "rate limit",  # rate-limiting is transient, retry
 )
 CONSISTENCY_WARNING_FRACTION = 0.80
 CONSISTENCY_THROTTLE_FRACTION = 0.90
@@ -255,8 +256,15 @@ def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
 def _load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_PATH):
         return _default_state()
-    with open(STATE_PATH, "r", encoding="utf-8") as fh:
-        return _normalize_state(json.load(fh))
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as fh:
+            return _normalize_state(json.load(fh))
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        # A corrupt/unreadable state file must never wedge the bot in a
+        # crash-restart loop (run_loop calls this outside its try block).
+        # Fall back to defaults; the next reconcile restores broker truth.
+        _write_log("ERROR", f"state_file_unreadable_using_defaults: {exc}", error_only=True)
+        return _default_state()
 
 
 def _save_state(state: Dict[str, Any]) -> None:
@@ -328,9 +336,14 @@ def _maybe_auto_clear_data_gap_kill_switch() -> bool:
 
 
 def _write_json(path: str, payload: Dict[str, Any]) -> None:
+    # Atomic write (temp file + os.replace): a crash mid-write can never leave a
+    # torn/partial JSON file, and concurrent readers (e.g. the watchdog) never
+    # see a half-written state.
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
+    os.replace(tmp_path, path)
 
 
 def _append_jsonl(path: str, payload: Dict[str, Any]) -> None:
@@ -939,7 +952,7 @@ def build_live_strategy_signal(
     if contract is None:
         raise TopstepXAPIError(f"Could not resolve contract for search text '{config.contract_search_text}'.")
 
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(_dt_timezone.utc).replace(tzinfo=None)  # naive-UTC, keeps isoformat()+"Z" shape
     start_utc = now_utc - timedelta(days=45)
     bars = client.retrieve_bars(
         contract_id=str(contract["id"]),
@@ -1079,12 +1092,19 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
             trade_pnl = _extract_numeric(payload, "profitAndLoss", "pnl", "profit")
             if trade_pnl is not None:
                 state["session_daily_pnl_usd"] = float(state.get("session_daily_pnl_usd", 0.0) or 0.0) + float(trade_pnl)
+            prev_position = int(state.get("current_position", 0) or 0)
             try:
-                signed_trade_size = int(float(payload.get("size", state.get("current_position", 0))))
-                state["current_position"] = signed_trade_size
-                state["current_contracts"] = abs(signed_trade_size)
+                signed_trade_size = int(float(payload.get("size", prev_position)))
+                if prev_position == 0:
+                    # Entry from flat: the trade size IS the new position.
+                    # When already in a position, leave position tracking to
+                    # GatewayUserPosition (authoritative) — a partial exit's
+                    # trade size (e.g. 2 of 5) must not clobber the net size
+                    # that live stop management reads.
+                    state["current_position"] = signed_trade_size
+                    state["current_contracts"] = abs(signed_trade_size)
             except (TypeError, ValueError):
-                pass
+                signed_trade_size = prev_position
             fill_timestamp = (
                 payload.get("fillTime")
                 or payload.get("timestamp")
@@ -2007,11 +2027,21 @@ def _flatten_account_internal(
         )
         return payload
     responses = []
+    # A failed bracket cancel must NEVER prevent the position close below —
+    # closing the position is the safety-critical half of a flatten. Collect
+    # cancel failures, close positions regardless, then raise afterwards so the
+    # caller retries the leftover cancels next cycle (with the position flat).
+    cancel_failures = []
     for order in open_orders:
         order_id = order.get("id")
         if order_id is None:
             continue
-        response = client.cancel_order(int(account["id"]), int(order_id))
+        try:
+            response = client.cancel_order(int(account["id"]), int(order_id))
+        except Exception as exc:
+            cancel_failures.append(f"order {int(order_id)}: {exc}")
+            _write_log("ERROR", f"flatten_cancel_failed order={int(order_id)} reason={reason}: {exc}", error_only=True)
+            continue
         responses.append({"cancel_order_id": int(order_id), "response": response})
         _log_trade_event(
             event_type="flatten_cancel_order",
@@ -2052,6 +2082,15 @@ def _flatten_account_internal(
         _write_log(
             "INFO",
             f"manual_flatten_cooldown set until {cooldown_until} reason={reason}",
+        )
+
+    if cancel_failures:
+        # Positions were closed above; surface the leftover working orders so
+        # the caller retries the cancels next cycle (orphan brackets could
+        # otherwise fill later and open a fresh netted position).
+        raise TopstepXAPIError(
+            f"flatten_incomplete: position close attempted, but {len(cancel_failures)} "
+            f"bracket cancel(s) failed: {'; '.join(cancel_failures)}"
         )
 
     return payload
@@ -2313,7 +2352,7 @@ def _manage_position_stops(client: TopstepXClient, config: TopstepXConfig,
         return
     contract_id = str(contract["id"])
 
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(_dt_timezone.utc).replace(tzinfo=None)  # naive-UTC, keeps isoformat()+"Z" shape
     bars = client.retrieve_bars(
         contract_id=contract_id,
         start_time=(now_utc - timedelta(days=2)).replace(microsecond=0).isoformat() + "Z",
@@ -2372,6 +2411,9 @@ def _manage_position_stops(client: TopstepXClient, config: TopstepXConfig,
                 f"Stop: {current_stop:.2f} → {desired:.2f}",
             ])
     except Exception as exc:
+        # Un-mark the bar so the ratchet retries next minute instead of
+        # waiting a full 5-min bar after a transient modify/place failure.
+        state["stop_mgmt_last_bar"] = None
         _write_log("ERROR", f"stop_move_failed (old stop still working): {exc}", error_only=True)
     _save_state(state)
 
@@ -2472,6 +2514,14 @@ def _handle_telegram_command(text: str, client: TopstepXClient, config: TopstepX
             _send_telegram_lines(["✅ MNQ Bot: closed everything as requested."])
         except Exception as exc:
             _send_telegram_lines([f"⚠️ MNQ Bot: could not close — {exc}"])
+        finally:
+            # _flatten_account_internal wrote the re-entry cooldown to DISK on
+            # its own state copy; sync it into the caller's in-memory `state`,
+            # otherwise the post-command _save_state(state) would clobber the
+            # cooldown and the bot could immediately re-enter the closed trade.
+            _fresh = _load_state()
+            state["manual_flatten_cooldown_until"] = _fresh.get("manual_flatten_cooldown_until")
+            state["manual_flatten_reason"] = _fresh.get("manual_flatten_reason")
     elif action == "test":
         _send_test_alerts(state)
     elif action == "help":
@@ -2619,7 +2669,10 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
 
             if _kill_switch_active():
                 _write_log("WARN", "HALT.txt detected during run loop; new entries are blocked.")
-                if (state.get("open_order_count") or state.get("open_position_count")) and (config.enable_order_routing and not config.dry_run):
+                # current_position included: the hub-event order counter can
+                # drift to 0 while a position is still live — never let counter
+                # drift skip a kill-switch flatten.
+                if (state.get("open_order_count") or state.get("open_position_count") or state.get("current_position")) and (config.enable_order_routing and not config.dry_run):
                     _flatten_account_internal(client, config, reason="kill_switch")
                 cycles += 1
                 if max_cycles and cycles >= max_cycles:
@@ -2630,7 +2683,7 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
             minute_key = now.strftime("%Y-%m-%d %H:%M")
 
             if (now.hour, now.minute) >= (bot.HARD_FLATTEN_H, bot.HARD_FLATTEN_M):
-                if state.get("open_order_count") or state.get("open_position_count"):
+                if state.get("open_order_count") or state.get("open_position_count") or state.get("current_position"):
                     _flatten_account_internal(client, config, reason="hard_flatten_time")
                 try:
                     _send_eod_summary(state)   # once-per-day end-of-day digest

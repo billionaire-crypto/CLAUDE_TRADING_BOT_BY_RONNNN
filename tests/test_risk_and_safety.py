@@ -677,3 +677,148 @@ def test_eod_summary_sends_once_and_reads_exits(monkeypatch, tmp_path):
 # -- Shipped trend-bias mode (validated 2026-07-04) --------------------------------
 def test_bias_mode_shipped_is_vwap_only():
     assert bot.BIAS_MODE == "vwap_only"
+
+
+# ── 2026-07-04 internal audit hardening ─────────────────────────────────────────
+# Fixes verified here: atomic state writes, corrupt-state tolerance, flatten
+# resilience (close even when a cancel fails), telegram /flatten cooldown
+# surviving the post-command state save, partial-exit trade events not
+# clobbering net position, and 429s classified transient.
+import json as _json
+
+
+def test_write_json_atomic_no_tmp_left(tmp_path):
+    p = str(tmp_path / "state.json")
+    tr._write_json(p, {"a": 1})
+    with open(p, encoding="utf-8") as fh:
+        assert _json.load(fh) == {"a": 1}
+    assert not os.path.exists(p + ".tmp")
+
+
+def test_write_json_overwrites_existing_atomically(tmp_path):
+    p = str(tmp_path / "state.json")
+    tr._write_json(p, {"v": 1})
+    tr._write_json(p, {"v": 2})
+    with open(p, encoding="utf-8") as fh:
+        assert _json.load(fh) == {"v": 2}
+    assert not os.path.exists(p + ".tmp")
+
+
+def test_load_state_survives_corrupt_file(tmp_path, monkeypatch):
+    # A crash mid-write must not wedge the bot in a crash-restart loop:
+    # corrupt JSON -> default state (broker reconcile restores truth).
+    p = str(tmp_path / "state.json")
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write('{"updated_at": "2026-')  # torn write
+    monkeypatch.setattr(tr, "STATE_PATH", p)
+    st = tr._load_state()
+    assert isinstance(st, dict)
+    assert st.get("current_position", 0) == 0
+
+
+class _FlattenClient:
+    """cancel_order fails on the FIRST order; close_contract must still run."""
+    def __init__(self):
+        self.cancelled = []
+        self.closed = []
+    def search_accounts(self, only_active):
+        return [{"id": 1, "name": "ACCT"}]
+    def search_open_orders(self, account_id):
+        return [{"id": 11}, {"id": 12}]
+    def search_open_positions(self, account_id):
+        return [{"contractId": "CON.F.US.MNQ.U26"}]
+    def cancel_order(self, account_id, order_id):
+        if order_id == 11:
+            raise tr.TopstepXAPIError("simulated cancel failure")
+        self.cancelled.append(order_id)
+        return {"ok": True}
+    def close_contract(self, account_id, contract_id):
+        self.closed.append(contract_id)
+        return {"ok": True}
+
+
+class _FlattenCfg:
+    account_name = "ACCT"
+    dry_run = False
+    enable_order_routing = True
+
+
+def test_flatten_closes_position_even_if_cancel_fails(monkeypatch):
+    monkeypatch.setattr(tr, "_log_trade_event", lambda *a, **k: None)
+    client = _FlattenClient()
+    with pytest.raises(tr.TopstepXAPIError, match="flatten_incomplete"):
+        tr._flatten_account_internal(client, _FlattenCfg(), reason="hard_flatten_time")
+    # The position was closed despite the first cancel failing,
+    # and the second cancel still went through.
+    assert client.closed == ["CON.F.US.MNQ.U26"]
+    assert client.cancelled == [12]
+
+
+def test_telegram_flatten_cooldown_survives_state_save(tmp_path, monkeypatch):
+    # _flatten_account_internal writes the cooldown to disk on its own state
+    # copy; the telegram handler must sync it into the caller's in-memory
+    # state so the post-command _save_state doesn't clobber it.
+    p = str(tmp_path / "state.json")
+    monkeypatch.setattr(tr, "STATE_PATH", p)
+
+    def fake_flatten(client, config, reason):
+        st = tr._load_state()
+        st["manual_flatten_cooldown_until"] = "2099-01-01T00:00:00-05:00"
+        st["manual_flatten_reason"] = reason
+        tr._save_state(st)
+        return {}
+
+    monkeypatch.setattr(tr, "_flatten_account_internal", fake_flatten)
+    state = tr._default_state()
+    tr._handle_telegram_command("/flatten", None, None, state)
+    tr._save_state(state)  # what _process_telegram_commands does afterwards
+    assert tr._load_state()["manual_flatten_cooldown_until"] == "2099-01-01T00:00:00-05:00"
+
+
+class _HubCfg:
+    account_name = "ACCT"
+
+
+def _trade_event(trade_id, size, pnl):
+    return {
+        "event_type": "GatewayUserTrade",
+        "payload": {"id": trade_id, "size": size, "price": 20000.0,
+                    "profitAndLoss": pnl, "contractId": "CON.F.US.MNQ.U26"},
+        "logged_at": "2026-07-04T12:00:00Z",
+    }
+
+
+def test_partial_exit_trade_event_does_not_clobber_position(monkeypatch):
+    monkeypatch.setattr(tr, "_log_trade_event", lambda *a, **k: None)
+    state = tr._default_state()
+    state["current_position"] = 5   # long 5 MNQ
+    # Partial exit: 2 of 5 close. The trade's size (2) must NOT overwrite
+    # the net position (5) that live stop management reads.
+    tr._process_user_hub_events([_trade_event("t-exit", 2, 40.0)], state, _HubCfg())
+    assert state["current_position"] == 5
+
+
+def test_entry_from_flat_trade_event_sets_position(monkeypatch):
+    monkeypatch.setattr(tr, "_log_trade_event", lambda *a, **k: None)
+    state = tr._default_state()
+    state["current_position"] = 0
+    tr._process_user_hub_events([_trade_event("t-entry", 3, None)], state, _HubCfg())
+    assert state["current_position"] == 3
+
+
+def test_position_event_still_authoritative(monkeypatch):
+    monkeypatch.setattr(tr, "_log_trade_event", lambda *a, **k: None)
+    state = tr._default_state()
+    state["current_position"] = 5
+    ev = {"event_type": "GatewayUserPosition",
+          "payload": {"size": 0, "contractId": "CON.F.US.MNQ.U26"},
+          "logged_at": "2026-07-04T12:00:01Z"}
+    tr._process_user_hub_events([ev], state, _HubCfg())
+    assert state["current_position"] == 0
+    assert state["in_trade"] is False
+
+
+def test_rate_limit_429_is_transient():
+    assert tr._is_transient_error(Exception("HTTP 429 Too Many Requests"))
+    assert tr._is_transient_error(Exception("rate limit exceeded"))
+    assert not tr._is_transient_error(Exception("invalid order size"))
