@@ -380,6 +380,16 @@ FVG_LONG_MIN_EMA_SPREAD_PTS    = 10.0
 FVG_LONG_EMA_FILTER_MIN_AGE_BARS = 8
 FVG_LONG_AGE_FILTER_ENABLED    = False
 FVG_LONG_MAX_AGE_BARS          = 7
+# Trend-bias filter mode: how EMA-trend and VWAP-position combine to allow an
+# FVG entry. SHIPPED = "vwap_only" (2026-07-04): a code-level filter audit found
+# the EMA-trend leg of the old "ema_and_vwap" AND was a handbrake -- it deleted
+# 380 above-average trades (marg $193 vs $148 base), mostly VWAP-aligned pullback
+# entries the slow EMAs hadn't caught up to. VWAP alone (institutional fair value)
+# is the real bias. Full gauntlet cleared: net $416,436 (+21%), PF 3.97->4.10,
+# better in ALL 3-way-split periods incl. untouched 2026Q2, 0 failed walk-forward
+# windows, survives slip x3 at PF 3.19, combine pass 97.7% median 17d (vs 20d).
+# Tail at scaled size -$983 (was -$918); combine daily-limit failures LOWER.
+BIAS_MODE                      = "vwap_only"
 FVG_QUALITY_SCORE_ENABLED      = True
 FVG_SCORE_SIZING_ENABLED       = True
 FVG_SCORE_MEDIUM_THRESHOLD     = 3
@@ -1449,8 +1459,19 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     above_vwap = df["close"]   > df["vwap"]
     below_vwap = df["close"]   < df["vwap"]
 
-    df["long_bias"]  = trend_up   & above_vwap
-    df["short_bias"] = trend_down & below_vwap
+    # Trend-bias filter mode (research toggle). "ema_and_vwap" is the shipped
+    # rule (both must agree). The looser modes are swept to test whether the
+    # AND is a frequency handbrake or load-bearing edge protection.
+    if BIAS_MODE == "ema_only":
+        df["long_bias"], df["short_bias"] = trend_up, trend_down
+    elif BIAS_MODE == "vwap_only":
+        df["long_bias"], df["short_bias"] = above_vwap, below_vwap
+    elif BIAS_MODE == "ema_or_vwap":
+        df["long_bias"]  = trend_up   | above_vwap
+        df["short_bias"] = trend_down | below_vwap
+    else:  # "ema_and_vwap" (shipped default)
+        df["long_bias"]  = trend_up   & above_vwap
+        df["short_bias"] = trend_down & below_vwap
     df["long_signal"]  = df["long_bias"]
     df["short_signal"] = df["short_bias"]
 

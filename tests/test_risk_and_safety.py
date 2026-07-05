@@ -672,3 +672,8 @@ def test_eod_summary_sends_once_and_reads_exits(monkeypatch, tmp_path):
     sent.clear()
     tr._send_eod_summary(st)          # second call same day -> no-op
     assert not sent
+
+
+# -- Shipped trend-bias mode (validated 2026-07-04) --------------------------------
+def test_bias_mode_shipped_is_vwap_only():
+    assert bot.BIAS_MODE == "vwap_only"
