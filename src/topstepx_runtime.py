@@ -51,6 +51,7 @@ MAX_RECONNECT_BACKOFF_SECONDS = 60
 DATA_GAP_KILL_THRESHOLD = 5
 DATA_GAP_AUTO_CLEAR_MINUTES = 30
 MAX_TRANSIENT_RETRIES = 50
+AUTH_REJECTED_RETRY_SECONDS = 300   # rejected API key: alert once, retry every 5 min forever
 TRANSIENT_ERROR_KEYWORDS = (
     "network error", "urlopen error", "timed out", "timeout",
     "502", "503", "504", "connection", "ssl", "winerror", "handshake", "remote host",
@@ -584,10 +585,19 @@ def _is_protective_stop_like_order(order: Dict[str, Any], entry_side: int, contr
     return bool(opposite_side and (has_stop_descriptor or has_stop_price or has_stop_type_code))
 
 
+_TERMINAL_ORDER_STATUSES = {"filled", "cancelled", "canceled", "rejected", "complete", "done", "expired"}
+
+
 def _user_hub_confirms_protective_order(event: Dict[str, Any], order_payload: Dict[str, Any]) -> bool:
     if event.get("event_type") != "GatewayUserOrder":
         return False
     payload = event.get("payload") or {}
+    # Reject terminal statuses: a cancelled or rejected stop must never count as
+    # bracket confirmation. Only working/accepted/new orders actually protect the
+    # position. (Finding 5 fix: hub confirmation previously accepted cancelled stops.)
+    order_status = str(payload.get("status", "")).strip().lower()
+    if order_status in _TERMINAL_ORDER_STATUSES:
+        return False
     return _is_protective_stop_like_order(
         payload,
         entry_side=int(order_payload["side"]),
@@ -737,6 +747,39 @@ def _log_fill_forensics(state: Dict[str, Any], *, kind: str, contract: str, dire
                        f"actual={actual} slip_ticks={slip_ticks} slip_usd={slip_usd} "
                        f"latency_ms={row['submit_to_fill_ms']}")
     return row
+
+
+PAYLOAD_FORENSICS_PATH = os.path.join(bot.EXPORT_DIR, "payload_forensics.jsonl")
+PAYLOAD_FORENSICS_MAX_PER_KIND_PER_DAY = 5
+_payload_forensics_counts: Dict[str, Any] = {}
+
+
+def _log_payload_forensics(kind: str, payload: Any) -> None:
+    """Capture one raw broker payload to a JSONL file, capped per kind per day.
+
+    Purpose: resolve the three audit unknowns with real captures instead of
+    guesses — (1) signed vs unsigned position sizes for shorts, (8) numeric vs
+    text status enums in hub order events, (B) whether Auto-OCO duplicates our
+    API-supplied brackets (visible as extra orders after entry). The absence of
+    any fill-forensics rows after 9 live fills says the hub payload shape does
+    not match what _process_user_hub_events expects; these captures show the
+    actual shape. Never raises — forensics must not break trading.
+    """
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        day, count = _payload_forensics_counts.get(kind, (today, 0))
+        if day != today:
+            day, count = today, 0
+        if count >= PAYLOAD_FORENSICS_MAX_PER_KIND_PER_DAY:
+            return
+        _payload_forensics_counts[kind] = (day, count + 1)
+        record = {"logged_at": datetime.now().isoformat(), "kind": kind, "payload": payload}
+        os.makedirs(os.path.dirname(PAYLOAD_FORENSICS_PATH), exist_ok=True)
+        with open(PAYLOAD_FORENSICS_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+        _write_log("INFO", f"payload_forensics_captured kind={kind}")
+    except Exception as exc:
+        _write_log("ERROR", f"payload_forensics_write_failed: {exc}", error_only=True)
 
 
 def _alert_fill(kind: str, row: Dict[str, Any]) -> None:
@@ -1048,6 +1091,9 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
         event_type = str(event.get("event_type", ""))
         payload = event.get("payload", {}) or {}
         state["last_hub_message_at"] = event.get("logged_at")
+        # Raw capture (capped/day): live hub logs show status=None/size=0 on every
+        # event, so the real payload shape is unknown — record it to find out.
+        _log_payload_forensics(f"hub_{event_type or 'unknown'}", event)
         if event_type == "GatewayUserAccount":
             _apply_hub_account_update(state, payload)
             _write_log("INFO", f"user_hub_account_update balance={payload.get('balance')}")
@@ -1326,9 +1372,18 @@ def _topstepx_scaling_plan_limit_mnq(
     return None
 
 
-def _unprotected_position_detected(state: Dict[str, Any], config: TopstepXConfig) -> bool:
-    """True when live routing holds an open position with zero working orders
-    (i.e. no protective stop). Dry-run and routing-disabled modes never qualify."""
+def _unprotected_position_detected(
+    state: Dict[str, Any],
+    config: TopstepXConfig,
+    open_orders: Optional[List[Dict[str, Any]]] = None,
+    open_positions: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """True when live routing holds an open position with no protective stop.
+    When the actual order/position lists are supplied (from a fresh reconcile),
+    verifies that at least one working order is a real stop on the right side —
+    a take-profit or unrelated order must not be allowed to hide a missing stop.
+    Falls back to order-count check when lists are not available.
+    Dry-run and routing-disabled modes never qualify."""
     if not config.enable_order_routing or config.dry_run:
         return False
     try:
@@ -1336,7 +1391,28 @@ def _unprotected_position_detected(state: Dict[str, Any], config: TopstepXConfig
         orders = int(state.get("open_order_count", 0) or 0)
     except (TypeError, ValueError):
         return False
-    return positions > 0 and orders == 0
+    if positions == 0:
+        return False
+    if open_orders is not None and open_positions is not None:
+        # Verify that for every open position there is at least one order that
+        # looks like a protective stop on the correct (opposite) side.
+        # (Finding 3 fix: previously only checked orders > 0, allowing a TP
+        # or unrelated order to hide a genuinely missing stop.)
+        for position in open_positions:
+            contract_id = str(position.get("contractId", ""))
+            signed_size = _extract_signed_position_size(position)
+            if not contract_id or signed_size == 0:
+                continue
+            entry_side = 0 if signed_size > 0 else 1
+            has_stop = any(
+                _is_protective_stop_like_order(o, entry_side=entry_side, contract_id=contract_id)
+                for o in open_orders
+            )
+            if not has_stop:
+                return True
+        return False
+    # Lists not available: fall back to order-count check.
+    return orders == 0
 
 
 def _orphan_orders_detected(state: Dict[str, Any], config: TopstepXConfig) -> bool:
@@ -1397,11 +1473,44 @@ def reconcile_state(client: TopstepXClient, config: TopstepXConfig) -> Dict[str,
         state["session_daily_pnl_usd"] = float(metrics["day_pnl"])
 
     prior_in_trade = bool(state.get("in_trade"))
+    if open_positions:
+        # Raw capture (capped/day) whenever the broker reports a live position:
+        # backup path for the Finding 1/B payload questions if the bracket-verify
+        # window exits before the position becomes visible.
+        _log_payload_forensics("rest_positions_reconcile", open_positions)
+        _log_payload_forensics("rest_orders_reconcile", open_orders)
     state["in_trade"] = bool(open_positions)
     state["current_position"] = sum(_extract_signed_position_size(position) for position in open_positions)
     state["current_contracts"] = sum(_extract_position_size(position) for position in open_positions)
     state["open_order_count"] = len(open_orders)
     state["open_position_count"] = len(open_positions)
+
+    # Lifecycle flag repair: if reconcile finds an open position with bracket
+    # orders while awaiting_entry_fill is still True, the entry fill was missed
+    # (e.g. process restarted after submit but before the hub fill event). Advance
+    # the flags so orphan cleanup and exit-slippage tracking work correctly.
+    # (Finding 7 fix.)
+    if (
+        state.get("awaiting_entry_fill")
+        and open_positions
+        and open_orders
+    ):
+        _lf_pos = open_positions[0]
+        _lf_signed = _extract_signed_position_size(_lf_pos)
+        _lf_side = 0 if _lf_signed > 0 else 1
+        _lf_contract = str(_lf_pos.get("contractId", ""))
+        if _lf_contract and any(
+            _is_protective_stop_like_order(o, entry_side=_lf_side, contract_id=_lf_contract)
+            for o in open_orders
+        ):
+            state["awaiting_entry_fill"] = False
+            state["awaiting_exit_fill"] = True
+            _write_log(
+                "WARN",
+                "awaiting_entry_fill_reconcile_repair: entry fill missed (e.g. restart); "
+                "lifecycle flags advanced from broker position truth",
+            )
+
     state["topstep_max_contracts"] = _infer_topstep_max_contracts(
         account, {}, symbol=config.contract_search_text)
     state["topstep_scaling_plan_limit_mnq"] = _topstepx_scaling_plan_limit_mnq(
@@ -1437,11 +1546,11 @@ def reconcile_state(client: TopstepXClient, config: TopstepXConfig) -> Dict[str,
     # and flatten rather than leave an unbracketed position exposed. Reconcile is
     # periodic (outside the entry race that bracket-verification already covers),
     # so positions>0 with orders==0 here is a genuine red flag, not a timing blip.
-    if _unprotected_position_detected(state, config):
+    if _unprotected_position_detected(state, config, open_orders=open_orders, open_positions=open_positions):
         _write_log(
             "ERROR",
             f"account_state_mismatch: {state['open_position_count']} open position(s) "
-            f"with 0 working orders (no protective stop). Engaging kill switch + flatten.",
+            f"with no protective stop order detected. Engaging kill switch + flatten.",
             error_only=True,
         )
         _send_telegram_lines([
@@ -1688,16 +1797,27 @@ def build_order_plan(
             "consistencyMode": state.get("consistency_mode"),
             "consistencyRatio": state.get("consistency_ratio"),
             "consistencyStatus": state.get("consistency_status"),
+            # customTag must be unique PER ATTEMPT, not just per signal: the broker
+            # remembers tags from REJECTED orders too (2026-07-13: first live order
+            # was rejected on a bracket-mode setting, and every retry then bounced
+            # with "custom tag already in use" until the signal expired). The
+            # signal identity stays in the prefix; the epoch-seconds suffix makes
+            # each retry a fresh tag.
             "customTag": (
                 f"V29-{signal['entry_type']}-{signal['direction']}-"
                 f"{signal['entry_timestamp'].replace(':', '').replace('+', '_')}"
+                f"-a{int(time.time())}"
             ),
+            # Gateway bracket ticks are SIGNED offsets from entry (discovered by
+            # the 2026-07-13 wiring test: "Ticks should be less than zero when
+            # longing"). Long: stop below entry (negative), target above
+            # (positive). Short: mirrored. Unsigned ticks = rejected order.
             "stopLossBracket": {
-                "ticks": stop_ticks,
+                "ticks": -stop_ticks if signal["direction"] == "long" else stop_ticks,
                 "type": 4,
             },
             "takeProfitBracket": {
-                "ticks": target_ticks,
+                "ticks": target_ticks if signal["direction"] == "long" else -target_ticks,
                 "type": 1,
             },
         },
@@ -1804,6 +1924,24 @@ def _submit_order_plan(
             notes="Signal routing blocked because this signal ID was already processed for the same session.",
         )
         raise TopstepXAPIError("Refusing to route signal: duplicate signal detected for the same session.")
+
+    # Re-run risk gate with broker-verified state. The plan was approved against a
+    # cached snapshot; reconcile_state() just pulled broker truth and may reveal a
+    # worse daily P&L, a combine-target breach, or a new consistency block that
+    # the original cached state missed. (Finding 4 fix.)
+    _post_reconcile_state = _load_state()
+    _post_reconcile_halt = _evaluate_signal_risk_halts(signal, _post_reconcile_state, config)
+    if _post_reconcile_halt:
+        _log_trade_event(
+            event_type="signal_blocked_post_reconcile_risk_halt",
+            signal_payload=signal_payload,
+            account_name=str(order_payload.get("accountName", "")),
+            contract_name=str(order_payload.get("contractName", "")),
+            dry_run=bool(config.dry_run),
+            notes=f"Post-reconcile risk gate blocked submission: {_post_reconcile_halt}",
+        )
+        raise TopstepXAPIError(_post_reconcile_halt)
+    state.update(_post_reconcile_state)
 
     cooldown_until_raw = state.get("manual_flatten_cooldown_until")
     if cooldown_until_raw:
@@ -1925,6 +2063,12 @@ def _verify_brackets_after_submit(
     open_orders: List[Dict[str, Any]] = []
     open_positions: List[Dict[str, Any]] = []
     saw_hub_confirmation = False
+    # Track whether the position was ever visible during this verification window.
+    # Distinguishes "entry not yet settled" (never saw position) from "position
+    # appeared but had no stop" (saw position but verification failed).
+    # (Finding 2 fix: previously returned early when position was not yet visible,
+    # skipping verification for fills that appeared moments later.)
+    saw_position = False
 
     while time.monotonic() < deadline:
         _check_kill_switch_or_raise()
@@ -1951,7 +2095,22 @@ def _verify_brackets_after_submit(
         next_rest_poll = now_monotonic + BRACKET_VERIFY_REST_POLL_SECONDS
 
         if not _has_matching_position(open_positions, contract_id):
-            return
+            if saw_position:
+                # Position was visible and is now gone — trade exited cleanly
+                # (stop or target filled). No unprotected state; verification done.
+                _write_log("INFO", f"bracket_verify_position_exited signal_id={state.get('last_order_signal_id', '')}")
+                return
+            # Position not yet visible — entry fill may still be propagating.
+            # Keep polling rather than returning early and skipping verification.
+            continue
+
+        if not saw_position:
+            # First sight of the live position: capture the raw REST payloads.
+            # Positions answer the signed-size question for shorts (Finding 1);
+            # orders show whether Auto-OCO duplicated our brackets (Finding B).
+            _log_payload_forensics("rest_positions_after_entry", open_positions)
+            _log_payload_forensics("rest_orders_after_entry", open_orders)
+        saw_position = True
 
         has_protective_stop = any(
             _is_protective_stop_like_order(order, entry_side=entry_side, contract_id=contract_id)
@@ -1960,6 +2119,16 @@ def _verify_brackets_after_submit(
         if has_protective_stop or saw_hub_confirmation:
             _write_log("INFO", f"bracket_verification_passed signal_id={state.get('last_order_signal_id', '')}")
             return
+
+    # Timeout. If the position never appeared the entry was likely rejected or
+    # not yet settled — do not panic-flatten an account that may already be flat.
+    if not saw_position:
+        _write_log(
+            "WARN",
+            f"bracket_verify_no_position_at_timeout signal_id={state.get('last_order_signal_id', '')} "
+            f"(order may have been rejected or not yet settled)",
+        )
+        return
 
     _log_trade_event(
         event_type="bracket_verification_failed",
@@ -2506,6 +2675,45 @@ def _handle_telegram_command(text: str, client: TopstepXClient, config: TopstepX
                               "No new trades; any open trade is closed next cycle.",
                               "Send /resume when you want it trading again."])
     elif action == "resume":
+        # For safety-critical halts (bracket failure, unprotected position,
+        # slippage excess) verify the account is flat before clearing.
+        # A simple /resume must not silently restart after a halt that
+        # requires human investigation. (Finding 10 fix.)
+        _halt_reason = ""
+        if _kill_switch_active():
+            try:
+                with open(KILL_SWITCH_PATH, "r", encoding="utf-8") as _fh:
+                    _halt_reason = str(json.load(_fh).get("reason", ""))
+            except Exception:
+                pass
+        _safety_halt_reasons = {
+            "bracket_failure_unprotected_position",
+            "unprotected_position_state_mismatch",
+            "slippage_systematic_excess",
+            "exit_slippage_systematic_excess",
+        }
+        if _halt_reason in _safety_halt_reasons:
+            try:
+                _resume_acct = _require_single_account(client.search_accounts(True), config.account_name)
+                _resume_orders = client.search_open_orders(int(_resume_acct["id"]))
+                _resume_positions = client.search_open_positions(int(_resume_acct["id"]))
+                if _resume_positions or _resume_orders:
+                    _send_telegram_lines([
+                        f"⚠️ MNQ Bot: cannot resume — safety halt '{_halt_reason}'",
+                        f"Account is NOT flat: {len(_resume_positions)} position(s), {len(_resume_orders)} order(s).",
+                        "Close all positions/orders first, then send /resume again.",
+                    ])
+                    return
+            except Exception as _exc:
+                _send_telegram_lines([
+                    f"⚠️ MNQ Bot: cannot verify account state for safety resume: {_exc}",
+                    f"Halt was '{_halt_reason}' — manual inspection required before resuming.",
+                ])
+                return
+            _send_telegram_lines([
+                f"⚠️ Safety halt '{_halt_reason}' cleared — account confirmed flat.",
+                "Resuming. Investigate the root cause before the next trade.",
+            ])
         clear_kill_switch()
         _send_telegram_lines(["✅ MNQ Bot resumed — back to watching the market."])
     elif action == "flatten":
@@ -2625,6 +2833,11 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
         _maybe_send_status_heartbeat(state)                 # 15-min status heartbeat
         try:
             _ensure_authenticated(client, state)
+            if state.get("auth_failure_alerted") and client.token:
+                # key was rejected earlier this run and now works -> tell Ron once
+                state["auth_failure_alerted"] = False
+                _save_state(state)
+                _send_telegram_lines(["✅ MNQ Bot: broker login works again — resuming normal operation."])
             if config.enable_user_hub and user_stream is None:
                 user_stream = _restart_user_stream(client, config, user_stream)
             if _should_run_heavy_reconcile(state):
@@ -2669,10 +2882,12 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
 
             if _kill_switch_active():
                 _write_log("WARN", "HALT.txt detected during run loop; new entries are blocked.")
-                # current_position included: the hub-event order counter can
-                # drift to 0 while a position is still live — never let counter
-                # drift skip a kill-switch flatten.
-                if (state.get("open_order_count") or state.get("open_position_count") or state.get("current_position")) and (config.enable_order_routing and not config.dry_run):
+                # Always call flatten when kill-switch fires: _flatten_account_internal
+                # queries broker truth directly and is a no-op when already flat.
+                # Relying on cached local counters risks silently skipping a flatten
+                # if hub events have not yet updated the counters.
+                # (Finding 9 fix.)
+                if config.enable_order_routing and not config.dry_run:
                     _flatten_account_internal(client, config, reason="kill_switch")
                 cycles += 1
                 if max_cycles and cycles >= max_cycles:
@@ -2767,10 +2982,56 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
                     raise
                 time.sleep(backoff)
                 backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF_SECONDS)
+            elif "Auth/loginKey" in error_str or "errorCode=3" in error_str:
+                # CREDENTIAL REJECTED (2026-07-08 incident: expired API key killed
+                # the process after 10 retries -> 6h crash-restart loop + alert
+                # spam). Correct behavior: alert ONCE, then wait patiently and
+                # re-read .env each attempt so the bot SELF-HEALS the moment a
+                # new key is saved — no restart, no process death.
+                state = _load_state()
+                if not state.get("auth_failure_alerted"):
+                    state["auth_failure_alerted"] = True
+                    _save_state(state)
+                    _send_telegram_lines([
+                        "🔑 MNQ Bot: broker LOGIN REJECTED (API key invalid/expired).",
+                        "The bot cannot trade until the key is replaced.",
+                        "Fix: dashboard -> generate new API key -> update TOPSTEPX_API_KEY in .env.",
+                        "I will keep retrying every 5 minutes and resume automatically.",
+                    ])
+                _write_log("ERROR", f"auth_rejected_waiting_for_new_key: {error_str[:120]}", error_only=True)
+                # heartbeat the state file each retry so the watchdog knows the
+                # process is alive-and-waiting, not dead (else false DOWN texts)
+                _save_state(state)
+                time.sleep(AUTH_REJECTED_RETRY_SECONDS)
+                try:
+                    from dotenv import load_dotenv
+                    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+                                override=True)
+                except Exception:
+                    pass
+                config = TopstepXConfig.from_env()   # pick up a freshly saved key
+                client = TopstepXClient(config)
+                attempts = 0                          # never count toward death
             else:
                 attempts += 1
                 max_retries = MAX_TRANSIENT_RETRIES if _is_transient_error(exc) else 10
                 _write_log("ERROR", f"run_loop broker error attempt={attempts}/{max_retries}: {exc}", error_only=True)
+                # ORDER REJECTED must reach the phone immediately (2026-07-13: the
+                # first-ever live order was rejected on an account setting and Ron
+                # only learned about it hours later). One alert per rejection
+                # reason per session — no spam on retries.
+                if "/api/Order/place failed" in error_str:
+                    state = _load_state()
+                    reason_key = error_str[-80:]
+                    if state.get("last_order_reject_alerted") != reason_key:
+                        state["last_order_reject_alerted"] = reason_key
+                        _save_state(state)
+                        _send_telegram_lines([
+                            "🚫 MNQ Bot: the broker REJECTED an order!",
+                            f"Reason: {error_str.split('errorMessage=')[-1][:120]}",
+                            "The bot will keep retrying while the signal is valid,",
+                            "but if this mentions a setting, it needs YOUR fix in TopstepX.",
+                        ])
                 if attempts > max_retries:
                     raise
                 if user_stream is not None:

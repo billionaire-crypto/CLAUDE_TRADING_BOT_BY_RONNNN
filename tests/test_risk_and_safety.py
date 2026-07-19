@@ -21,11 +21,18 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _no_real_telegram(monkeypatch):
-    """Hard guard: tests must NEVER reach the live Telegram chat. Neutralizes
-    both the line sender and the raw HTTP call regardless of env credentials."""
+def _no_real_telegram(monkeypatch, tmp_path):
+    """Hard guard: tests must NEVER reach the live Telegram chat OR the live
+    log files. Neutralizes the senders and the log writer (2026-07-08: test
+    artifacts like 'simulated cancel failure' landed in live_errors.txt and
+    looked like real incidents during live debugging)."""
     monkeypatch.setattr(tr, "_send_telegram_lines", lambda *a, **k: True, raising=False)
     monkeypatch.setattr(tr, "_send_telegram_message", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(tr, "_write_log", lambda *a, **k: None, raising=False)
+    # Payload forensics must write to tmp, never into the live exports dir.
+    monkeypatch.setattr(tr, "PAYLOAD_FORENSICS_PATH",
+                        str(tmp_path / "payload_forensics.jsonl"), raising=False)
+    monkeypatch.setattr(tr, "_payload_forensics_counts", {}, raising=False)
 
 
 # ── round_turn_cost: tiered slippage (1 tk <=10, 2 tk 11-20, 3 tk 21+) ──────────
@@ -822,3 +829,321 @@ def test_rate_limit_429_is_transient():
     assert tr._is_transient_error(Exception("HTTP 429 Too Many Requests"))
     assert tr._is_transient_error(Exception("rate limit exceeded"))
     assert not tr._is_transient_error(Exception("invalid order size"))
+
+
+# ── Fix 5: hub bracket confirmation must reject cancelled/rejected stops ────────
+
+def _hub_order_event(contract_id, entry_side_of_position, stop_price, status):
+    """Return a GatewayUserOrder hub event for a stop on the opposite side."""
+    opposite_side = 1 - entry_side_of_position
+    return {
+        "event_type": "GatewayUserOrder",
+        "payload": {
+            "contractId": contract_id,
+            "side": opposite_side,
+            "type": "4",
+            "stopPrice": stop_price,
+            "status": status,
+        },
+    }
+
+
+def test_hub_does_not_confirm_rejected_stop():
+    event = _hub_order_event("C1", 0, 19900.0, "rejected")
+    order_payload = {"side": 0, "contractId": "C1"}
+    assert not tr._user_hub_confirms_protective_order(event, order_payload)
+
+
+def test_hub_does_not_confirm_cancelled_stop():
+    event = _hub_order_event("C1", 0, 19900.0, "cancelled")
+    order_payload = {"side": 0, "contractId": "C1"}
+    assert not tr._user_hub_confirms_protective_order(event, order_payload)
+
+
+def test_hub_does_not_confirm_filled_stop():
+    event = _hub_order_event("C1", 0, 19900.0, "filled")
+    order_payload = {"side": 0, "contractId": "C1"}
+    assert not tr._user_hub_confirms_protective_order(event, order_payload)
+
+
+def test_hub_confirms_working_stop():
+    event = _hub_order_event("C1", 0, 19900.0, "working")
+    order_payload = {"side": 0, "contractId": "C1"}
+    assert tr._user_hub_confirms_protective_order(event, order_payload)
+
+
+def test_hub_confirms_open_stop():
+    event = _hub_order_event("C1", 0, 19900.0, "open")
+    order_payload = {"side": 0, "contractId": "C1"}
+    assert tr._user_hub_confirms_protective_order(event, order_payload)
+
+
+# ── Fix 2: bracket verify must not panic-flatten when fill never appeared ───────
+
+class _FlattenCfgRouting:
+    account_name = "ACCT"
+    dry_run = False
+    enable_order_routing = True
+
+
+def test_bracket_verify_no_panic_when_position_never_appeared(monkeypatch):
+    """If the entry order was rejected (or not yet settled by end of timeout),
+    position count stays 0 throughout. Must return quietly without flattening."""
+    class _EmptyClient:
+        def search_open_orders(self, account_id):
+            return []
+        def search_open_positions(self, account_id):
+            return []
+
+    monkeypatch.setattr(tr, "ORDER_BRACKET_VERIFY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(tr, "BRACKET_VERIFY_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(tr, "BRACKET_VERIFY_REST_POLL_SECONDS", 0)
+    monkeypatch.setattr(tr, "_check_kill_switch_or_raise", lambda: None)
+    monkeypatch.setattr(tr, "_log_trade_event", lambda *a, **k: None)
+    flattened = []
+    monkeypatch.setattr(tr, "_flatten_account_internal", lambda *a, **k: flattened.append(True))
+    monkeypatch.setattr(tr, "engage_kill_switch", lambda *a, **k: None)
+
+    state = tr._default_state()
+    order_payload = {"accountId": 1, "contractId": "C1", "side": 0,
+                     "accountName": "ACCT", "contractName": "MNQU6"}
+    tr._verify_brackets_after_submit(
+        _EmptyClient(), _FlattenCfgRouting(), {}, state, order_payload, user_stream=None,
+    )
+    assert not flattened, "Must not flatten when position never appeared (likely rejection)"
+
+
+# ── Fix 3: unprotected detection must look for a real stop, not just any order ─
+
+class _UnprotectedCfg:
+    enable_order_routing = True
+    dry_run = False
+
+
+def test_tp_order_does_not_satisfy_stop_requirement():
+    """A sell-limit take-profit order must not count as a protective stop."""
+    state = tr._default_state()
+    state["open_position_count"] = 1
+    state["open_order_count"] = 1
+    # Long position; the only order is a take-profit (type=1 limit, no stopPrice)
+    open_positions = [{"contractId": "C1", "size": 2}]
+    open_orders = [{"contractId": "C1", "side": 1, "type": 1, "stopPrice": None}]
+    assert tr._unprotected_position_detected(
+        state, _UnprotectedCfg(), open_orders=open_orders, open_positions=open_positions
+    )
+
+
+def test_real_stop_order_satisfies_stop_requirement():
+    """A genuine stop order on the opposite side protects the position."""
+    state = tr._default_state()
+    state["open_position_count"] = 1
+    state["open_order_count"] = 1
+    open_positions = [{"contractId": "C1", "size": 2}]
+    open_orders = [{"contractId": "C1", "side": 1, "type": "4", "stopPrice": 19900.0}]
+    assert not tr._unprotected_position_detected(
+        state, _UnprotectedCfg(), open_orders=open_orders, open_positions=open_positions
+    )
+
+
+def test_zero_orders_always_unprotected():
+    """When open_order_count == 0, the position is unprotected regardless of lists."""
+    state = tr._default_state()
+    state["open_position_count"] = 1
+    state["open_order_count"] = 0
+    assert tr._unprotected_position_detected(state, _UnprotectedCfg(), open_orders=[], open_positions=[{"contractId": "C1", "size": 2}])
+
+
+def test_no_position_never_unprotected():
+    state = tr._default_state()
+    state["open_position_count"] = 0
+    state["open_order_count"] = 0
+    assert not tr._unprotected_position_detected(state, _UnprotectedCfg())
+
+
+# ── Fix 7: awaiting_entry_fill repaired on reconcile after restart ──────────────
+
+class _ReconcileCfgFull:
+    account_name = "ACCT"
+    contract_search_text = "MNQ"
+    live_data = False
+    topstep_account_stage = "combine"
+    topstep_account_size_usd = 50_000
+    enable_order_routing = True
+    dry_run = False
+
+
+class _ReconcileClientWithPosition:
+    def search_accounts(self, only_active):
+        return [{"id": 1, "name": "ACCT", "balance": 50_000}]
+    def search_open_orders(self, account_id):
+        return [{"id": 99, "contractId": "C1", "side": 1, "type": "4", "stopPrice": 19900.0}]
+    def search_open_positions(self, account_id):
+        return [{"contractId": "C1", "size": 2}]
+    def resolve_contract(self, search_text, live):
+        return {"id": "C1", "name": "MNQU6"}
+
+
+def test_awaiting_entry_fill_repaired_when_position_and_bracket_found(tmp_path, monkeypatch):
+    """After a restart with awaiting_entry_fill=True, if reconcile finds an open
+    position AND a protective stop, the lifecycle flags are advanced automatically."""
+    monkeypatch.setattr(tr, "STATE_PATH", str(tmp_path / "state.json"))
+    monkeypatch.setattr(tr, "_log_trade_event", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "engage_kill_switch", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "_flatten_account_internal", lambda *a, **k: None)
+
+    st = tr._default_state()
+    st["awaiting_entry_fill"] = True
+    st["awaiting_exit_fill"] = False
+    tr._save_state(st)
+
+    tr.reconcile_state(_ReconcileClientWithPosition(), _ReconcileCfgFull())
+    repaired = tr._load_state()
+    assert repaired["awaiting_entry_fill"] is False, "awaiting_entry_fill must be cleared"
+    assert repaired["awaiting_exit_fill"] is True, "awaiting_exit_fill must be armed"
+
+
+def test_awaiting_entry_fill_not_repaired_when_no_brackets(tmp_path, monkeypatch):
+    """If there is a position but no stop order, do not silently advance the
+    lifecycle flag — the unprotected-position guard is supposed to fire instead."""
+    monkeypatch.setattr(tr, "STATE_PATH", str(tmp_path / "state.json"))
+    monkeypatch.setattr(tr, "_log_trade_event", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "engage_kill_switch", lambda *a, **k: None)
+    monkeypatch.setattr(tr, "_flatten_account_internal", lambda *a, **k: None)
+
+    st = tr._default_state()
+    st["awaiting_entry_fill"] = True
+    tr._save_state(st)
+
+    class _NoOrdersClient(_ReconcileClientWithPosition):
+        def search_open_orders(self, account_id):
+            return []  # position open but no bracket orders
+
+    tr.reconcile_state(_NoOrdersClient(), _ReconcileCfgFull())
+    not_repaired = tr._load_state()
+    # Flag stays True; the unprotected-position guard (separate path) is responsible
+    assert not_repaired["awaiting_entry_fill"] is True
+
+
+# ── Fix 10: /resume must verify account is flat for safety-critical halts ───────
+
+import json as _json_module
+
+
+class _FlatAccountClient:
+    def search_accounts(self, only_active):
+        return [{"id": 1, "name": "ACCT"}]
+    def search_open_orders(self, account_id):
+        return []
+    def search_open_positions(self, account_id):
+        return []
+
+
+class _PositionAccountClient:
+    def search_accounts(self, only_active):
+        return [{"id": 1, "name": "ACCT"}]
+    def search_open_orders(self, account_id):
+        return []
+    def search_open_positions(self, account_id):
+        return [{"contractId": "C1"}]
+
+
+class _ResumeCfg:
+    account_name = "ACCT"
+
+
+def _write_halt(path, reason):
+    with open(path, "w", encoding="utf-8") as fh:
+        _json_module.dump({"reason": reason, "engaged_at": "2026-07-15T10:00:00-05:00"}, fh)
+
+
+def test_resume_blocked_for_bracket_failure_halt_when_position_open(tmp_path, monkeypatch):
+    p = str(tmp_path / "HALT.txt")
+    _write_halt(p, "bracket_failure_unprotected_position")
+    monkeypatch.setattr(tr, "KILL_SWITCH_PATH", p)
+    msgs = []
+    monkeypatch.setattr(tr, "_send_telegram_lines", lambda lines, **k: msgs.append(lines))
+    state = tr._default_state()
+    tr._handle_telegram_command("/resume", _PositionAccountClient(), _ResumeCfg(), state)
+    assert os.path.exists(p), "Safety halt must NOT be cleared while position is open"
+    assert any("cannot resume" in " ".join(str(x) for x in m) for m in msgs)
+
+
+def test_resume_clears_bracket_failure_halt_when_account_flat(tmp_path, monkeypatch):
+    p = str(tmp_path / "HALT.txt")
+    _write_halt(p, "bracket_failure_unprotected_position")
+    monkeypatch.setattr(tr, "KILL_SWITCH_PATH", p)
+    monkeypatch.setattr(tr, "_send_telegram_lines", lambda *a, **k: None)
+    state = tr._default_state()
+    tr._handle_telegram_command("/resume", _FlatAccountClient(), _ResumeCfg(), state)
+    assert not os.path.exists(p), "Safety halt should clear when account is confirmed flat"
+
+
+def test_resume_clears_telegram_halt_without_broker_check(tmp_path, monkeypatch):
+    """A /halt (reason=telegram_command) must clear immediately — no broker query needed."""
+    p = str(tmp_path / "HALT.txt")
+    _write_halt(p, "telegram_command")
+    monkeypatch.setattr(tr, "KILL_SWITCH_PATH", p)
+    monkeypatch.setattr(tr, "_send_telegram_lines", lambda *a, **k: None)
+    state = tr._default_state()
+    # Pass None for client — safe halts must not touch the broker API
+    tr._handle_telegram_command("/resume", None, None, state)
+    assert not os.path.exists(p)
+
+
+# ── Payload forensics capture (audit Findings 1 / 8 / B instrumentation) ────────
+import json as _json
+
+
+def _read_forensics_lines():
+    if not os.path.exists(tr.PAYLOAD_FORENSICS_PATH):
+        return []
+    with open(tr.PAYLOAD_FORENSICS_PATH, encoding="utf-8") as fh:
+        return [_json.loads(line) for line in fh if line.strip()]
+
+
+def test_payload_forensics_writes_record():
+    tr._log_payload_forensics("test_kind", {"size": -4, "contractId": "CON.F.US.MNQ.U26"})
+    records = _read_forensics_lines()
+    assert len(records) == 1
+    assert records[0]["kind"] == "test_kind"
+    assert records[0]["payload"]["size"] == -4
+
+
+def test_payload_forensics_daily_cap():
+    for i in range(tr.PAYLOAD_FORENSICS_MAX_PER_KIND_PER_DAY + 3):
+        tr._log_payload_forensics("capped_kind", {"n": i})
+    records = _read_forensics_lines()
+    assert len(records) == tr.PAYLOAD_FORENSICS_MAX_PER_KIND_PER_DAY
+
+
+def test_payload_forensics_cap_is_per_kind():
+    tr._log_payload_forensics("kind_a", {})
+    tr._log_payload_forensics("kind_b", {})
+    assert len(_read_forensics_lines()) == 2
+
+
+def test_payload_forensics_survives_unserializable_payload():
+    # A set is not JSON-serializable; default=str must save it, not raise.
+    tr._log_payload_forensics("weird", {"raw": {1, 2, 3}})
+    records = _read_forensics_lines()
+    assert len(records) == 1
+
+
+def test_payload_forensics_never_raises_on_write_failure(monkeypatch):
+    monkeypatch.setattr(tr, "PAYLOAD_FORENSICS_PATH", r"Z:\nonexistent\dir\f.jsonl")
+    tr._log_payload_forensics("doomed", {"x": 1})  # must not raise
+
+
+def test_hub_event_capture_records_raw_event(monkeypatch):
+    monkeypatch.setattr(tr, "_log_trade_event", lambda *a, **k: None)
+    state = tr._default_state()
+    event = {"event_type": "GatewayUserPosition",
+             "payload": {"size": -4, "contractId": "CON.F.US.MNQ.U26"},
+             "logged_at": "2026-07-18T09:30:00Z"}
+    tr._process_user_hub_events([event], state, _HubCfg())
+    records = _read_forensics_lines()
+    assert any(r["kind"] == "hub_GatewayUserPosition" for r in records)
+    hub_rec = next(r for r in records if r["kind"] == "hub_GatewayUserPosition")
+    # The FULL event is captured (not the pre-parsed extract), so the true
+    # payload shape is preserved even if the parser's key assumptions are wrong.
+    assert hub_rec["payload"]["payload"]["size"] == -4

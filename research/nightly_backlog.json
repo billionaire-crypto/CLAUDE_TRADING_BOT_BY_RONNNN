@@ -1,0 +1,62 @@
+[
+ {
+  "id": "calm_atr_ratio_070",
+  "param": "CALM_ATR_RATIO",
+  "candidate_value": 0.7,
+  "status": "APPLIED_LIVE",
+  "source": "seeded",
+  "rationale": "April sweep found 0.70 was the looser floor (monotonic improvement 0.80->0.70, identical at 0.65); shipped config uses 0.75. Parked in memory as 'possible minor future dial, needs full gauntlet re-run' since 2026-07-04. First real candidate for the nightly runner.",
+  "tested_at": "2026-07-07T06:23:09.956204-05:00",
+  "verdict": "SHIP -> applied to src/bot.py 2026-07-07 14:20 CT by Ron's instruction"
+ },
+ {
+  "id": "strong_max_trades_5",
+  "param": "STRONG_MAX_TRADES",
+  "candidate_value": 5,
+  "status": "shipped_pending_review",
+  "source": "seeded",
+  "rationale": "2026-04-19 sweep: max_trades=5 added +$204/mo, +19 qual days, no WR/PF degradation vs the then-current 4. Never shipped. Needs re-validation on the current vwap_only baseline (that sweep predated the vwap_only/ATR-target changes).",
+  "tested_at": "2026-07-07T20:06:08.874470-05:00",
+  "verdict": "SHIP (tested 2026-07-07): safe but TINY (+33 trades/7yr, worst trade unchanged -983, combine 97.7->97.8%). Cap rarely binds. 6 REJECTS (worst -2318 cliff)."
+ },
+ {
+  "id": "fvg_max_age_bars_5",
+  "param": "FVG_MAX_AGE_BARS",
+  "candidate_value": 5,
+  "status": "rejected",
+  "source": "seeded",
+  "rationale": "Current age gate is 4 bars (~20 min); age-12 was proven to reopen a gap-through tail (-$5,037). Nobody has tested the ONE-STEP move to 5 on the current baseline. Small, bounded, worth a real check instead of assuming linear risk between 4 and 12.",
+  "tested_at": null,
+  "verdict": "REJECT (age 5/6/7 all tested 2026-07-07): net rises (+7.5% at age5) but worst trade -983->-1246 and combine pass 97.7%->95.9% - safety cost fails pre-registered gates for a COMBINE account"
+ },
+ {
+  "id": "breakeven_trigger_16",
+  "param": "BREAKEVEN_TRIGGER_TICKS",
+  "candidate_value": 16,
+  "status": "shipped_pending_review",
+  "source": "seeded",
+  "rationale": "Live breakeven trigger is 20 ticks. Never swept against the current vwap_only + ATR-target baseline. A lower trigger locks in break-even sooner (less give-back) but may cut winners short more often - exactly the kind of trade-off the gauntlet should adjudicate, not intuition.",
+  "tested_at": "2026-07-08T20:04:25.741530-05:00",
+  "verdict": "SHIP"
+ },
+ {
+  "id": "fvg_lunch_filter_on",
+  "param": "FVG_LUNCH_FILTER_ENABLED",
+  "candidate_value": true,
+  "status": "rejected",
+  "source": "regime_detector_2026_07_17",
+  "rationale": "Regime study (ledger 2026-07-17): lunch phase 11-13 CT is the weakest slice of the book - 897 trades, 23.0% WR, PF 2.84 vs am 4.62 / pm 4.53. This existing experiment flag blocks entries 11:00-12:30 CT (note: slightly narrower than the studied 11-13 bucket). A TIGHTENING, not a loosening. Open question for the gauntlet: lunch still contributed +$78,620/7yr, so cutting it likely lowers net - but does removing the weakest, most stop-out-prone slice improve the combine pass rate / daily-limit fail rate enough to justify it? The combine-sim gate is the interesting one, not raw net.",
+  "tested_at": "2026-07-18T20:42:03.993344-05:00",
+  "verdict": "REJECT"
+ },
+ {
+  "id": "fvg_vwap_rubber_band_on",
+  "param": "FVG_VWAP_RUBBER_BAND_ENABLED",
+  "candidate_value": true,
+  "status": "pending",
+  "source": "regime_detector_2026_07_17",
+  "rationale": "Regime study (ledger 2026-07-17): composite choppy days (high VWAP-crossing frequency) run PF 2.53 vs 5.14 on trending days. A day-level filter is not causal (day type known only in hindsight), but this existing flag is a causal intraday proxy: it requires price to be extended >= 12 pts from VWAP when the FVG is created, which is exactly what churny VWAP-hugging days fail. A TIGHTENING. Gauntlet decides whether the chop it removes is worth the trades it costs.",
+  "tested_at": null,
+  "verdict": null
+ }
+]

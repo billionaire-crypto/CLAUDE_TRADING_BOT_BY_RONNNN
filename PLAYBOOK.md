@@ -1,7 +1,7 @@
 # MNQ Bot — Operating Playbook
 
 **Read this before you touch anything. Especially when you're stressed.**
-Last updated: 2026-07-04. Config: V29 FVG, `vwap_only` bias, ATR targets (2.0×, cap 240t), breakeven live, trail OFF.
+Last updated: 2026-07-07. Config: V29 FVG, `vwap_only` bias, ATR targets (2.0×, cap 240t), breakeven live, trail OFF, CALM_ATR_RATIO 0.70 (gauntlet-validated change, 07-07).
 
 ---
 
@@ -18,9 +18,9 @@ Last updated: 2026-07-04. Config: V29 FVG, `vwap_only` bias, ATR targets (2.0×,
 | Thing | Number | Note |
 |---|---|---|
 | Win rate | **~29%** (recent ~31–36%) | You LOSE ~7 of 10 trades. **This is by design.** |
-| Trades per day | **~1.5** | ~1 in 4 days: **zero trades** (normal). |
-| Combine pass | **~17 trading days** (~3.5 weeks) | ~98% likely *if* live matches testing. |
-| Profit factor | 4.10 backtest → **plan for ~3 live** | Real fills are worse than backtests. |
+| Trades per day | **~1.2–1.3 in the current regime** (7-yr avg 1.5) | ~**1 in 3** days: **zero trades** (normal NOW — the market supplies fewer pullback days each year: idle rate 13%→32% from 2019→2026. Measured, not a malfunction). |
+| Combine pass | **~17–25 trading days** (slower than the 17-day median, which assumed the older, busier regime) | ~98% likely *if* live matches testing. |
+| Profit factor | 4.10 backtest → **plan for ~3 live** | Real fills are worse than backtests. Per-trade edge has RISEN as frequency fell. |
 
 **The single most important mindset:** this is a *"lose small, win big"* machine. A few huge winners pay for everything (top 10% of trades = 85% of profit). So:
 - **A losing streak of 5–7 in a row is NORMAL. Do not panic-halt.**

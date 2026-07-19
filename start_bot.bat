@@ -14,7 +14,7 @@ if not "%RUNNING%"=="0" (
 
 :loop
 echo [%date% %time%] Starting MNQ bot...
-"C:\Users\kyawz\AppData\Local\Programs\Python\Python313\python.exe" -X utf8 -m src.topstepx_runtime run-loop --auto-submit
+"C:\Users\kyawz\AppData\Local\Programs\Python\Python313\python.exe" -X utf8 -m src.topstepx_runtime run-loop --auto-submit 2>> "C:\CLAUDE TRADING BOT\src\exports\bot_stderr.log"
 
 echo [%date% %time%] Bot exited (code %errorlevel%). Restarting in 60 seconds...
 timeout /t 60 /nobreak >nul

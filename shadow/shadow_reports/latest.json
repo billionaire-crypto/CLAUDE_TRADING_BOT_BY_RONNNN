@@ -1,0 +1,44 @@
+{
+ "generated_at": "2026-07-07T22:26:34.605375",
+ "drift": {
+  "fills_recorded": 0,
+  "exits": 0,
+  "observed_slippage_status": "Normal",
+  "avg_entry_slip_ticks": null,
+  "avg_exit_slip_ticks": null,
+  "live_win_rate": null,
+  "win_rate_convergence": 0.0,
+  "live_avg_trade_usd": null,
+  "sufficient_sample": false,
+  "breaches": [],
+  "note": "no fills yet \u2014 drift unmeasurable (n=0)"
+ },
+ "funnel": {
+  "live_sessions": 2,
+  "zero_trade_sessions": 2,
+  "consecutive_quiet": 2,
+  "historical_idle_rate": 0.219,
+  "funnel_throughput_status": "Baseline",
+  "breaches": []
+ },
+ "ghost": {
+  "session_bars": 0,
+  "gate_regime_open": null,
+  "fvgs_formed": null,
+  "bars_price_in_gap": null,
+  "binding_gate": null,
+  "note": "no completed session bars for 2026-07-08 yet \u2014 pipeline idle"
+ },
+ "telemetry": {
+  "errors": 0,
+  "non_whitelisted_warns": 15,
+  "data_gaps": 0,
+  "hub_restarts": 1,
+  "state_fresh_seconds": 0,
+  "in_session_latency_ok": true,
+  "breaches": [],
+  "hub_restarts_all_day": 5
+ },
+ "breaches": [],
+ "v30_staged": false
+}

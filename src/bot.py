@@ -117,7 +117,10 @@ SCALING_TIER_2_THRESHOLD = 1_500.0
 SCALING_TIER_3_THRESHOLD = 2_000.0
 
 # ── DYNAMIC RISK PROFILES ────────────────────────────────────────────────────
-CALM_ATR_RATIO   = 0.75   # removed: 1.00 was curve-fitted upward; 0.75 keeps the quietest bars out
+CALM_ATR_RATIO   = 0.70   # 2026-07-07: 0.75->0.70 per nightly-researcher full gauntlet (ledger entry
+                          # 2026-07-07): net better in ALL 3 OOS periods, 0 negative walk-forward
+                          # windows, stress x3 PF 3.15, combine pass 97.7->97.8%, worst trade unchanged.
+                          # 0.70 was also the April-validated floor (0.65 identical = hard floor).
 STRONG_ATR_RATIO = 0.70
 
 NORMAL_CONTRACTS    = 2   # restored from 0; conservative start for the middle tier
