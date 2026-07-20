@@ -24,21 +24,26 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dataclasses import dataclass, field
+from collections import deque
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict
 import warnings
 warnings.filterwarnings("ignore")
 
-from src.load_data import load_mes_data
+from src.load_data import load_ohlcv_csv
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 DATA_PATH       = r"C:\Users\kyawz\Downloads\GLBX-20260331-885WT5W7KA\glbx-mdp3-20100606-20260329.ohlcv-1m.csv"
+# Additional bar files appended to the base dataset (deduped on the overlap).
+# Same GLBX.MDP3 OHLCV-1m format; verified bar-identical to the live ProjectX
+# feed. Extends the backtest past the base file's 2026-03-27 end.
+DATA_PATH_EXTENSIONS = [
+    r"C:\Users\kyawz\Downloads\databento_mnq_2026_apr_jul.csv",
+]
 INIT_CASH       = 50_000.0
 RUN_MODE        = "BACKTEST"
 EXECUTION_PROFILE = "CONSERVATIVE"
-TOPSTEPX_DRY_RUN = os.getenv("TOPSTEPX_DRY_RUN", "true").strip().lower() == "true"
-TOPSTEPX_ENABLE_ORDER_ROUTING = os.getenv("TOPSTEPX_ENABLE_ORDER_ROUTING", "false").strip().lower() == "true"
-LIVE_EXECUTION_ENABLED = TOPSTEPX_ENABLE_ORDER_ROUTING and not TOPSTEPX_DRY_RUN
+LIVE_EXECUTION_ENABLED = False
 PRODUCTION_AUDIT_ENABLED = True
 
 # Strategy params
@@ -56,8 +61,11 @@ PRIOR_TRADES    = 20
 PRIOR_WIN_RATE  = 0.45
 
 # ── MNQ CONTRACT SPECS (changed from MES) ────────────────────────────────────
-COMMISSION_PER_CONTRACT = 1.34
-SLIPPAGE_TICKS          = 1.0
+COMMISSION_PER_CONTRACT  = 1.34
+SLIPPAGE_TICKS           = 1.0   # used when SLIPPAGE_SCALE_ENABLED=False or CLI override
+SLIPPAGE_SCALE_ENABLED   = True  # scale slippage with contract size (more realistic)
+# Tiers: 1-10 contracts = 1 tick, 11-20 = 2 ticks, 21+ = 3 ticks
+SLIPPAGE_SCALE_TIERS     = [(10, 1.0), (20, 2.0), (999, 3.0)]
 
 MNQ_TICK_SIZE   = 0.25          # same tick size as MES
 MNQ_TICK_VALUE  = 0.50          # $0.50/tick (MES was $1.25)
@@ -66,13 +74,25 @@ MNQ_POINT_VALUE = 2.00          # $2.00/point (MES was $5.00)
 # Stop fallback — scaled for MNQ (32 ticks = 8 NQ points, equiv to 2 ES points)
 STOP_TICKS      = 32
 
+# Gap-through stop fills: when a bar OPENS beyond the stop (a gap or fast move),
+# fill at the open (worse) instead of the exact stop price. Models real stop
+# slippage; makes the backtest conservative rather than optimistic. Set False to
+# reproduce the old exact-stop-price behavior for A/B comparison.
+GAP_THROUGH_STOPS_ENABLED = True
+
+# Phantom-bar filter: drop isolated bad-print bars whose ENTIRE range floats
+# beyond BOTH neighbours by more than this fraction of price. Real moves overlap
+# their neighbours; a bar detached above/below both is a data artifact (a spike
+# that reverts on the next bar). Without this, gap-through fills at those garbage
+# prices produce fake catastrophic losses. Conservative: only fully-detached bars.
+PHANTOM_BAR_FILTER_ENABLED = True
+PHANTOM_BAR_DETACH_PCT     = 0.004   # 0.4% margin beyond full detachment
+
 # ── TOPSTEP $50K RULES ────────────────────────────────────────────────────────
 import pytz
 TIMEZONE             = pytz.timezone("America/Chicago")
 SESSION_OPEN_H       = 17
 SESSION_OPEN_M       = 0
-LIVE_TRADE_WINDOW_START_H = 9
-LIVE_TRADE_WINDOW_START_M = 30
 ENTRY_CUTOFF_H       = 15
 ENTRY_CUTOFF_M       = 8
 HARD_FLATTEN_H       = 15
@@ -97,16 +117,55 @@ SCALING_TIER_2_THRESHOLD = 1_500.0
 SCALING_TIER_3_THRESHOLD = 2_000.0
 
 # ── DYNAMIC RISK PROFILES ────────────────────────────────────────────────────
-CALM_ATR_RATIO   = 0.70
+CALM_ATR_RATIO   = 0.70   # 2026-07-07: 0.75->0.70 per nightly-researcher full gauntlet (ledger entry
+                          # 2026-07-07): net better in ALL 3 OOS periods, 0 negative walk-forward
+                          # windows, stress x3 PF 3.15, combine pass 97.7->97.8%, worst trade unchanged.
+                          # 0.70 was also the April-validated floor (0.65 identical = hard floor).
 STRONG_ATR_RATIO = 0.70
 
-NORMAL_CONTRACTS    = 4
+NORMAL_CONTRACTS    = 2   # restored from 0; conservative start for the middle tier
 NORMAL_TARGET_TICKS = 64  # 16 NQ points = equiv to 4 ES points
-NORMAL_MAX_TRADES   = 5
+NORMAL_MAX_TRADES   = 3   # capped lower than STRONG until live data validates
 
 STRONG_CONTRACTS    = 5          # V28: capped at Topstep max
 STRONG_TARGET_TICKS = 100  # 20 NQ points = equiv to 5 ES points at 4x scale
 STRONG_MAX_TRADES   = 4          # V28: 1 ORB + 3 FVG
+
+# ATR constant-dollar-risk sizing: re-sizes FVG contracts so stop exposure
+# stays near a fixed dollar target regardless of where the structural stop lands.
+ATR_CDR_ENABLED    = True
+ATR_CDR_TARGET_USD = 80.0   # target stop-exposure in dollars per FVG trade
+
+# ── RISK-BUDGET SIZING (DLL-headroom aware) ───────────────────────────────────
+# Correct fix for the score-map DLL conflict: control DOLLAR risk, not contract
+# count. Per-trade size = min(per-score conviction budget, HEADROOM_SAFETY_FRAC
+# of remaining daily-loss headroom) / per-contract stop risk. The stop is costed
+# at the worst slippage tier so the reserve never underruns at a tier boundary.
+# This makes a single-trade DLL breach mathematically impossible while letting
+# size grow as an intraday cushion is built. When enabled it REPLACES the CDR
+# block for FVG entries. Off by default; the A/B runner toggles it.
+# Defaults = sweep config "C": keeps ~94% of baseline P&L, beats baseline Sharpe,
+# caps worst single trade at ~-$674 (leaves ~$326 for live gap-through slippage
+# before the $1,000 DLL).
+RISK_BUDGET_SIZING_ENABLED = True
+RISK_BUDGET_MAP            = {8: 900.0, 7: 675.0, 6: 350.0}  # $ stop-risk budget by FVG score
+RISK_BUDGET_DEFAULT        = 150.0   # budget for scores below the lowest key
+HEADROOM_SAFETY_FRAC       = 0.80    # max fraction of remaining DLL headroom risked per trade
+
+# ── GAP-RISK MITIGATIONS (both off by default; A/B swept) ─────────────────────
+# Option A — gap-aware budget: size the risk budget against a stop that fills
+# GAP_STOP_MULT x its width worse (models gap-through), so even a gapped fill
+# stays within budget. Self-targeting: only trims trades big enough to matter.
+# ENABLED: caps worst single trade under the $1k combine DLL (worst -$823 vs
+# -$1018), raises Sharpe 6.81->7.23, costs ~2 days to median combine pass.
+GAP_AWARE_SIZING_ENABLED = True
+GAP_STOP_MULT            = 1.5
+
+# Option B — news-day size cap: on scheduled high-impact news days (where gaps
+# cluster), cap contracts so a gap cannot breach the DLL. Leaves all other days
+# at full size, so P&L cost is confined to those few days.
+NEWS_DAY_SIZE_CAP_ENABLED = False
+NEWS_DAY_MAX_CONTRACTS    = 10
 
 # V28: Explosive regime disabled (33% WR, consistently loses)
 # ATR ratio hard cap at 2.0 enforced in get_risk_profile()
@@ -120,21 +179,72 @@ EXPLOSIVE_MAX_TRADES   = 0       # V28: explosive = 0 trades allowed
 ADX_STRONG_THRESHOLD    = 10
 ADX_EXPLOSIVE_THRESHOLD = 30
 
+# ── REGIME DETECTOR (clock + ADX) ──────────────────────────────────────────────
+# The "is the owner sitting or moving?" detector.
+#   - Clock  = time of day rhythm (AM rush / lunch bench / PM rush)
+#   - ADX    = are the steps pointing one way (trend) or all over (chop)?
+#   - CHOP   = optional Choppiness Index confirmation (squiggly vs straight path)
+# detect_regime() uses ADX when REGIME_USE_ADX is True; set False to fall back to
+# the legacy volatility-only (ATR) rule for A/B comparison in the backtest.
+REGIME_USE_ADX        = True
+ADX_CHOP_MAX          = 20.0   # ADX below this  -> ranging / chop
+ADX_TREND_MIN         = 25.0   # ADX above this  -> trending; 20-25 = neutral (stand aside)
+CHOP_INDEX_ENABLED    = False  # require Choppiness Index confirmation for "choppy"
+CHOP_INDEX_PERIOD     = 14
+CHOP_INDEX_RANGE_MIN  = 61.8   # Choppiness Index above this confirms a range
+# E3: regime router — route entries by detected regime instead of winner-take-all score
+REGIME_ROUTER_ENABLED = False
+# E5: explicit neutral no-trade zone (ADX 20-25 stands aside completely)
+NEUTRAL_NO_TRADE      = False
+
+# Clock windows (US/Central). The lunch "bench" window is when fades work best.
+MR_WINDOW_START_CT    = (11, 0)    # mean-reversion (bounce-catching) window start
+MR_WINDOW_END_CT      = (13, 30)   # mean-reversion window end
+TREND_AM_WINDOW_CT    = ((8, 30), (10, 0))   # morning rush -> trend strategies
+TREND_PM_WINDOW_CT    = ((14, 0), (14, 50))  # afternoon push -> trend strategies
+
 # EMA Spread filter
 EMA_SPREAD_MIN = 0.0010
 
 # FVG settings
-FVG_MAX_AGE_BARS   = 20
+FVG_MAX_AGE_BARS   = 4
 FVG_MIN_SIZE_TICKS = 2
 FVG_FRESH_ONLY     = False
-FVG_BLOCK_SWEEP_LEVELS: set = {"globex_high"}  # block FVGs preceded by a globex_high liquidity sweep
 FVG_LEVEL_ALIGNMENT_BONUS_ENABLED = True
 FVG_LEVEL_ALIGNMENT_TICKS         = 8
 FVG_BOS_BONUS_ENABLED             = True
 FVG_BOS_LOOKBACK_BARS             = 5
 FVG_REACTION_CLOSE_BONUS_ENABLED  = True
 
+# ── FVG experiment filters (all disabled by default) ──────────────────────────
+FVG_LUNCH_FILTER_ENABLED     = False  # idea 1: block entries 11:00–12:30 CT
+FVG_LUNCH_START_CT           = (11, 0)
+FVG_LUNCH_END_CT             = (12, 30)
+FVG_VWAP_RUBBER_BAND_ENABLED = False  # idea 2: require VWAP extension at creation
+FVG_VWAP_MIN_EXTENSION_PTS   = 12.0
+FVG_BODY_QUALITY_ENABLED     = False  # idea 3: require strong impulse candle
+FVG_BODY_MIN_PCT             = 0.60
+FVG_SWEEP_REQUIRED           = False  # idea 4: require liquidity sweep before FVG
+FVG_OVERLAP_REQUIRED         = False  # idea 5: require 2+ overlapping active FVGs
+# idea 6: block FVGs preceded by a liquidity sweep+reject at a key level (distinct
+# from idea 4 above — this checks a SESSION LEVEL like globex_high, not the FVG's
+# own formation). Ported from an older branch's validated finding (sweep-preceded
+# FVGs: 39.1% WR vs 46% baseline) but never re-tested against the current vwap_only
+# + ATR-target config. OFF by default pending nightly-researcher re-validation
+# (see research/RESEARCH_LEDGER.md 2026-07-19 and nightly_backlog.json).
+FVG_BLOCK_LEVEL_SWEEP_ENABLED       = False
+FVG_BLOCK_LEVEL_SWEEP_LEVELS: set   = {"globex_high"}
+FVG_BLOCK_LEVEL_SWEEP_LOOKBACK_BARS = 10
+FVG_BLOCK_LEVEL_SWEEP_MIN_PTS       = 3.0
+FVG_BLOCK_LEVEL_SWEEP_MAX_PTS       = 8.0
+
 # ── V28: ORB SETTINGS ─────────────────────────────────────────────────────────
+# ORB is DISABLED. It was cut for a 26% WR under the shared FVG/ORB trade cap.
+# This explicit flag is the authoritative off-switch — the ORB entry block is
+# gated on it. (Previously ORB was disabled only by the obscure side effect of
+# ORB_MAX_RANGE_TICKS=0 making its range guard unsatisfiable.) Do not flip to
+# True without first separating the ORB and FVG per-day trade caps.
+ORB_ENABLED            = False
 ORB_RANGE_BARS         = 3       # 6 bars = 30 minutes (9:30-10:00 CT)
 ORB_ENTRY_WINDOW_START = (9, 30) # CT hour, minute — range starts forming
 ORB_ENTRY_WINDOW_END   = (10, 30)# CT hour, minute — last valid ORB entry
@@ -146,16 +256,135 @@ ORB_STOP_BUFFER_TICKS  = 1       # ticks beyond ORB boundary for stop
 # V28: ORB fires independently of ATR regime
 ORB_INDEPENDENT_CONTRACTS = 3    # contracts when ORB fires without ATR confirmation
 
+# ── PDH/PDL RETEST SETTINGS ──────────────────────────────────────────────────
+PDH_RETEST_ENABLED     = False
+PDH_BREAK_TICKS        = 8    # ticks price must extend beyond PDH/PDL to confirm clean break
+PDH_ENTRY_ZONE_TICKS   = 6    # enter when price pulls back within this many ticks of level
+PDH_STOP_TICKS         = 10   # stop placed this many ticks beyond the PDH/PDL level
+PDH_TARGET_TICKS       = 50   # target ticks from entry
+
+# ── VWAP PULLBACK SETTINGS ────────────────────────────────────────────────────
+# After the first hour (10:30 CT), if price moved ≥ 1 ATR from the session open,
+# enter when it pulls back to touch the running VWAP.
+VWAP_PB_ENABLED            = False   # 35% WR, net negative — not a real edge
+VWAP_PB_WINDOW_START       = (10, 30)  # CT — start looking for entries after first hour
+VWAP_PB_WINDOW_END         = (13,  0)  # CT — stop looking (avoid afternoon chop)
+VWAP_PB_MIN_MOVE_ATR       = 1.0       # first-hour VWAP must be ≥ 1 ATR from session open
+VWAP_PB_ENTRY_ZONE_TICKS   = 10        # within 10 ticks of VWAP = entry zone
+VWAP_PB_STOP_TICKS         = 16        # stop on wrong side of VWAP
+VWAP_PB_TARGET_TICKS       = 50        # target ticks from entry
+VWAP_PB_MAX_TRADES_PER_DAY = 2
+
+# ── SWEEP & REVERSE SETTINGS ──────────────────────────────────────────────────
+# When price sweeps above/below the N-bar rolling high/low by a small amount
+# then closes back through the level, the stop-hunt has failed and we fade.
+# Causal logic: stops at the N-bar extreme were triggered, creating the
+# liquidity that now pushes price back in the other direction.
+SWEEP_REV_ENABLED      = False  # net negative (-$266/yr); cut
+SWEEP_REV_LOOKBACK_BARS = 12   # swept parameter — 6/12/24/48 in the test
+SWEEP_REV_SWEEP_TICKS  = 4     # max ticks the sweep can extend beyond the level
+SWEEP_REV_STOP_BUFFER  = 4     # ticks beyond the sweep extreme for our stop
+SWEEP_REV_TARGET_TICKS = 40    # target ticks from entry
+SWEEP_REV_MAX_DAY      = 3     # max sweeps to trade per day
+SWEEP_REV_CONTRACTS    = 1     # 1 contract — stop is structural not fixed
+
+# ── GAP FILL SETTINGS ─────────────────────────────────────────────────────────
+# Fade overnight gaps that are likely to refill to the previous close.
+# All thresholds expressed in ATR multiples — self-calibrating across eras.
+GAP_FILL_ENABLED   = False
+
+# ── VOLUME POC REVERSION SETTINGS ─────────────────────────────────────────────
+# Compute the running session Point of Control (price bin with most volume).
+# Enter a mean-reversion trade back toward POC when price is overextended.
+# Causal: institutions filled most orders at POC — unfilled orders pull price back.
+VPOC_ENABLED       = False  # $7/slot ROI vs FVG's $84/slot; displaced by FVG
+VPOC_BIN_POINTS    = 5.0   # NQ-point resolution for price binning
+VPOC_MIN_BARS      = 12    # need ≥ 1 hour of data before POC is reliable
+VPOC_ENTRY_ATR     = 0.5   # prev-bar high/low must reach ≥ this × ATR beyond POC
+VPOC_STOP_TICKS    = 6     # ticks beyond the rejection bar's extreme for structural stop
+VPOC_MAX_TRADES    = 2     # max VPOC trades per day
+VPOC_CONTRACTS     = 1
+
+# ── HIGHER TIMEFRAME FVG (30-min bars) ────────────────────────────────────────
+# Same 3-bar imbalance logic as 5-min FVG but on 30-min bars.
+# Institutional gaps at this scale represent far more unfilled orders —
+# hypothesis: higher WR than 5-min FVG (60%+) with fewer but larger trades.
+HTF_FVG_ENABLED      = False  # 28% WR; 30-min orders are stale by the time we enter
+HTF_FVG_MINS         = 30    # resample to this many minutes per bar
+HTF_FVG_MAX_AGE_BARS = 4     # expire after 4 × 30min = 2 hours
+HTF_FVG_MIN_SIZE_PTS = 5.0   # minimum gap width in NQ points (filter noise)
+HTF_FVG_STOP_BUFFER  = 8     # ticks beyond FVG boundary for structural stop
+HTF_FVG_TARGET_TICKS = 120   # target (larger because gap is bigger)
+HTF_FVG_MAX_TRADES   = 2     # max per day
+HTF_FVG_CONTRACTS    = 1
+
+# Gap size compared to YESTERDAY'S actual RTH range (H-L), not ATR from globex bars.
+# At 9:30, ATR reflects overnight volatility which is 3-5× smaller than RTH —
+# using ATR would classify tiny gaps as "large." Prev-day range is the honest ruler.
+GAP_FILL_MIN_RANGE = 0.25  # gap ≥ 25% of yesterday's range (smaller = noise)
+GAP_FILL_MAX_RANGE = 0.80  # gap ≤ 80% of yesterday's range (larger = gap-and-go)
+GAP_FILL_STOP_TICKS = 40   # 2 NQ points — fixed tick stop beyond the open
+GAP_FILL_CONTRACTS  = 1    # fixed 1 contract
+
 # V28: Partial profit — take 60% off at 40 ticks, let 40% run to full target
 PARTIAL_PROFIT_ENABLED  = False
 PARTIAL_PROFIT_TICKS    = 40     # 10 NQ points — lock in profit here
 PARTIAL_PROFIT_FRACTION = 0.60   # close 60% of contracts, let 40% run
 
+# Breakeven stop: once +N ticks in profit, move stop to entry (set 0 to disable)
+BREAKEVEN_TRIGGER_TICKS = 20
+
+# ── EXIT / REGIME RESEARCH TOGGLES (default OFF; flipped by research sweeps) ──
+# All decisions use PRIOR-bar information only (no intrabar lookahead).
+TIME_STOP_ENABLED       = False  # kill dead trades to free the one-position slot
+TIME_STOP_BARS          = 24     # bars in trade before the time stop is eligible (2h)
+TIME_STOP_MIN_MFE_TICKS = 8      # only exit if prior-bar MFE never reached this
+# TRAIL: live stop-modification now EXISTS (_manage_position_stops in
+# topstepx_runtime.py: atomic modify, else place-new-confirm-then-cancel-old;
+# shares this exact math via desired_stop_price()). STAGED ROLLOUT: the flag
+# stays OFF until the machinery is proven on real live fills — breakeven moves
+# (already modeled by the backtest) exercise the same code path first. Flip to
+# True only after observing clean live stop-moves; then backtest and live are
+# consistent by construction. Validated with ATR targets: WR 49%, PF 4.0.
+TRAIL_AFTER_MFE_ENABLED = False  # once a runner, trail the stop behind peak MFE
+TRAIL_TRIGGER_TICKS     = 60     # prior-bar MFE that arms the trail
+TRAIL_GAP_TICKS         = 40     # stop trails this far behind prior-bar peak MFE
+BE_OFFSET_TICKS         = 0      # breakeven stop = entry +/- offset (covers costs)
+ATR_FLOOR_PCT_ENABLED   = False  # normalize the strong-gate 1.5-pt ATR floor by price
+ATR_FLOOR_PCT           = 0.0002 # = 1.5 pts at ~7,600 (2019 calibration)
+# ATR-scaled FVG targets — SHIPPING (2026-07-02). The fixed 100-tick target
+# (25 pts) was ~3-5x ATR in 2019 but only ~0.7x ATR by 2025 (index tripled;
+# tick-denominated geometry drifted). Scaling by ATR restores constant reward
+# geometry. Validated: net +40% ($320.9k vs $228.7k/7yr), PF 3.89, avg trade
+# $143 vs $101, better in ALL 8 years, tails IDENTICAL (worst trade/day/trough
+# -$823/-$915/-$915), combine sim P(pass) 98.3% with median 21d vs 24d.
+# The 240-tick cap is load-bearing: uncapped targets held positions through
+# violent bars (worst trade -$3,613). Do not raise the cap without re-running
+# research batches 3-5.
+ATR_TARGET_ENABLED      = True
+ATR_TARGET_MULT         = 2.0
+ATR_TARGET_MIN_TICKS    = 60
+ATR_TARGET_MAX_TICKS    = 240
+
+# ── STRESS-TEST TOGGLES (default OFF; flipped only by robustness batteries) ──
+MISS_FILL_PROB        = 0.0   # probability an entry is randomly skipped (latency/missed-fill stress)
+MISS_FILL_SEED        = 1     # RNG seed so missed-fill runs are reproducible
+STOP_EXTRA_SLIP_TICKS = 0     # extra adverse ticks on EVERY stop fill (gap/news shock stress)
+
+# FOMC announcement blackout. Statement drops 2:00 PM ET = 13:00 CT; press
+# conference 2:30-3:30 PM ET = 13:30-14:30 CT. The old window (13:45-14:30 CT)
+# was a timezone slip — it STARTED 45 minutes after the statement and left the
+# most violent bar of the day tradeable. Corrected to cover pre-statement
+# through the end of the press conference.
+FOMC_BLACKOUT_ENABLED  = True
+FOMC_BLACKOUT_START_CT = (12, 40)  # 20 min before the 13:00 CT statement
+FOMC_BLACKOUT_END_CT   = (14, 30)  # end of press conference (3:30 PM ET)
+
 # One-account optimization filters
 SKIP_FOMC_ENTRIES              = False
 SKIP_HOUR_11_ENTRIES           = False
 SKIP_LONG_HOUR_10_11           = False
-LONG_QUALITY_FILTERS_ENABLED   = True
+LONG_QUALITY_FILTERS_ENABLED   = False  # removed: ADX+EMA-spread gate for 10-11 CT longs was too hour-specific
 LONG_FILTER_START_HOUR         = 10
 LONG_FILTER_END_HOUR           = 11
 LONG_FILTER_MIN_ADX            = 10
@@ -165,12 +394,25 @@ FVG_LONG_MIN_EMA_SPREAD_PTS    = 10.0
 FVG_LONG_EMA_FILTER_MIN_AGE_BARS = 8
 FVG_LONG_AGE_FILTER_ENABLED    = False
 FVG_LONG_MAX_AGE_BARS          = 7
+# Trend-bias filter mode: how EMA-trend and VWAP-position combine to allow an
+# FVG entry. SHIPPED = "vwap_only" (2026-07-04): a code-level filter audit found
+# the EMA-trend leg of the old "ema_and_vwap" AND was a handbrake -- it deleted
+# 380 above-average trades (marg $193 vs $148 base), mostly VWAP-aligned pullback
+# entries the slow EMAs hadn't caught up to. VWAP alone (institutional fair value)
+# is the real bias. Full gauntlet cleared: net $416,436 (+21%), PF 3.97->4.10,
+# better in ALL 3-way-split periods incl. untouched 2026Q2, 0 failed walk-forward
+# windows, survives slip x3 at PF 3.19, combine pass 97.7% median 17d (vs 20d).
+# Tail at scaled size -$983 (was -$918); combine daily-limit failures LOWER.
+BIAS_MODE                      = "vwap_only"
 FVG_QUALITY_SCORE_ENABLED      = True
 FVG_SCORE_SIZING_ENABLED       = True
 FVG_SCORE_MEDIUM_THRESHOLD     = 3
 FVG_SCORE_MEDIUM_SIZE_STEP     = 1
 FVG_SCORE_HIGH_THRESHOLD       = 4
 FVG_SCORE_HIGH_SIZE_STEP       = 2
+# Score-to-contracts map (overrides old additive system; Topstep 50K limit = 50 MNQ)
+FVG_SCORE_CONTRACT_MAP_ENABLED = True
+FVG_SCORE_CONTRACT_MAP         = {8: 50, 7: 40, 6: 10}  # score >= key → contracts value
 LATE_LONG_TARGET_ENABLED       = False
 LATE_LONG_TARGET_START_HOUR    = 10
 LATE_LONG_TARGET_END_HOUR      = 11
@@ -178,55 +420,50 @@ LATE_LONG_TARGET_TICKS         = 80
 
 # Complementary module: VWAP mean reversion V2a
 VWAP_MR_ENABLED                = False
-VWAP_MR_WINDOW_START           = (12, 0)
-VWAP_MR_WINDOW_END             = (14, 0)
+VWAP_MR_WINDOW_START           = (10, 30)  # validated in E2a holdout
+VWAP_MR_WINDOW_END             = (12, 30)  # validated in E2a holdout
 VWAP_MR_CONTRACTS              = 2
 VWAP_MR_MAX_TRADES_PER_DAY     = 1
 VWAP_MR_MAX_ADX                = 20
 VWAP_MR_MAX_ATR_RATIO          = 1.10
-VWAP_MR_MIN_DISTANCE_POINTS    = 16.0
-VWAP_MR_MAX_DISTANCE_POINTS    = 24.0
+VWAP_MR_MIN_DISTANCE_POINTS    = 16.0    # used when VWAP_MR_SIGMA_BAND=False
+VWAP_MR_MAX_DISTANCE_POINTS    = 24.0    # used when VWAP_MR_SIGMA_BAND=False
 VWAP_MR_FAILED_FVG_MAX_AGE     = 8
 VWAP_MR_RSI_SHORT_MIN          = 60
-VWAP_MR_STOP_TICKS             = 24
+VWAP_MR_STOP_TICKS             = 24      # fallback stop when sigma-band=False
 VWAP_MR_MIN_TARGET_TICKS       = 20
 VWAP_MR_MAX_TARGET_TICKS       = 60
 VWAP_MR_TARGET_BUFFER_TICKS    = 4
 VWAP_MR_DEBUG_PRINT_LIMIT      = 25
-
-# Module E: VWAP extension short (afternoon mean-reversion)
-VWAP_EXT_ENABLED            = False
-VWAP_EXT_WINDOW_START       = (13, 30)  # 13:30 CT
-VWAP_EXT_WINDOW_END         = (15, 0)   # 15:00 CT
-VWAP_EXT_MIN_ATR_MULT       = 1.2       # price >= VWAP + 1.2 * ATR to qualify
-VWAP_EXT_CONTRACTS          = 2
-VWAP_EXT_MAX_TRADES_PER_DAY = 1
-VWAP_EXT_STOP_ATR_MULT      = 1.0       # stop = entry + 1.0 * ATR (widened from 0.5)
-VWAP_EXT_TARGET_ATR_MULT    = 1.5       # target = entry - 1.5 * ATR (widened from 0.75)
-VWAP_EXT_MAX_BARS           = 8         # time-based exit: 40 min on 5-min bars
-VWAP_EXT_DEBUG_PRINT_LIMIT  = 25
+# E1: two-sided σ-band VWAP reversion enhancements
+VWAP_MR_TWO_SIDED              = True    # also fade below VWAP (long side)
+VWAP_MR_SIGMA_BAND             = True    # use rolling σ-band instead of fixed pts
+VWAP_MR_SIGMA_MULT             = 2.0     # entry threshold: price ≥ ±N*σ from VWAP
+VWAP_MR_SIGMA_STOP_MULT        = 3.0     # stop: ±N*σ from VWAP (gravity weakens past 3σ)
+VWAP_MR_SIGMA_PERIOD           = 20      # bars for rolling std(close - vwap)
+VWAP_MR_FVG_AS_BONUS           = True    # failed-FVG is a score bonus, not a gate
 
 # Complementary module: opening-drive first pullback continuation
 OD_PULLBACK_ENABLED             = False
 OD_DRIVE_WINDOW_START           = (9, 30)
 OD_DRIVE_WINDOW_END             = (9, 45)
 OD_ENTRY_WINDOW_START           = (9, 45)
-OD_ENTRY_WINDOW_END             = (10, 20)
+OD_ENTRY_WINDOW_END             = (10, 45)
 OD_MAX_TRADES_PER_DAY           = 1
 OD_CONTRACTS                    = 3
 OD_MIN_DRIVE_TICKS              = 12
-OD_MAX_DRIVE_TICKS              = 48
-OD_MIN_PULLBACK_PCT             = 0.40
-OD_MAX_PULLBACK_PCT             = 0.60
+OD_MAX_DRIVE_TICKS              = 120
+OD_MIN_PULLBACK_PCT             = 0.25
+OD_MAX_PULLBACK_PCT             = 0.75
 OD_MIN_ADX                      = 10
 OD_MIN_ATR_RATIO                = 0.90
 OD_STOP_CAP_TICKS               = 28
 OD_TARGET_TICKS                 = 80
 OD_DEBUG_PRINT_LIMIT            = 25
-OD_SHORT_ONLY                   = True
+OD_SHORT_ONLY                   = False
 
 # Complementary module: failed breakout / liquidity sweep reversal
-FAILED_BREAKOUT_ENABLED         = True
+FAILED_BREAKOUT_ENABLED         = False
 FB_WINDOW_START                 = (10, 0)
 FB_WINDOW_END                   = (13, 30)
 FB_CONTRACTS                    = 3
@@ -245,8 +482,8 @@ FB_DEBUG_PRINT_LIMIT            = 25
 
 ANALYSIS_HIGHLIGHT_MIN_TRADES  = 40
 
-# V28: Disable July (36.3% WR, net negative over 7yr)
-SKIP_JULY = True
+# July disabled in V28 based on 7yr sample WR; removed as curve-fitted seasonality
+SKIP_JULY = False
 
 # Monte Carlo
 MC_SIMULATIONS  = 10_000
@@ -271,8 +508,11 @@ FOMC_DATES = {
     "2024-07-31","2024-09-18","2024-11-07","2024-12-18","2025-01-29",
     "2025-03-19","2025-05-07","2025-06-18","2025-07-30","2025-09-17",
     "2025-11-05","2025-12-17","2026-01-28","2026-03-18",
-    "2026-05-06","2026-06-17","2026-07-29","2026-09-16",
-    "2026-11-04","2026-12-16",
+    # Remaining 2026 meetings (announcement day = second meeting day), from the
+    # Fed's published tentative schedule. VERIFY against federalreserve.gov
+    # before each meeting — a rescheduled meeting with a stale date here means
+    # an unprotected 13:00 CT statement bar.
+    "2026-04-29","2026-06-17","2026-07-29","2026-09-16","2026-10-28","2026-12-09",
 }
 CPI_DATES = {
     "2019-01-11","2019-02-13","2019-03-12","2019-04-10","2019-05-10",
@@ -292,9 +532,7 @@ CPI_DATES = {
     "2024-11-13","2024-12-11","2025-01-15","2025-02-12","2025-03-12",
     "2025-04-10","2025-05-13","2025-06-11","2025-07-15","2025-08-12",
     "2025-09-10","2025-10-15","2025-11-13","2025-12-10","2026-01-14",
-    "2026-02-11","2026-03-11","2026-04-10","2026-05-13",
-    "2026-06-11","2026-07-15","2026-08-12","2026-09-10",
-    "2026-10-14","2026-11-12","2026-12-10",
+    "2026-02-11","2026-03-11",
 }
 NFP_DATES = {
     "2019-01-04","2019-02-01","2019-03-08","2019-04-05","2019-05-03",
@@ -314,10 +552,41 @@ NFP_DATES = {
     "2024-11-01","2024-12-06","2025-01-10","2025-02-07","2025-03-07",
     "2025-04-04","2025-05-02","2025-06-06","2025-07-03","2025-08-01",
     "2025-09-05","2025-10-03","2025-11-07","2025-12-05","2026-01-09",
-    "2026-02-06","2026-03-06","2026-04-03","2026-05-08",
-    "2026-06-05","2026-07-03","2026-08-07","2026-09-04",
-    "2026-10-02","2026-11-06","2026-12-04",
+    "2026-02-06","2026-03-06",
 }
+
+# NFP releases on the first Friday of the month (8:30 ET, pre-session for this
+# bot). The hardcoded list above went stale after 2026-03; auto-extend with
+# first-Fridays so is_nfp_day tagging and the news-day size cap never silently
+# lapse again. (CPI has no fixed rule — its list is maintained manually and is
+# stale after 2026-03; CPI releases pre-open so no in-session exposure.)
+def _first_fridays(start_year: int, end_year: int) -> set:
+    import datetime as _dt
+    out = set()
+    for y in range(start_year, end_year + 1):
+        for m in range(1, 13):
+            d = _dt.date(y, m, 1)
+            d += _dt.timedelta(days=(4 - d.weekday()) % 7)  # first Friday
+            out.add(d.isoformat())
+    return out
+
+NFP_DATES |= _first_fridays(2026, 2027)
+# ISM Manufacturing PMI — first business day of each month (10:00 AM ET release)
+ISM_BLACKOUT_ENABLED = True
+
+def _is_ism_day(session_date_str: str) -> bool:
+    """True if session_date is the first business day of its month (ISM release day).
+    Skips weekends and New Year's Day (the only federal holiday that falls on the 1st
+    of a month and can shift the first business day)."""
+    import datetime as _dt
+    try:
+        d = _dt.date.fromisoformat(str(session_date_str))
+    except ValueError:
+        return False
+    candidate = _dt.date(d.year, d.month, 1)
+    while candidate.weekday() >= 5 or (candidate.month == 1 and candidate.day == 1):
+        candidate += _dt.timedelta(days=1)
+    return candidate == d
 ALL_NEWS_DATES = FOMC_DATES | CPI_DATES | NFP_DATES
 
 # ── DATA CLASSES ──────────────────────────────────────────────────────────────
@@ -330,6 +599,9 @@ class FVG:
     created_bar: int
     session_date: object
     tested: bool = False
+    body_pct: float = 0.0              # impulse bar body / total range (0–1)
+    sweep: bool = False                # impulse bar wicked past setup bar extreme
+    vwap_dist_at_creation: float = 0.0 # abs(close - vwap) on impulse bar
 
 
 @dataclass
@@ -366,6 +638,58 @@ class ODPullbackState:
 
 
 @dataclass
+class PDHRetestState:
+    """Tracks the Previous Day High/Low retest state for the current session."""
+    session_date: object = None
+    pdh_break_confirmed: bool = False  # price traded >= PDH + PDH_BREAK_TICKS
+    pdl_break_confirmed: bool = False  # price traded <= PDL - PDH_BREAK_TICKS
+    pdh_fired_today: bool = False      # already took the PDH retest long today
+    pdl_fired_today: bool = False      # already took the PDL retest short today
+
+
+@dataclass
+class VWAPPullbackState:
+    """Tracks first-hour VWAP pullback state for the current session."""
+    session_date: object = None
+    session_open: float = 0.0       # price at the 9:30 CT open bar
+    drive_confirmed: bool = False   # True once first-hour VWAP move ≥ 1 ATR
+    drive_direction: str = ""       # "long" or "short"
+    trades_today: int = 0
+
+
+@dataclass
+class VPOCRevState:
+    """Tracks the running session volume-at-price profile and POC."""
+    session_date:    object = None
+    vol_at_price:    object = None   # dict {bin_price: cumulative_volume}
+    poc:             float  = 0.0    # current point of control price
+    bars_in_session: int    = 0
+    trades_today:    int    = 0
+    entry_extreme:   float  = 0.0   # extreme (high/low) of the rejection bar → structural stop
+    entry_poc:       float  = 0.0   # POC snapped at entry time → target
+
+
+@dataclass
+class SweepRevState:
+    """Tracks rolling N-bar high/low and sweep-and-reverse signals."""
+    session_date: object = None
+    recent_highs: object = None   # deque of bar highs (filled each bar)
+    recent_lows:  object = None   # deque of bar lows
+    sweep_extreme: float = 0.0    # high/low of the bar that swept the level
+    trades_today:  int   = 0
+    _pending:      str   = ""     # "long"/"short" if sweep detected on prev bar
+
+
+@dataclass
+class GapFillState:
+    """Tracks overnight-gap fade state for the current session."""
+    session_date: object = None
+    fired_today: bool = False     # only 1 gap fill entry per session
+    gap_direction: str = ""       # "long" (gap-down fade) or "short" (gap-up fade)
+    open_price: float = 0.0       # 9:30 open price (gap extreme for stop reference)
+
+
+@dataclass
 class TradeRecord:
     # Original fields
     date: pd.Timestamp
@@ -384,7 +708,7 @@ class TradeRecord:
     fvg_stop: float
 
     # V28: entry type
-    entry_type: str = "FVG"       # "FVG", "ORB", "OD_PULLBACK", "VWAP_MR", "VWAP_EXT", or "FAILED_BREAKOUT"
+    entry_type: str = "FVG"       # "FVG", "ORB", "OD_PULLBACK", "VWAP_MR", or "FAILED_BREAKOUT"
 
     # Timing
     entry_hour: int = 0
@@ -410,9 +734,6 @@ class TradeRecord:
     fvg_type: str = ""
     fvg_quality_score: int = 0
     fvg_quality_flags: str = ""
-    sweep_preceded: bool = False
-    sweep_level: str = ""
-    sweep_bars_ago: int = 0
 
     # ORB quality (0 for FVG trades)
     orb_range_ticks: float = 0.0
@@ -458,6 +779,9 @@ class TradeRecord:
     r_multiple: float = 0.0
     edge_ratio: float = 0.0
     efficiency_ratio: float = 0.0
+
+    # ADX-based bar regime at entry (independent of ATR profile)
+    bar_adx_regime: str = ""   # "trending" | "choppy" | "neutral" | "unknown"
 
     # VWAP MR diagnostics
     vwap_mr_distance_points: float = 0.0
@@ -609,9 +933,6 @@ class LiveSignalSnapshot:
     fvg_type: str = ""
     fvg_quality_score: int = 0
     fvg_quality_flags: str = ""
-    sweep_preceded: bool = False
-    sweep_level: str = ""
-    sweep_bars_ago: int = 0
     fb_level_type: str = ""
     fb_level_price: float = 0.0
     fb_sweep_distance_ticks: float = 0.0
@@ -685,8 +1006,40 @@ class RiskState:
 
 def round_turn_cost(contracts: int) -> float:
     commission = COMMISSION_PER_CONTRACT * contracts
-    slippage   = SLIPPAGE_TICKS * MNQ_TICK_VALUE * contracts * 2
+    if SLIPPAGE_SCALE_ENABLED:
+        slip_ticks = next(t for cap, t in SLIPPAGE_SCALE_TIERS if contracts <= cap)
+    else:
+        slip_ticks = SLIPPAGE_TICKS
+    slippage = slip_ticks * MNQ_TICK_VALUE * contracts * 2
     return commission + slippage
+
+
+# ── SHARED STOP MANAGEMENT (backtest engine AND live stop manager) ───────────
+
+def desired_stop_price(direction: str, entry_price: float, current_stop: float,
+                       mfe_prev_bar_pts: float) -> float:
+    """Single source of truth for post-entry stop management (breakeven + trail).
+
+    Called by the backtest engine each bar AND by the live stop manager each
+    completed 5-min bar, so live behavior mirrors the backtest by construction.
+
+    mfe_prev_bar_pts: max favorable excursion in POINTS through the PRIOR
+    completed bar — never the current/forming bar (no lookahead, live or
+    backtest).
+
+    Ratchet-only: the returned stop is never worse than current_stop.
+    """
+    stop = float(current_stop)
+    if BREAKEVEN_TRIGGER_TICKS > 0 and mfe_prev_bar_pts >= BREAKEVEN_TRIGGER_TICKS * MNQ_TICK_SIZE:
+        be = entry_price + BE_OFFSET_TICKS * MNQ_TICK_SIZE if direction == "long" \
+            else entry_price - BE_OFFSET_TICKS * MNQ_TICK_SIZE
+        stop = max(stop, be) if direction == "long" else min(stop, be)
+    if TRAIL_AFTER_MFE_ENABLED and mfe_prev_bar_pts >= TRAIL_TRIGGER_TICKS * MNQ_TICK_SIZE:
+        lock = mfe_prev_bar_pts - TRAIL_GAP_TICKS * MNQ_TICK_SIZE
+        if lock > 0:
+            tgt = entry_price + lock if direction == "long" else entry_price - lock
+            stop = max(stop, tgt) if direction == "long" else min(stop, tgt)
+    return stop
 
 
 # ── SCALING TIER ──────────────────────────────────────────────────────────────
@@ -721,17 +1074,33 @@ def get_risk_profile(row) -> dict:
     if ratio < CALM_ATR_RATIO:
         return {"regime": "calm", "contracts": 0, "target_ticks": 0, "max_trades": 0}
 
-    elif (ratio >= STRONG_ATR_RATIO
-          and row["atr"] >= 1.5
+    # ATR floor: 1.5 raw points was calibrated at ~7,600 (2019). At today's
+    # index levels a fixed 1.5 is nearly always true (gate drift). The pct
+    # toggle re-normalizes the floor by price so "enough volatility to reach
+    # the target" means the same thing across eras.
+    _atr_floor = (row["close"] * ATR_FLOOR_PCT) if ATR_FLOOR_PCT_ENABLED else 1.5
+
+    if (ratio >= STRONG_ATR_RATIO
+          and row["atr"] >= _atr_floor
           and row["adx"] >= ADX_STRONG_THRESHOLD):
         return {
             "regime": "strong",
-            "contracts": STRONG_CONTRACTS,       # 5 max
-            "target_ticks": STRONG_TARGET_TICKS, # 20
-            "max_trades": STRONG_MAX_TRADES,     # 4
+            "contracts": STRONG_CONTRACTS,
+            "target_ticks": STRONG_TARGET_TICKS,
+            "max_trades": STRONG_MAX_TRADES,
+        }
+    elif row["atr"] >= _atr_floor:
+        # Normal: volatility is sufficient but ADX is weak — trade at reduced size.
+        # Previously returned 0 contracts (curve-fitted off); restored with conservative sizing.
+        return {
+            "regime": "normal",
+            "contracts": NORMAL_CONTRACTS,
+            "target_ticks": NORMAL_TARGET_TICKS,
+            "max_trades": NORMAL_MAX_TRADES,
         }
     else:
-        return {"regime": "normal", "contracts": 0, "target_ticks": 0, "max_trades": 0}
+        # ATR too low to reach a meaningful target — genuine reason to sit out.
+        return {"regime": "calm", "contracts": 0, "target_ticks": 0, "max_trades": 0}
 
 
 # ── DATA ──────────────────────────────────────────────────────────────────────
@@ -744,7 +1113,36 @@ def _serialize_audit_value(value):
     return value
 
 
+def _fvg_ambition_max_contracts() -> int:
+    """Largest contract count the FVG score map will ever request (before the
+    risk-budget/CDR gate). This is the real ceiling, not STRONG_CONTRACTS."""
+    if FVG_SCORE_CONTRACT_MAP_ENABLED and FVG_SCORE_CONTRACT_MAP:
+        return int(max(FVG_SCORE_CONTRACT_MAP.values()))
+    return int(STRONG_CONTRACTS)
+
+
+def worst_modeled_trade_loss_usd() -> float:
+    """Worst-case single-trade stop loss (USD) under the ACTIVE FVG sizing model,
+    on a fresh day (daily P&L = 0). Costs the stop at the worst slippage tier.
+
+    - Risk-budget model: size is capped so stop risk <= HEADROOM_SAFETY_FRAC of
+      the fresh-day headroom (|BOT_DAILY_LOSS_LIMIT|). That fraction IS the worst
+      realized single-trade loss, independent of stop distance.
+    - Score-map / CDR model: the largest score-mapped size can take the full
+      STOP_TICKS structural stop, so worst loss = max_contracts x stop + costs.
+    """
+    worst_slip = max(t for _cap, t in SLIPPAGE_SCALE_TIERS)
+    if RISK_BUDGET_SIZING_ENABLED:
+        return HEADROOM_SAFETY_FRAC * abs(BOT_DAILY_LOSS_LIMIT)
+    max_ctr    = _fvg_ambition_max_contracts()
+    gross      = STOP_TICKS * MNQ_TICK_VALUE * max_ctr
+    commission = COMMISSION_PER_CONTRACT * max_ctr
+    slippage   = worst_slip * MNQ_TICK_VALUE * max_ctr * 2
+    return gross + commission + slippage
+
+
 def build_run_audit() -> Dict[str, object]:
+    sizing_model = "risk_budget" if RISK_BUDGET_SIZING_ENABLED else "score_map"
     return {
         "version": "V29",
         "generated_at": datetime.now(TIMEZONE).isoformat(),
@@ -755,7 +1153,14 @@ def build_run_audit() -> Dict[str, object]:
         "commission_per_contract_rt": COMMISSION_PER_CONTRACT,
         "slippage_ticks_per_side": SLIPPAGE_TICKS,
         "init_cash": INIT_CASH,
-        "max_contracts_cap": STRONG_CONTRACTS,
+        "sizing_model": sizing_model,
+        "fvg_score_contract_map": FVG_SCORE_CONTRACT_MAP if FVG_SCORE_CONTRACT_MAP_ENABLED else None,
+        "max_contracts_ambition": _fvg_ambition_max_contracts(),
+        "max_contracts_cap": _fvg_ambition_max_contracts(),
+        "risk_budget_sizing_enabled": RISK_BUDGET_SIZING_ENABLED,
+        "risk_budget_map": RISK_BUDGET_MAP if RISK_BUDGET_SIZING_ENABLED else None,
+        "headroom_safety_frac": HEADROOM_SAFETY_FRAC if RISK_BUDGET_SIZING_ENABLED else None,
+        "worst_modeled_trade_loss_usd": round(worst_modeled_trade_loss_usd(), 2),
         "daily_loss_limit": BOT_DAILY_LOSS_LIMIT,
         "combine_profit_target": COMBINE_PROFIT_TARGET,
         "combine_daily_loss_limit": COMBINE_DAILY_LOSS_LIMIT,
@@ -775,21 +1180,8 @@ def run_startup_audit() -> Dict[str, object]:
 
     add_check("run_mode_explicit", RUN_MODE == "BACKTEST",
               f"RUN_MODE={RUN_MODE}")
-    execution_mode_valid = (
-        (TOPSTEPX_DRY_RUN and not TOPSTEPX_ENABLE_ORDER_ROUTING and not LIVE_EXECUTION_ENABLED)
-        or (not TOPSTEPX_DRY_RUN and TOPSTEPX_ENABLE_ORDER_ROUTING and LIVE_EXECUTION_ENABLED)
-    )
-    execution_mode_label = "DRY_RUN" if TOPSTEPX_DRY_RUN else "ROUTED_PRACTICE"
-    add_check(
-        "execution_mode_explicit",
-        execution_mode_valid,
-        (
-            f"mode={execution_mode_label}, "
-            f"TOPSTEPX_DRY_RUN={TOPSTEPX_DRY_RUN}, "
-            f"TOPSTEPX_ENABLE_ORDER_ROUTING={TOPSTEPX_ENABLE_ORDER_ROUTING}, "
-            f"LIVE_EXECUTION_ENABLED={LIVE_EXECUTION_ENABLED}"
-        ),
-    )
+    add_check("live_execution_disabled", not LIVE_EXECUTION_ENABLED,
+              f"LIVE_EXECUTION_ENABLED={LIVE_EXECUTION_ENABLED}")
     add_check("data_path_exists", os.path.exists(DATA_PATH),
               DATA_PATH)
     add_check("commission_positive", COMMISSION_PER_CONTRACT > 0,
@@ -798,8 +1190,15 @@ def run_startup_audit() -> Dict[str, object]:
               f"slippage_ticks_side={SLIPPAGE_TICKS}")
     add_check("slippage_conservative", SLIPPAGE_TICKS >= 1.0,
               f"slippage_ticks_side={SLIPPAGE_TICKS}")
-    add_check("contract_cap_valid", STRONG_CONTRACTS <= SCALING_TIER_3_CONTRACTS,
-              f"max_contracts={STRONG_CONTRACTS}, scaling_cap={SCALING_TIER_3_CONTRACTS}")
+    # Real sizing safety: the worst-case single trade under the ACTIVE model must
+    # stay under the combine DLL with margin left for live gap-through slippage.
+    _worst_trade = worst_modeled_trade_loss_usd()
+    _dll_margin  = 0.80 * abs(COMBINE_DAILY_LOSS_LIMIT)  # keep 20% for live gap slippage
+    add_check("sizing_dll_safe", _worst_trade < _dll_margin,
+              f"model={'risk_budget' if RISK_BUDGET_SIZING_ENABLED else 'score_map'} "
+              f"worst_modeled_trade=${_worst_trade:.0f} must be < ${_dll_margin:.0f} "
+              f"(80% of combine DLL ${abs(COMBINE_DAILY_LOSS_LIMIT):.0f}); "
+              f"ambition_max_contracts={_fvg_ambition_max_contracts()}")
     add_check("stop_positive", STOP_TICKS > 0, f"STOP_TICKS={STOP_TICKS}")
     add_check("target_positive", STRONG_TARGET_TICKS > 0 and FB_TARGET_TICKS > 0,
               f"STRONG_TARGET_TICKS={STRONG_TARGET_TICKS}, FB_TARGET_TICKS={FB_TARGET_TICKS}")
@@ -818,6 +1217,9 @@ def run_startup_audit() -> Dict[str, object]:
     print("  Run mode audit:")
     print(f"    mode={RUN_MODE} | profile={EXECUTION_PROFILE} | live={'ON' if LIVE_EXECUTION_ENABLED else 'OFF'}")
     print(f"    costs=commission ${COMMISSION_PER_CONTRACT:.2f} RT | slippage {SLIPPAGE_TICKS:.2f} ticks/side")
+    print(f"    sizing={audit['sizing_model']} | ambition_max={audit['max_contracts_ambition']} ctr "
+          f"| worst-case trade=${audit['worst_modeled_trade_loss_usd']:.0f} vs combine DLL "
+          f"${abs(COMBINE_DAILY_LOSS_LIMIT):.0f}")
     print(f"    startup audit={audit['status']}")
 
     if failed:
@@ -879,16 +1281,58 @@ def save_run_audit(audit: Dict[str, object], data_summary: Optional[Dict[str, ob
         json.dump(payload, fh, indent=2, default=_serialize_audit_value)
     print("  Exported: v29_run_audit.json")
 
+def filter_phantom_bars(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop isolated bad-print bars whose whole range floats beyond BOTH
+    neighbours (an impossible spike that reverts next bar). See PHANTOM_BAR_*."""
+    if not PHANTOM_BAR_FILTER_ENABLED or len(df) < 3:
+        return df
+    o = df["open"].values; h = df["high"].values
+    lo = df["low"].values; c = df["close"].values
+    keep = np.ones(len(df), dtype=bool)
+    for k in range(1, len(df) - 1):
+        thr = c[k - 1] * PHANTOM_BAR_DETACH_PCT
+        floats_above = lo[k] > max(h[k - 1], h[k + 1]) + thr
+        floats_below = h[k] < min(lo[k - 1], lo[k + 1]) - thr
+        if floats_above or floats_below:
+            keep[k] = False
+    removed = int((~keep).sum())
+    if removed:
+        print(f"  Phantom-bar filter: removed {removed} detached bad-print bar(s)")
+    return df[keep]
+
+
 def fetch_data() -> pd.DataFrame:
     print("Loading data...")
     if not os.path.exists(DATA_PATH):
         raise FileNotFoundError(f"Data path does not exist: {DATA_PATH}")
-    df = load_mes_data(DATA_PATH)
+    df = load_ohlcv_csv(DATA_PATH)
+    df = filter_phantom_bars(df)
+    for ext_path in DATA_PATH_EXTENSIONS:
+        if not os.path.exists(ext_path):
+            print(f"  (extension not found, skipped: {ext_path})")
+            continue
+        ext = filter_phantom_bars(load_ohlcv_csv(ext_path))
+        before = len(df)
+        df = pd.concat([df, ext])
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        print(f"  Extended with {os.path.basename(ext_path)}: "
+              f"+{len(df)-before:,} bars -> {len(df):,} total, to {df.index[-1]}")
     print(f"Loaded {len(df):,} 5-minute bars.")
     return df
 
 
 # ── INDICATORS ────────────────────────────────────────────────────────────────
+
+def compute_choppiness_index(high, low, tr, period: int):
+    """Choppiness Index over `period` bars (0-100).
+
+    High values (~> 61.8) = lots of motion but little net progress -> ranging/chop;
+    low values (~< 38.2) = efficient, straight-line travel -> trending. `tr` is the
+    per-bar true range (so gap moves are counted consistently with ATR)."""
+    atr_sum    = tr.rolling(period).sum()
+    chop_range = (high.rolling(period).max() - low.rolling(period).min()).replace(0, np.nan)
+    return 100 * np.log10(atr_sum / chop_range) / np.log10(period)
+
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df["close"]
@@ -912,6 +1356,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["vwap"]   = df["_tpvol"] / df["_vcum"].replace(0, np.nan)
     df.drop(columns=["_date", "_tp", "_tpvol", "_vcum"], inplace=True)
 
+    # Rolling σ of (close − VWAP): used by the σ-band VWAP reversion entry.
+    close_minus_vwap = (df["close"] - df["vwap"]).fillna(0)
+    df["vwap_sigma"] = close_minus_vwap.rolling(VWAP_MR_SIGMA_PERIOD).std()
+
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
@@ -930,6 +1378,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     dx         = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan))
     df["adx"]  = dx.rolling(14).mean()
 
+    # Choppiness Index: high = squiggly/range-bound, low = straight/trending.
+    df["chop_index"] = compute_choppiness_index(high, low, tr, CHOP_INDEX_PERIOD)
+
     df["ema_spread"] = (df["ema_fast"] - df["ema_slow"]).abs() / df["close"]
     df["structure_high"] = df["high"].rolling(FVG_BOS_LOOKBACK_BARS).max().shift(1)
     df["structure_low"]  = df["low"].rolling(FVG_BOS_LOOKBACK_BARS).min().shift(1)
@@ -942,17 +1393,76 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["mtf_15m_bear"] = (ema_fast_15m < ema_slow_15m).reindex(
         df.index, method="ffill").fillna(False)
 
+    # Relative volume: this bar's volume vs its own 20-bar rolling mean.
+    # High rel_vol = institutional activity = FVG is more mechanical.
+    # Low rel_vol  = thin market = FVG is a statistical guess.
+    df["rel_vol"] = df["volume"] / df["volume"].rolling(20, min_periods=5).mean()
+
     return df
 
 
 # ── SIGNALS ───────────────────────────────────────────────────────────────────
 
+def classify_regime_adx(row) -> str:
+    """ADX-based regime: 'trending' | 'choppy' | 'neutral' | 'unknown'.
+
+    Reads the *direction* of the steps (ADX) rather than just their speed (ATR):
+      ADX >= ADX_TREND_MIN          -> trending  (owner is moving)
+      ADX <  ADX_CHOP_MAX (+ CHOP)  -> choppy    (owner is sitting)
+      in between                    -> neutral   (unsure -> stand aside)
+    """
+    adx = row.get("adx") if hasattr(row, "get") else row["adx"]
+    if adx is None or pd.isna(adx):
+        return "unknown"
+    adx = float(adx)
+    if adx >= ADX_TREND_MIN:
+        return "trending"
+    if adx < ADX_CHOP_MAX:
+        if CHOP_INDEX_ENABLED:
+            chop = row.get("chop_index") if hasattr(row, "get") else row["chop_index"]
+            if chop is None or pd.isna(chop) or float(chop) < CHOP_INDEX_RANGE_MIN:
+                return "neutral"
+        return "choppy"
+    return "neutral"
+
+
 def detect_regime(row) -> str:
+    """Regime label for the bar. Uses the ADX detector unless REGIME_USE_ADX is
+    off, in which case it falls back to the legacy volatility-only (ATR) rule."""
+    if REGIME_USE_ADX:
+        return classify_regime_adx(row)
     if pd.isna(row["atr"]) or pd.isna(row["atr_avg_20"]):
         return "unknown"
     if row["atr"] >= row["atr_avg_20"] * ATR_REGIME_MULT:
         return "trending"
     return "choppy"
+
+
+def _in_window_ct(dt_ct, start, end) -> bool:
+    """True if dt_ct's clock time is within [start, end] (CT tuples)."""
+    from datetime import time as dtime
+    t = dt_ct.time()
+    return dtime(start[0], start[1]) <= t <= dtime(end[0], end[1])
+
+
+def session_phase(dt_ct) -> str:
+    """Clock-based market rhythm:
+    'am_trend' (morning rush) | 'lunch_chop' (bench) | 'pm_trend' (afternoon push)
+    | 'other'. The clock alone tells you which game is *likely* on."""
+    if _in_window_ct(dt_ct, TREND_AM_WINDOW_CT[0], TREND_AM_WINDOW_CT[1]):
+        return "am_trend"
+    if _in_window_ct(dt_ct, MR_WINDOW_START_CT, MR_WINDOW_END_CT):
+        return "lunch_chop"
+    if _in_window_ct(dt_ct, TREND_PM_WINDOW_CT[0], TREND_PM_WINDOW_CT[1]):
+        return "pm_trend"
+    return "other"
+
+
+def is_mean_reversion_window(row, dt_ct) -> bool:
+    """Green light for bounce-catching (mean reversion):
+    the clock says lunch 'bench' AND ADX confirms the owner is actually sitting.
+    Both must agree — a busy-news lunch that keeps trending is excluded."""
+    return session_phase(dt_ct) == "lunch_chop" and classify_regime_adx(row) == "choppy"
 
 
 def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
@@ -963,8 +1473,19 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     above_vwap = df["close"]   > df["vwap"]
     below_vwap = df["close"]   < df["vwap"]
 
-    df["long_bias"]  = trend_up   & above_vwap
-    df["short_bias"] = trend_down & below_vwap
+    # Trend-bias filter mode (research toggle). "ema_and_vwap" is the shipped
+    # rule (both must agree). The looser modes are swept to test whether the
+    # AND is a frequency handbrake or load-bearing edge protection.
+    if BIAS_MODE == "ema_only":
+        df["long_bias"], df["short_bias"] = trend_up, trend_down
+    elif BIAS_MODE == "vwap_only":
+        df["long_bias"], df["short_bias"] = above_vwap, below_vwap
+    elif BIAS_MODE == "ema_or_vwap":
+        df["long_bias"]  = trend_up   | above_vwap
+        df["short_bias"] = trend_down | below_vwap
+    else:  # "ema_and_vwap" (shipped default)
+        df["long_bias"]  = trend_up   & above_vwap
+        df["short_bias"] = trend_down & below_vwap
     df["long_signal"]  = df["long_bias"]
     df["short_signal"] = df["short_bias"]
 
@@ -973,15 +1494,29 @@ def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── FVG HELPERS ───────────────────────────────────────────────────────────────
 
+def _has_fvg_overlap(target: FVG, all_fvgs: List[FVG]) -> bool:
+    """True if any OTHER active FVG of the same direction overlaps target's zone."""
+    for other in all_fvgs:
+        if other is target or other.direction != target.direction:
+            continue
+        if max(other.bottom, target.bottom) < min(other.top, target.top):
+            return True
+    return False
+
 def is_fvg_valid(fvg: FVG, current_bar: int, current_date: object,
-                 current_high: float, current_low: float) -> bool:
+                 current_high: float, current_low: float,
+                 current_close: float = None) -> bool:
     if fvg.session_date != current_date:
         return False
     if (current_bar - fvg.created_bar) > FVG_MAX_AGE_BARS:
         return False
-    if fvg.direction == "bullish" and current_low < fvg.bottom:
+    # Use close price for far-edge invalidation: a wick through the boundary
+    # does not kill the FVG — only a close through it does (orders still resting).
+    ref = current_close if current_close is not None else current_low
+    if fvg.direction == "bullish" and ref < fvg.bottom:
         return False
-    if fvg.direction == "bearish" and current_high > fvg.top:
+    ref = current_close if current_close is not None else current_high
+    if fvg.direction == "bearish" and ref > fvg.top:
         return False
     return True
 
@@ -1007,22 +1542,18 @@ def fvg_distance_to_level_ticks(fvg: FVG, level_price: float) -> float:
 
 def _is_in_session(dt_ct) -> bool:
     from datetime import time as dtime
-    if getattr(dt_ct, "weekday", lambda: 7)() >= 5:
-        return False
     t      = dt_ct.time()
-    start  = dtime(LIVE_TRADE_WINDOW_START_H, LIVE_TRADE_WINDOW_START_M)
     cutoff = dtime(HARD_FLATTEN_H, HARD_FLATTEN_M)
-    return start <= t < cutoff
+    reopen = dtime(SESSION_OPEN_H, SESSION_OPEN_M)
+    return not (cutoff <= t < reopen)
 
 
 def _is_entry_allowed(dt_ct) -> bool:
     from datetime import time as dtime
-    if getattr(dt_ct, "weekday", lambda: 7)() >= 5:
-        return False
     t      = dt_ct.time()
-    start  = dtime(LIVE_TRADE_WINDOW_START_H, LIVE_TRADE_WINDOW_START_M)
     cutoff = dtime(ENTRY_CUTOFF_H, ENTRY_CUTOFF_M)
-    return start <= t < cutoff
+    reopen = dtime(SESSION_OPEN_H, SESSION_OPEN_M)
+    return not (cutoff <= t < reopen)
 
 
 def _passes_strategy_filters(
@@ -1036,6 +1567,20 @@ def _passes_strategy_filters(
     """Apply optional post-signal filters for one-account optimization."""
     if SKIP_FOMC_ENTRIES and str(session_date) in FOMC_DATES:
         return False
+
+    # ISM Manufacturing PMI releases at 10:00 AM ET on first business day of month.
+    # Market makers pull quotes; block the single 5-min bar that opens at 10:00 AM ET.
+    if ISM_BLACKOUT_ENABLED and _is_ism_day(session_date):
+        ct_min = dt_ct.hour * 60 + dt_ct.minute
+        if 9 * 60 <= ct_min < 9 * 60 + 5:   # 9:00–9:05 CT = 10:00–10:05 ET
+            return False
+
+    if FOMC_BLACKOUT_ENABLED and str(session_date) in FOMC_DATES:
+        ct_min = dt_ct.hour * 60 + dt_ct.minute
+        bs, bm = FOMC_BLACKOUT_START_CT
+        es, em = FOMC_BLACKOUT_END_CT
+        if bs * 60 + bm <= ct_min < es * 60 + em:
+            return False
 
     if SKIP_HOUR_11_ENTRIES and dt_ct.hour == 11:
         return False
@@ -1076,6 +1621,13 @@ def _passes_strategy_filters(
         if ema_spread_pts < LONG_FILTER_MIN_EMA_SPREAD_PTS:
             return False
 
+    if FVG_LUNCH_FILTER_ENABLED and entry_type == "FVG":
+        ct_min = dt_ct.hour * 60 + dt_ct.minute
+        ls, lm = FVG_LUNCH_START_CT
+        le, lem = FVG_LUNCH_END_CT
+        if ls * 60 + lm <= ct_min < le * 60 + lem:
+            return False
+
     return True
 
 
@@ -1084,16 +1636,14 @@ def _detect_prior_sweep(
     current_bar_idx: int,
     session_date: object,
     session_level_data: dict,
-    lookback_bars: int = 10,
-    min_sweep_pts: float = 3.0,
-    max_sweep_pts: float = 8.0,
+    lookback_bars: int = FVG_BLOCK_LEVEL_SWEEP_LOOKBACK_BARS,
+    min_sweep_pts: float = FVG_BLOCK_LEVEL_SWEEP_MIN_PTS,
+    max_sweep_pts: float = FVG_BLOCK_LEVEL_SWEEP_MAX_PTS,
 ) -> dict:
-    """
-    Look back up to lookback_bars within the current session to detect if a
-    key level (PDH/PDL/globex high/low) was swept (wick crossed by
-    min_sweep_pts–max_sweep_pts NQ points) with bar closing back inside.
-    Returns {"swept": bool, "level": str, "bars_ago": int}.
-    """
+    """Look back up to lookback_bars within the current session to detect if a
+    key level (prev day high/low, globex high/low) was swept (wick crossed by
+    min_sweep_pts-max_sweep_pts NQ points) with the bar closing back inside.
+    Returns {"swept": bool, "level": str, "bars_ago": int}."""
     levels = {
         "prev_day_high": float(session_level_data.get("prev_day_high", 0.0)),
         "prev_day_low":  float(session_level_data.get("prev_day_low", 0.0)),
@@ -1129,7 +1679,6 @@ def _compute_fvg_quality_score(
     entry_fvg: Optional[FVG],
     current_bar: int,
     session_level_data: Optional[dict] = None,
-    sweep_result: Optional[dict] = None,
 ) -> dict:
     if not FVG_QUALITY_SCORE_ENABLED or entry_fvg is None:
         return {"score": 0, "flags": ""}
@@ -1214,10 +1763,6 @@ def _compute_fvg_quality_score(
             if favorable_half_ok:
                 score += 1
                 flags.append("react")
-
-    if sweep_result and sweep_result.get("swept"):
-        score += 1
-        flags.append("sweep")
 
     return {"score": score, "flags": "|".join(flags)}
 
@@ -1332,140 +1877,145 @@ def _is_vwap_mr_window(dt_ct) -> bool:
 
 
 def _build_vwap_mr_setup(prev_row, current_price: float, dt_ct, active_fvgs, current_bar: int):
-    """Return a conservative failed-FVG VWAP reversion setup dict, or None."""
+    """VWAP mean-reversion setup.  Returns a setup dict or None.
+
+    When VWAP_MR_TWO_SIDED=True  : fades both above (short) and below (long).
+    When VWAP_MR_SIGMA_BAND=True : uses a rolling σ-band for entry/stop thresholds
+                                   instead of the original fixed-points band.
+    When VWAP_MR_FVG_AS_BONUS=True: a recent failed FVG improves the label but is
+                                   no longer a hard gate (was the main filter pre-E1).
+    """
     if not VWAP_MR_ENABLED or not _is_vwap_mr_window(dt_ct):
         return None
 
     required = ["vwap", "rsi", "adx", "atr", "atr_avg_20", "close", "high", "low", "open", "regime"]
+    if VWAP_MR_SIGMA_BAND:
+        required.append("vwap_sigma")
     for field_name in required:
         if field_name not in prev_row or pd.isna(prev_row[field_name]):
             return None
 
     if prev_row["regime"] != "choppy":
         return None
-
     if prev_row["vwap"] <= 0 or prev_row["atr_avg_20"] <= 0:
         return None
 
     atr_ratio = float(prev_row["atr"] / prev_row["atr_avg_20"])
     if atr_ratio > VWAP_MR_MAX_ATR_RATIO:
         return None
-
     adx = float(prev_row["adx"])
     if adx > VWAP_MR_MAX_ADX:
         return None
 
-    vwap = float(prev_row["vwap"])
-    distance_points = current_price - vwap
-    abs_distance_points = abs(distance_points)
-    if abs_distance_points < VWAP_MR_MIN_DISTANCE_POINTS:
-        return None
-    if abs_distance_points > VWAP_MR_MAX_DISTANCE_POINTS:
-        return None
+    vwap  = float(prev_row["vwap"])
+    dist  = current_price - vwap          # positive = above VWAP, negative = below
 
-    if current_price <= vwap:
-        return None
+    # ── Distance / entry threshold check ──────────────────────────────────────
+    if VWAP_MR_SIGMA_BAND:
+        sigma = float(prev_row["vwap_sigma"])
+        if sigma <= 0 or pd.isna(sigma):
+            return None
+        entry_threshold = VWAP_MR_SIGMA_MULT * sigma
+        stop_threshold  = VWAP_MR_SIGMA_STOP_MULT * sigma
+        if abs(dist) < entry_threshold:
+            return None
+        # direction: price above VWAP = short fade; price below VWAP = long fade
+        direction = "short" if dist > 0 else "long"
+        if direction == "short" and not (VWAP_MR_TWO_SIDED or dist > 0):
+            return None
+        if direction == "long" and not VWAP_MR_TWO_SIDED:
+            return None
+    else:
+        abs_dist_pts = abs(dist)
+        if abs_dist_pts < VWAP_MR_MIN_DISTANCE_POINTS:
+            return None
+        if abs_dist_pts > VWAP_MR_MAX_DISTANCE_POINTS:
+            return None
+        direction = "short" if dist > 0 else "long"
+        if direction == "long" and not VWAP_MR_TWO_SIDED:
+            return None
 
-    recent_bullish_fvg = None
+    # ── Optional failed-FVG bonus / legacy gate ────────────────────────────────
+    fvg_direction_sought = "bullish" if direction == "short" else "bearish"
+    recent_failed_fvg = None
     for fvg in reversed(active_fvgs):
-        if fvg.direction != "bullish":
+        if fvg.direction != fvg_direction_sought:
             continue
         age = current_bar - fvg.created_bar
         if age <= VWAP_MR_FAILED_FVG_MAX_AGE:
-            recent_bullish_fvg = fvg
+            recent_failed_fvg = fvg
             break
-    if recent_bullish_fvg is None:
-        return None
+    if not VWAP_MR_FVG_AS_BONUS and recent_failed_fvg is None:
+        return None   # legacy gate: require a failed FVG
 
+    # ── RSI confirmation (short needs overbought; long needs oversold inverse) ─
     rsi = float(prev_row["rsi"])
-    if rsi < VWAP_MR_RSI_SHORT_MIN:
+    if direction == "short" and rsi < VWAP_MR_RSI_SHORT_MIN:
+        return None
+    if direction == "long" and rsi > (100 - VWAP_MR_RSI_SHORT_MIN):
         return None
 
-    prev_open = float(prev_row["open"])
+    # ── Rejection-bar confirmation ─────────────────────────────────────────────
+    prev_open  = float(prev_row["open"])
     prev_close = float(prev_row["close"])
-    prev_high = float(prev_row["high"])
-    prev_low = float(prev_row["low"])
-    body = abs(prev_close - prev_open)
-    upper_wick = prev_high - max(prev_open, prev_close)
+    prev_high  = float(prev_row["high"])
+    prev_low   = float(prev_row["low"])
+    body       = abs(prev_close - prev_open)
 
-    bearish_rejection = (
-        prev_close < prev_open
-        and upper_wick >= max(body, MNQ_TICK_SIZE)
-    )
-    breakdown_confirmed = current_price < prev_low
-    if not (bearish_rejection or breakdown_confirmed):
-        return None
+    if direction == "short":
+        upper_wick          = prev_high - max(prev_open, prev_close)
+        bearish_rejection   = prev_close < prev_open and upper_wick >= max(body, MNQ_TICK_SIZE)
+        breakdown_confirmed = current_price < prev_low
+        if not (bearish_rejection or breakdown_confirmed):
+            return None
+    else:
+        lower_wick         = min(prev_open, prev_close) - prev_low
+        bullish_rejection  = prev_close > prev_open and lower_wick >= max(body, MNQ_TICK_SIZE)
+        breakout_confirmed = current_price > prev_high
+        if not (bullish_rejection or breakout_confirmed):
+            return None
 
-    raw_target_ticks = int((current_price - vwap) / MNQ_TICK_SIZE) - VWAP_MR_TARGET_BUFFER_TICKS
+    # ── Target and stop ───────────────────────────────────────────────────────
+    raw_target_ticks = int(abs(dist) / MNQ_TICK_SIZE) - VWAP_MR_TARGET_BUFFER_TICKS
     if raw_target_ticks < VWAP_MR_MIN_TARGET_TICKS:
         return None
     target_ticks = min(raw_target_ticks, VWAP_MR_MAX_TARGET_TICKS)
-    stop_price = prev_high + MNQ_TICK_SIZE
-    stop_price = min(stop_price, current_price + (VWAP_MR_STOP_TICKS * MNQ_TICK_SIZE))
-    if stop_price <= current_price:
-        return None
+
+    if direction == "short":
+        if VWAP_MR_SIGMA_BAND:
+            stop_price = vwap + stop_threshold
+        else:
+            stop_price = prev_high + MNQ_TICK_SIZE
+            stop_price = min(stop_price, current_price + VWAP_MR_STOP_TICKS * MNQ_TICK_SIZE)
+        if stop_price <= current_price:
+            return None
+    else:
+        if VWAP_MR_SIGMA_BAND:
+            stop_price = vwap - stop_threshold
+        else:
+            stop_price = prev_low - MNQ_TICK_SIZE
+            stop_price = max(stop_price, current_price - VWAP_MR_STOP_TICKS * MNQ_TICK_SIZE)
+        if stop_price >= current_price:
+            return None
 
     return {
-        "direction": "short",
-        "target_ticks": target_ticks,
-        "stop_price": stop_price,
-        "regime": "mean_revert",
-        "distance_points": distance_points,
-        "rsi": rsi,
-        "failed_fvg_age": current_bar - recent_bullish_fvg.created_bar,
+        "direction":       direction,
+        "target_ticks":    target_ticks,
+        "stop_price":      stop_price,
+        "regime":          "mean_revert",
+        "distance_points": dist,
+        "rsi":             rsi,
+        "failed_fvg_age":  (current_bar - recent_failed_fvg.created_bar)
+                           if recent_failed_fvg else -1,
     }
 
-    return None
 
-
-def _is_vwap_ext_window(dt_ct) -> bool:
+def _is_vwap_pb_window(dt_ct) -> bool:
     from datetime import time as dtime
     t     = dt_ct.time()
-    start = dtime(VWAP_EXT_WINDOW_START[0], VWAP_EXT_WINDOW_START[1])
-    end   = dtime(VWAP_EXT_WINDOW_END[0],   VWAP_EXT_WINDOW_END[1])
+    start = dtime(VWAP_PB_WINDOW_START[0], VWAP_PB_WINDOW_START[1])
+    end   = dtime(VWAP_PB_WINDOW_END[0],   VWAP_PB_WINDOW_END[1])
     return start <= t <= end
-
-
-def _build_vwap_ext_setup(prev_row, bar_2, current_price: float, dt_ct):
-    """Module E: short when price is >= 1.2x ATR above VWAP in the PM session,
-    with 2-bar bearish momentum confirmation. ATR regime gate is enforced by
-    the caller (profile["contracts"] > 0 required before calling)."""
-    if not VWAP_EXT_ENABLED or not _is_vwap_ext_window(dt_ct):
-        return None
-
-    for field_name in ("vwap", "atr", "open", "close"):
-        if field_name not in prev_row or pd.isna(prev_row[field_name]):
-            return None
-        if field_name in ("open", "close") and (field_name not in bar_2 or pd.isna(bar_2[field_name])):
-            return None
-
-    vwap = float(prev_row["vwap"])
-    atr  = float(prev_row["atr"])
-    if vwap <= 0 or atr <= 0:
-        return None
-
-    # Price must be extended >= 1.2x ATR above VWAP
-    vwap_distance = current_price - vwap
-    if vwap_distance < VWAP_EXT_MIN_ATR_MULT * atr:
-        return None
-
-    # 2-bar bearish momentum: both prior bars closed below their opens
-    if not (float(prev_row["close"]) < float(prev_row["open"])
-            and float(bar_2["close"]) < float(bar_2["open"])):
-        return None
-
-    stop_ticks   = max(1, int(VWAP_EXT_STOP_ATR_MULT  * atr / MNQ_TICK_SIZE))
-    target_ticks = max(1, int(VWAP_EXT_TARGET_ATR_MULT * atr / MNQ_TICK_SIZE))
-    stop_price   = current_price + stop_ticks * MNQ_TICK_SIZE
-
-    return {
-        "direction":      "short",
-        "target_ticks":   target_ticks,
-        "stop_price":     stop_price,
-        "vwap":           vwap,
-        "atr":            atr,
-        "vwap_distance":  vwap_distance,
-    }
 
 
 def _is_od_drive_bar(dt_ct) -> bool:
@@ -1855,11 +2405,49 @@ def compute_session_levels(df: pd.DataFrame) -> Dict:
 
 # ── BACKTEST ENGINE ───────────────────────────────────────────────────────────
 
+def compute_htf_fvgs(df: pd.DataFrame) -> List[Dict]:
+    """
+    Resample RTH 5-min bars to HTF_FVG_MINS bars and detect 3-bar FVGs.
+    Returns a list of zone dicts sorted by ts_active (when the zone first becomes tradeable).
+    Only emits zones where all 3 HTF bars are within the same calendar session.
+    """
+    td_htf = pd.Timedelta(minutes=HTF_FVG_MINS)
+    df_htf = df.resample(f"{HTF_FVG_MINS}min", closed="left", label="left").agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low",  "min"),
+        close=("close", "last"),
+    ).dropna(subset=["open"])
+
+    zones: List[Dict] = []
+    for i in range(2, len(df_htf)):
+        ts_a = df_htf.index[i - 2]
+        ts_c = df_htf.index[i]
+        # Skip if the 3-bar window crosses an overnight gap (different session dates)
+        if ts_a.date() != ts_c.date():
+            continue
+        a = df_htf.iloc[i - 2]
+        c = df_htf.iloc[i]
+        ts_active  = ts_c + td_htf        # first 5-min bar that can trade this zone
+        ts_expires = ts_active + td_htf * HTF_FVG_MAX_AGE_BARS
+
+        if c["low"] > a["high"] and (c["low"] - a["high"]) >= HTF_FVG_MIN_SIZE_PTS:
+            zones.append({"ts_active": ts_active, "ts_expires": ts_expires,
+                          "top": c["low"], "bottom": a["high"], "direction": "long"})
+        elif c["high"] < a["low"] and (a["low"] - c["high"]) >= HTF_FVG_MIN_SIZE_PTS:
+            zones.append({"ts_active": ts_active, "ts_expires": ts_expires,
+                          "top": a["low"], "bottom": c["high"], "direction": "short"})
+    return sorted(zones, key=lambda z: z["ts_active"])
+
+
 def run_backtest(
     df: pd.DataFrame,
     session_levels: Dict,
     live_signal_sink: Optional[Dict[str, object]] = None,
 ) -> Tuple[pd.DataFrame, List[TradeRecord], List[DailyRecord], RiskState]:
+
+    import random as _random
+    _miss_rng = _random.Random(MISS_FILL_SEED)  # missed-fill stress RNG (inert unless MISS_FILL_PROB>0)
 
     state   = RiskState()
     trades:        List[TradeRecord] = []
@@ -1876,16 +2464,31 @@ def run_backtest(
     entry_regime  = "unknown"
     entry_type    = "FVG"
     entry_bar_idx = 0
-    partial_taken      = False   # has partial profit fired for current trade?
-    partial_pnl_banked = 0.0    # P&L locked in from partial exit
+    partial_taken        = False   # has partial profit fired for current trade?
+    partial_pnl_banked   = 0.0    # P&L locked in from partial exit
+    breakeven_triggered  = False   # has stop been moved to entry price?
 
     trade_mfe = 0.0
     trade_mae = 0.0
+    trade_mfe_prev_bar = 0.0   # MFE through the PRIOR completed bar (breakeven uses this, no lookahead)
 
     current_day   = None
     active_fvgs:  List[FVG] = []
+
+    # HTF FVG state
+    _htf_zones_all:   List[Dict] = compute_htf_fvgs(df) if HTF_FVG_ENABLED else []
+    _htf_zones_ptr:   int        = 0
+    active_htf_fvgs:  List[Dict] = []
+    htffvg_today:     int        = 0
+    _htffvg_zone:     object     = None   # zone that triggered the current entry
+
     orb           = ORBState()
     od            = ODPullbackState()
+    pdhr          = PDHRetestState()
+    vwap_pb       = VWAPPullbackState()
+    sweeprev      = SweepRevState()
+    vpocrev       = VPOCRevState()
+    gapfill       = GapFillState()
 
     trade_number_overall  = 0
     trade_number_today    = 0
@@ -1914,42 +2517,24 @@ def run_backtest(
         session_date = date_ct.date()
         sl = session_levels.get(session_date, {})
 
+        # Last bar of this RTH session? (next bar is a new day, or end of data).
+        # Used to force an EOD flatten at THIS bar's close and to block entries
+        # that would have no intraday bar left to exit on (prevents overnight holds).
+        if i + 1 < len(df):
+            _nd = df.index[i + 1]
+            _nd_ct = _nd.astimezone(TIMEZONE) if (hasattr(_nd, "tzinfo") and _nd.tzinfo is not None) else TIMEZONE.localize(_nd)
+            is_last_session_bar = (_nd_ct.date() != session_date)
+        else:
+            # End of data is NOT a known session boundary. Critically, in LIVE
+            # signal generation the current bar is always the final bar of the
+            # window — flagging it as last-session-bar would block entry
+            # evaluation there and silence live signals entirely (the sink at
+            # the bottom of run_backtest only emits when in_trade on the final
+            # bar). Only an OBSERVED date change blocks entries / EOD-flattens.
+            is_last_session_bar = False
+
         # ── Day rollover ──────────────────────────────────────────────────────
         if current_day != session_date:
-            # Close any position carried into a new session at the prior bar's close
-            if in_trade and current_day is not None:
-                exit_price    = float(prev_row["close"])
-                pnl_pts       = (exit_price - entry_price) if direction == "long" else (entry_price - exit_price)
-                gross_pnl_usd = pnl_pts * MNQ_POINT_VALUE * contracts
-                costs_usd     = round_turn_cost(contracts)
-                pnl_usd       = gross_pnl_usd - costs_usd
-                pnl_pct       = pnl_pts / entry_price
-                won           = pnl_usd > 0
-                cash         += pnl_usd
-                state.update(won, pnl_pct, pnl_usd)
-                if cash > day_peak_cash:   day_peak_cash   = cash
-                if cash < day_trough_cash: day_trough_cash = cash
-                tr = _build_trade_record(
-                    entry_snapshot=entry_snapshot,
-                    date=df.index[i - 1],
-                    direction=direction,
-                    entry_price=entry_price, exit_price=exit_price,
-                    pnl_pts=pnl_pts, gross_pnl_usd=gross_pnl_usd,
-                    costs_usd=costs_usd, pnl_usd=pnl_usd,
-                    pnl_pct=pnl_pct, won=won, cash=cash,
-                    contracts=contracts, entry_regime=entry_regime,
-                    exit_reason="eod_flatten", fvg_stop=fvg_stop,
-                    trade_mae=trade_mae, trade_mfe=trade_mfe,
-                    bars_to_exit=(i - 1) - entry_bar_idx, state=state,
-                )
-                trades.append(tr)
-                day_trades_list.append(tr)
-                if won: consecutive_wins += 1; consecutive_losses = 0
-                else:   consecutive_losses += 1; consecutive_wins = 0
-                in_trade  = False
-                trade_mfe = 0.0
-                trade_mae = 0.0
-
             if current_day is not None:
                 state.end_of_day(cash)
                 sl = session_levels.get(current_day, {})
@@ -1971,10 +2556,20 @@ def run_backtest(
             day_trough_cash   = cash
             day_trades_list   = []
 
-            # Reset ORB for new session
-            orb = ORBState(session_date=session_date)
-            od  = ODPullbackState(session_date=session_date)
+            # Reset per-session state objects
+            orb      = ORBState(session_date=session_date)
+            od       = ODPullbackState(session_date=session_date)
+            pdhr     = PDHRetestState(session_date=session_date)
+            vwap_pb  = VWAPPullbackState(session_date=session_date)
+            sweeprev = SweepRevState(
+                session_date=session_date,
+                recent_highs=deque(maxlen=SWEEP_REV_LOOKBACK_BARS),
+                recent_lows =deque(maxlen=SWEEP_REV_LOOKBACK_BARS),
+            )
+            vpocrev  = VPOCRevState(session_date=session_date, vol_at_price={})
+            gapfill  = GapFillState(session_date=session_date)
             fb_levels_seen_today = set()
+            htffvg_today = 0
 
             # Clear FVGs from previous session
             active_fvgs = [f for f in active_fvgs if f.session_date == session_date]
@@ -2004,6 +2599,10 @@ def run_backtest(
 
         # ── MAE/MFE update ────────────────────────────────────────────────────
         if in_trade:
+            # Snapshot MFE as of the PRIOR completed bar BEFORE folding in this
+            # bar's excursion, so breakeven can only react to information that
+            # was actually available at this bar's open (no intrabar lookahead).
+            trade_mfe_prev_bar = trade_mfe
             if direction == "long":
                 favorable   = row["high"] - entry_price
                 unfavorable = entry_price - row["low"]
@@ -2029,6 +2628,87 @@ def run_backtest(
                 orb.range_ticks = (orb.high - orb.low) / MNQ_TICK_SIZE
                 orb.formed = True
 
+        # ── SWEEP REV: maintain rolling N-bar high/low every bar ────────────
+        # Done BEFORE the entry check so we can detect a sweep on prev_row.
+        if SWEEP_REV_ENABLED and sweeprev.session_date == session_date:
+            if sweeprev.recent_highs is not None:
+                # Detect sweep on the bar that just completed (prev_row)
+                if len(sweeprev.recent_highs) == SWEEP_REV_LOOKBACK_BARS:
+                    _sr_n_high = max(sweeprev.recent_highs)
+                    _sr_n_low  = min(sweeprev.recent_lows)
+                    _sr_ph = float(prev_row["high"])
+                    _sr_pl = float(prev_row["low"])
+                    _sr_pc = float(prev_row["close"])
+                    # Sweep UP + closed back below → mark short opportunity
+                    if _sr_ph > _sr_n_high:
+                        _sr_dist = (_sr_ph - _sr_n_high) / MNQ_TICK_SIZE
+                        if 0 < _sr_dist <= SWEEP_REV_SWEEP_TICKS and _sr_pc <= _sr_n_high:
+                            sweeprev.sweep_extreme = _sr_ph
+                            sweeprev._pending = "short"
+                        else:
+                            sweeprev._pending = ""
+                    # Sweep DOWN + closed back above → mark long opportunity
+                    elif _sr_pl < _sr_n_low:
+                        _sr_dist = (_sr_n_low - _sr_pl) / MNQ_TICK_SIZE
+                        if 0 < _sr_dist <= SWEEP_REV_SWEEP_TICKS and _sr_pc >= _sr_n_low:
+                            sweeprev.sweep_extreme = _sr_pl
+                            sweeprev._pending = "long"
+                        else:
+                            sweeprev._pending = ""
+                    else:
+                        sweeprev._pending = ""
+                else:
+                    sweeprev._pending = ""
+                # Update deque with prev_row AFTER detection
+                sweeprev.recent_highs.append(float(prev_row["high"]))
+                sweeprev.recent_lows.append(float(prev_row["low"]))
+
+        # ── VOLUME POC: update running profile each bar ───────────────────────
+        # Accumulate volume at the bar's midpoint (binned to VPOC_BIN_POINTS).
+        # POC = bin with max cumulative volume → institutional gravity level.
+        if VPOC_ENABLED and vpocrev.session_date == session_date and vpocrev.vol_at_price is not None:
+            _vp_mid  = (float(prev_row["high"]) + float(prev_row["low"])) / 2.0
+            _vp_bin  = round(_vp_mid / VPOC_BIN_POINTS) * VPOC_BIN_POINTS
+            vpocrev.vol_at_price[_vp_bin] = vpocrev.vol_at_price.get(_vp_bin, 0.0) + float(prev_row["volume"])
+            vpocrev.bars_in_session += 1
+            if vpocrev.vol_at_price:
+                vpocrev.poc = max(vpocrev.vol_at_price, key=vpocrev.vol_at_price.get)
+
+        # ── VWAP PB: capture session open (9:30 CT first bar) ───────────────
+        if (VWAP_PB_ENABLED
+                and vwap_pb.session_date == session_date
+                and vwap_pb.session_open == 0.0
+                and date_ct.hour == 9 and date_ct.minute == 30):
+            vwap_pb.session_open = float(row["open"])
+
+        # ── VWAP PB: confirm first-hour drive at exactly 10:30 CT ────────────
+        if (VWAP_PB_ENABLED
+                and not vwap_pb.drive_confirmed
+                and vwap_pb.session_date == session_date
+                and vwap_pb.session_open > 0
+                and date_ct.hour == 10 and date_ct.minute == 30):
+            _pb_vwap = float(prev_row["vwap"]) if not pd.isna(prev_row["vwap"]) else 0.0
+            _pb_atr  = float(prev_row["atr"])  if not pd.isna(prev_row["atr"])  else 0.0
+            if _pb_vwap > 0 and _pb_atr > 0:
+                move = _pb_vwap - vwap_pb.session_open
+                if move >= VWAP_PB_MIN_MOVE_ATR * _pb_atr:
+                    vwap_pb.drive_confirmed  = True
+                    vwap_pb.drive_direction  = "long"
+                elif move <= -VWAP_PB_MIN_MOVE_ATR * _pb_atr:
+                    vwap_pb.drive_confirmed  = True
+                    vwap_pb.drive_direction  = "short"
+
+        # ── PDH/PDL break detection (runs every bar, outside in_trade gate) ──
+        if PDH_RETEST_ENABLED and pdhr.session_date == session_date:
+            _pdh_ref = sl.get("prev_day_high", 0.0)
+            _pdl_ref = sl.get("prev_day_low", 0.0)
+            if _pdh_ref > 0 and not pdhr.pdh_break_confirmed:
+                if float(prev_row["high"]) > _pdh_ref + PDH_BREAK_TICKS * MNQ_TICK_SIZE:
+                    pdhr.pdh_break_confirmed = True
+            if _pdl_ref > 0 and not pdhr.pdl_break_confirmed:
+                if float(prev_row["low"]) < _pdl_ref - PDH_BREAK_TICKS * MNQ_TICK_SIZE:
+                    pdhr.pdl_break_confirmed = True
+
         # Build opening-drive state from the first three 5m bars after 9:30
         if od.session_date == session_date and _is_od_drive_bar(date_ct):
             if od.bars_seen == 0:
@@ -2049,35 +2729,55 @@ def run_backtest(
                 and _is_od_entry_window(date_ct)):
             _update_od_pullback_state(od, prev_row)
 
+        # ── HTF FVG: activate zones whose ts_active <= current bar ───────────
+        _cur_ts = row.name
+        while (_htf_zones_ptr < len(_htf_zones_all)
+               and _htf_zones_all[_htf_zones_ptr]["ts_active"] <= _cur_ts):
+            active_htf_fvgs.append(_htf_zones_all[_htf_zones_ptr])
+            _htf_zones_ptr += 1
+        active_htf_fvgs = [z for z in active_htf_fvgs if z["ts_expires"] > _cur_ts]
+
         # ── Detect new FVG ────────────────────────────────────────────────────
         fvg_size_min = FVG_MIN_SIZE_TICKS * MNQ_TICK_SIZE
 
         if bar_2["high"] < row["low"]:
             gap_size = row["low"] - bar_2["high"]
             if gap_size >= fvg_size_min:
+                _imp_range = prev_row["high"] - prev_row["low"]
+                _imp_body  = max(0.0, float(prev_row["close"]) - float(prev_row["open"]))
+                _vwap_val  = float(prev_row.get("vwap", 0.0) or 0.0)
                 active_fvgs.append(FVG(
                     direction="bullish",
                     top=row["low"],
                     bottom=bar_2["high"],
                     created_bar=i,
                     session_date=session_date,
+                    body_pct=(_imp_body / _imp_range) if _imp_range > 0 else 0.0,
+                    sweep=bool(prev_row["low"] < bar_2["low"]),
+                    vwap_dist_at_creation=abs(float(prev_row["close"]) - _vwap_val) if _vwap_val > 0 else 0.0,
                 ))
 
         if bar_2["low"] > row["high"]:
             gap_size = bar_2["low"] - row["high"]
             if gap_size >= fvg_size_min:
+                _imp_range = prev_row["high"] - prev_row["low"]
+                _imp_body  = max(0.0, float(prev_row["open"]) - float(prev_row["close"]))
+                _vwap_val  = float(prev_row.get("vwap", 0.0) or 0.0)
                 active_fvgs.append(FVG(
                     direction="bearish",
                     top=bar_2["low"],
                     bottom=row["high"],
                     created_bar=i,
                     session_date=session_date,
+                    body_pct=(_imp_body / _imp_range) if _imp_range > 0 else 0.0,
+                    sweep=bool(prev_row["high"] > bar_2["high"]),
+                    vwap_dist_at_creation=abs(float(prev_row["close"]) - _vwap_val) if _vwap_val > 0 else 0.0,
                 ))
 
         # ── Prune stale FVGs ──────────────────────────────────────────────────
         active_fvgs = [
             f for f in active_fvgs
-            if is_fvg_valid(f, i, session_date, row["high"], row["low"])
+            if is_fvg_valid(f, i, session_date, row["high"], row["low"], row["close"])
         ]
 
         # ── Hard flatten outside session ──────────────────────────────────────
@@ -2114,14 +2814,24 @@ def run_backtest(
             if won: consecutive_wins += 1;  consecutive_losses = 0
             else:   consecutive_losses += 1; consecutive_wins = 0
 
-            in_trade           = False
-            trade_mfe          = 0.0
-            trade_mae          = 0.0
-            partial_taken      = False
-            partial_pnl_banked = 0.0
+            in_trade             = False
+            trade_mfe            = 0.0
+            trade_mae            = 0.0
+            partial_taken        = False
+            partial_pnl_banked   = 0.0
+            breakeven_triggered  = False
 
         # ── Exit logic ────────────────────────────────────────────────────────
         if in_trade:
+            # Breakeven stop: once trade is +BREAKEVEN_TRIGGER_TICKS in profit,
+            # move stop to entry price. Prevents a winner from becoming a loser.
+            # Uses prior-bar MFE (not the current bar's high/low) so a stop that
+            # would only be reached intrabar cannot be "moved to breakeven" using
+            # a favorable excursion the strategy could not have seen yet.
+            # Breakeven + trail via the SHARED stop-management function (same
+            # code path the live stop manager uses -> parity by construction).
+            fvg_stop = desired_stop_price(direction, entry_price, fvg_stop, trade_mfe_prev_bar)
+
             target_pts  = target_ticks * MNQ_TICK_SIZE
             partial_pts = PARTIAL_PROFIT_TICKS * MNQ_TICK_SIZE
             if direction == "long":
@@ -2130,6 +2840,9 @@ def run_backtest(
                 partial_px    = entry_price + partial_pts
                 hit_stop      = row["low"]  <= stop_px
                 hit_target    = row["high"] >= target_px
+                # Gap-through: if the bar opened below the stop, fill at the open.
+                stop_fill_px  = min(row["open"], stop_px) if GAP_THROUGH_STOPS_ENABLED else stop_px
+                stop_fill_px -= STOP_EXTRA_SLIP_TICKS * MNQ_TICK_SIZE  # stress: worse long-stop fill
                 hit_partial   = (PARTIAL_PROFIT_ENABLED
                                  and not partial_taken
                                  and contracts > 1
@@ -2140,6 +2853,9 @@ def run_backtest(
                 partial_px    = entry_price - partial_pts
                 hit_stop      = row["high"] >= stop_px
                 hit_target    = row["low"]  <= target_px
+                # Gap-through: if the bar opened above the stop, fill at the open.
+                stop_fill_px  = max(row["open"], stop_px) if GAP_THROUGH_STOPS_ENABLED else stop_px
+                stop_fill_px += STOP_EXTRA_SLIP_TICKS * MNQ_TICK_SIZE  # stress: worse short-stop fill
                 hit_partial   = (PARTIAL_PROFIT_ENABLED
                                  and not partial_taken
                                  and contracts > 1
@@ -2165,20 +2881,38 @@ def run_backtest(
                 if cash > day_peak_cash:   day_peak_cash   = cash
                 if cash < day_trough_cash: day_trough_cash = cash
 
-            if hit_target:
+            # Conservative intrabar resolution: when both stop and target are touched
+            # in the same bar, assume stop was hit first. Prevents the backtest from
+            # favorably assuming targets fill before stops on volatile bars.
+            if hit_stop and hit_target:
+                exit_price  = stop_fill_px
+                exit_reason = "stop"
+            elif hit_target:
                 exit_price  = target_px
                 exit_reason = "target"
             elif hit_stop:
-                exit_price  = stop_px
+                exit_price  = stop_fill_px
                 exit_reason = "stop"
-            elif (entry_type == "VWAP_EXT"
-                  and (i - entry_bar_idx) >= VWAP_EXT_MAX_BARS):
-                exit_price  = row["open"]
-                exit_reason = "time_exit"
             elif ((direction == "long"  and not prev_row["long_signal"]) or
                   (direction == "short" and not prev_row["short_signal"])):
                 exit_price  = row["open"]
                 exit_reason = "signal_flip"
+            elif (TIME_STOP_ENABLED
+                  and (i - entry_bar_idx) >= TIME_STOP_BARS
+                  and trade_mfe_prev_bar < TIME_STOP_MIN_MFE_TICKS * MNQ_TICK_SIZE):
+                # Dead trade: N bars in and it never moved. Free the single
+                # position slot for the next setup instead of waiting for the
+                # stop. Decision uses prior-bar MFE only; fill at current open.
+                exit_price  = row["open"]
+                exit_reason = "time_stop"
+
+            # EOD flatten: if still in a trade on the last bar of the session,
+            # close at THIS bar's close. Prevents holding overnight and eating
+            # the next session's opening gap (the flatten window otherwise never
+            # intersects RTH-filtered data, which ends before HARD_FLATTEN time).
+            if exit_price is None and is_last_session_bar:
+                exit_price  = row["close"]
+                exit_reason = "eod_flatten"
 
             if exit_price is not None:
                 pnl_pts       = ((exit_price - entry_price) if direction == "long"
@@ -2213,15 +2947,22 @@ def run_backtest(
                 if won: consecutive_wins += 1;  consecutive_losses = 0
                 else:   consecutive_losses += 1; consecutive_wins = 0
 
-                in_trade           = False
-                trade_mfe          = 0.0
-                trade_mae          = 0.0
-                partial_taken      = False
-                partial_pnl_banked = 0.0
+                in_trade             = False
+                trade_mfe            = 0.0
+                trade_mae            = 0.0
+                partial_taken        = False
+                partial_pnl_banked   = 0.0
+                breakeven_triggered  = False
 
         # ── Entry logic ───────────────────────────────────────────────────────
         if not in_trade:
             if not _is_entry_allowed(date_ct):
+                portfolio.append(cash)
+                continue
+
+            # No entries on the last bar of the session — there is no further
+            # intraday bar to exit on, which would force an overnight hold.
+            if is_last_session_bar:
                 portfolio.append(cash)
                 continue
 
@@ -2237,9 +2978,42 @@ def run_backtest(
             entry_dir      = None
             this_entry_type = None
             vwap_mr_setup  = None
-            vwap_ext_setup = None
             od_setup       = None
             fb_setup       = None
+
+            # ── E3: Regime router ─────────────────────────────────────────────
+            # When REGIME_ROUTER_ENABLED=True, decide which strategy stack is
+            # allowed based on the current regime + session clock:
+            #   trending session  →  FVG + ORB only (directional stack)
+            #   choppy+MR window  →  VWAP_MR + FAILED_BREAKOUT only (fade stack)
+            #   neutral           →  stand aside (no entries)
+            # When disabled, all enabled modules compete as before (legacy).
+            if REGIME_ROUTER_ENABLED:
+                _bar_regime  = classify_regime_adx(prev_row)
+                _bar_phase   = session_phase(date_ct)
+                _in_mr_win   = is_mean_reversion_window(prev_row, date_ct)
+                _in_trend_win = _bar_phase in ("am_trend", "pm_trend")
+                if _bar_regime == "neutral":
+                    # E5 neutral zone: stand aside regardless of NEUTRAL_NO_TRADE flag
+                    portfolio.append(cash)
+                    continue
+                if _bar_regime == "trending" or _in_trend_win:
+                    _router_allow_trend = True
+                    _router_allow_mr    = False
+                elif _in_mr_win:
+                    _router_allow_trend = False
+                    _router_allow_mr    = True
+                else:
+                    # choppy but outside MR window — stand aside
+                    portfolio.append(cash)
+                    continue
+            elif NEUTRAL_NO_TRADE and classify_regime_adx(prev_row) == "neutral":
+                # E5 standalone: neutral zone no-trade without full router
+                portfolio.append(cash)
+                continue
+            else:
+                _router_allow_trend = True
+                _router_allow_mr    = True
 
             # Pre-compute regime profile for regime-gated modules such as FVG.
             # ORB sizing may still reference the strong regime, but ORB entry itself
@@ -2249,8 +3023,11 @@ def run_backtest(
 
             # ── ORB ENTRY (priority, independent of ATR regime) ──────────────
             # ORB fires BEFORE regime gate — has its own quality filters
-            # (VWAP confirmation + breakout confirmation)
-            if (orb.formed
+            # (VWAP confirmation + breakout confirmation).
+            # Gated by ORB_ENABLED (currently False). See the ORB SETTINGS block.
+            if (ORB_ENABLED
+                    and _router_allow_trend
+                    and orb.formed
                     and not orb.fired_today
                     and _is_orb_window(date_ct)
                     and orb.range_ticks <= ORB_MAX_RANGE_TICKS
@@ -2275,6 +3052,7 @@ def run_backtest(
 
             # ── Opening-drive first pullback (independent morning continuation module) ──
             if (entry_dir is None
+                    and _router_allow_mr
                     and FAILED_BREAKOUT_ENABLED
                     and state.daily_trades < STRONG_MAX_TRADES):
                 fb_trades_today = sum(1 for t in day_trades_list if t.entry_type == "FAILED_BREAKOUT")
@@ -2311,6 +3089,7 @@ def run_backtest(
 
             if (entry_dir is None
                     and OD_PULLBACK_ENABLED
+                    and _router_allow_trend
                     and state.daily_trades < STRONG_MAX_TRADES):
                 od_trades_today = sum(1 for t in day_trades_list if t.entry_type == "OD_PULLBACK")
                 if od_trades_today < OD_MAX_TRADES_PER_DAY:
@@ -2326,14 +3105,169 @@ def run_backtest(
                         entry_dir = od_setup["direction"]
                         this_entry_type = "OD_PULLBACK"
 
+            # ── PDH/PDL RETEST ENTRY ─────────────────────────────────────────────
+            # Fires when price breaks cleanly through a previous day level then
+            # pulls back to test it. Uses the existing daily bias filter.
+            if (entry_dir is None
+                    and PDH_RETEST_ENABLED
+                    and _router_allow_trend
+                    and state.daily_trades < STRONG_MAX_TRADES):
+                _pdh_e = sl.get("prev_day_high", 0.0)
+                _pdl_e = sl.get("prev_day_low", 0.0)
+                if (pdhr.pdh_break_confirmed
+                        and not pdhr.pdh_fired_today
+                        and prev_row["long_bias"]
+                        and _pdh_e > 0
+                        and _pdh_e <= current_price <= _pdh_e + PDH_ENTRY_ZONE_TICKS * MNQ_TICK_SIZE):
+                    entry_dir       = "long"
+                    this_entry_type = "PDH_RETEST"
+                elif (pdhr.pdl_break_confirmed
+                        and not pdhr.pdl_fired_today
+                        and prev_row["short_bias"]
+                        and _pdl_e > 0
+                        and _pdl_e - PDH_ENTRY_ZONE_TICKS * MNQ_TICK_SIZE <= current_price <= _pdl_e):
+                    entry_dir       = "short"
+                    this_entry_type = "PDH_RETEST"
+
+            # ── GAP FILL — detect at 9:30, qualify the gap for entry at 9:35 ────────
+            if (GAP_FILL_ENABLED
+                    and not gapfill.fired_today
+                    and gapfill.session_date == session_date
+                    and date_ct.hour == 9 and date_ct.minute == 30):
+                _gf_pdc   = sl.get("prev_day_close", 0.0)
+                _gf_pdh   = sl.get("prev_day_high",  0.0)
+                _gf_pdl   = sl.get("prev_day_low",   0.0)
+                _gf_range = _gf_pdh - _gf_pdl
+                if _gf_pdc > 0 and _gf_range > 0:
+                    _gf_gap      = current_price - _gf_pdc
+                    _gf_gap_frac = abs(_gf_gap) / _gf_range
+                    if GAP_FILL_MIN_RANGE <= _gf_gap_frac <= GAP_FILL_MAX_RANGE:
+                        gapfill.open_price    = current_price
+                        gapfill.gap_direction = "short" if _gf_gap > 0 else "long"
+
+            # ── GAP FILL — confirm fade at 9:35 and enter ─────────────────────────
+            # Entering one bar later ensures the 9:30 bar STARTED fading the gap
+            # (first bar moved opposite to gap direction) before we commit.
+            if (entry_dir is None
+                    and GAP_FILL_ENABLED
+                    and not gapfill.fired_today
+                    and gapfill.session_date == session_date
+                    and gapfill.gap_direction != ""
+                    and date_ct.hour == 9 and date_ct.minute == 35):
+                _first_bar_faded = (
+                    (gapfill.gap_direction == "short"
+                     and float(prev_row["close"]) < float(prev_row["open"]))  # gap-up, first bar bearish
+                    or
+                    (gapfill.gap_direction == "long"
+                     and float(prev_row["close"]) > float(prev_row["open"]))  # gap-down, first bar bullish
+                )
+                if _first_bar_faded:
+                    entry_dir       = gapfill.gap_direction
+                    this_entry_type = "GAP_FILL"
+
+            # ── SWEEP & REVERSE ENTRY ─────────────────────────────────────────────
+            # Price swept the N-bar high/low by 1–SWEEP_TICKS then closed back
+            # through the level — the stop-hunt failed, fade the move.
+            if (entry_dir is None
+                    and SWEEP_REV_ENABLED
+                    and sweeprev.session_date == session_date
+                    and sweeprev._pending != ""
+                    and sweeprev.trades_today < SWEEP_REV_MAX_DAY
+                    and state.daily_trades < STRONG_MAX_TRADES):
+                entry_dir       = sweeprev._pending
+                this_entry_type = "SWEEP_REV"
+                sweeprev._pending = ""   # consume signal
+
+            # ── HTF FVG ENTRY ─────────────────────────────────────────────────────
+            # Enter when 5-min price trades inside an active 30-min FVG zone.
+            if (entry_dir is None
+                    and HTF_FVG_ENABLED
+                    and htffvg_today < HTF_FVG_MAX_TRADES
+                    and state.daily_trades < STRONG_MAX_TRADES):
+                for _z in list(active_htf_fvgs):
+                    if _z["bottom"] <= current_price <= _z["top"]:
+                        entry_dir       = _z["direction"]
+                        this_entry_type = "HTF_FVG"
+                        _htffvg_zone    = _z
+                        active_htf_fvgs.remove(_z)
+                        break
+
+            # ── VOLUME POC REVERSION ENTRY ────────────────────────────────────────
+            # Require TWO things from the PREVIOUS bar:
+            #   1. Its high/low reached ≥ VPOC_ENTRY_ATR × ATR beyond today's POC.
+            #   2. It closed in the opposing half of its range (rejection confirmed).
+            # Entering at the next bar's open (close of rejection bar) keeps R:R tight.
+            if (entry_dir is None
+                    and VPOC_ENABLED
+                    and vpocrev.session_date == session_date
+                    and vpocrev.poc > 0.0
+                    and vpocrev.bars_in_session >= VPOC_MIN_BARS
+                    and vpocrev.trades_today < VPOC_MAX_TRADES
+                    and state.daily_trades < STRONG_MAX_TRADES):
+                _vp_atr      = float(prev_row["atr"]) if not pd.isna(prev_row["atr"]) else 0.0
+                _vp_required = VPOC_ENTRY_ATR * _vp_atr
+                _vp_ph  = float(prev_row["high"])
+                _vp_pl  = float(prev_row["low"])
+                _vp_pc  = float(prev_row["close"])
+                _vp_bar_range = _vp_ph - _vp_pl
+                _vp_poc = vpocrev.poc
+                if _vp_atr > 0 and _vp_required > 0 and _vp_bar_range > 0:
+                    # SHORT: high reached above POC AND bar closed bearish (lower half)
+                    if (_vp_ph - _vp_poc >= _vp_required
+                            and (_vp_ph - _vp_pc) / _vp_bar_range >= 0.5):
+                        entry_dir = "short"
+                        this_entry_type = "VPOC_REV"
+                        vpocrev.entry_extreme = _vp_ph
+                        vpocrev.entry_poc     = _vp_poc
+                    # LONG: low reached below POC AND bar closed bullish (upper half)
+                    elif (_vp_poc - _vp_pl >= _vp_required
+                            and (_vp_pc - _vp_pl) / _vp_bar_range >= 0.5):
+                        entry_dir = "long"
+                        this_entry_type = "VPOC_REV"
+                        vpocrev.entry_extreme = _vp_pl
+                        vpocrev.entry_poc     = _vp_poc
+
+            # ── VWAP PULLBACK ENTRY ───────────────────────────────────────────────
+            # Fires after the first hour when price returns to touch the running VWAP
+            # in the direction of the morning's established move.
+            if (entry_dir is None
+                    and VWAP_PB_ENABLED
+                    and _router_allow_trend
+                    and vwap_pb.drive_confirmed
+                    and vwap_pb.trades_today < VWAP_PB_MAX_TRADES_PER_DAY
+                    and state.daily_trades < STRONG_MAX_TRADES
+                    and _is_vwap_pb_window(date_ct)):
+                _pb_vwap_now = float(prev_row["vwap"]) if not pd.isna(prev_row["vwap"]) else 0.0
+                if _pb_vwap_now > 0:
+                    _pb_zone = VWAP_PB_ENTRY_ZONE_TICKS * MNQ_TICK_SIZE
+                    # Bounce confirmation: prev bar touched VWAP zone AND closed on the
+                    # correct side, AND current bar opens on the correct side.
+                    # All three conditions together mean VWAP held as a level.
+                    _long_bounce  = (float(prev_row["low"])  <= _pb_vwap_now + _pb_zone
+                                     and float(prev_row["close"]) > _pb_vwap_now
+                                     and current_price >= _pb_vwap_now)
+                    _short_bounce = (float(prev_row["high"]) >= _pb_vwap_now - _pb_zone
+                                     and float(prev_row["close"]) < _pb_vwap_now
+                                     and current_price <= _pb_vwap_now)
+                    if vwap_pb.drive_direction == "long" and prev_row["long_bias"] and _long_bounce:
+                        entry_dir       = "long"
+                        this_entry_type = "VWAP_PB"
+                    elif vwap_pb.drive_direction == "short" and prev_row["short_bias"] and _short_bounce:
+                        entry_dir       = "short"
+                        this_entry_type = "VWAP_PB"
+
             # ── FVG ENTRY (requires ATR regime, fires if ORB/OD not triggered) ──
-            if entry_dir is None:
+            if entry_dir is None and _router_allow_trend:
                 profile = get_risk_profile(prev_row)
                 if profile["contracts"] > 0 and state.daily_trades < profile["max_trades"]:
                     if prev_row["long_bias"]:
                         for fvg in active_fvgs:
                             if (fvg.direction == "bullish"
                                     and (not FVG_FRESH_ONLY or not fvg.tested)
+                                    and (not FVG_BODY_QUALITY_ENABLED or fvg.body_pct >= FVG_BODY_MIN_PCT)
+                                    and (not FVG_SWEEP_REQUIRED or fvg.sweep)
+                                    and (not FVG_VWAP_RUBBER_BAND_ENABLED or fvg.vwap_dist_at_creation >= FVG_VWAP_MIN_EXTENSION_PTS)
+                                    and (not FVG_OVERLAP_REQUIRED or _has_fvg_overlap(fvg, active_fvgs))
                                     and price_in_fvg(fvg, current_price)):
                                 entry_fvg       = fvg
                                 entry_dir       = "long"
@@ -2344,6 +3278,10 @@ def run_backtest(
                         for fvg in active_fvgs:
                             if (fvg.direction == "bearish"
                                     and (not FVG_FRESH_ONLY or not fvg.tested)
+                                    and (not FVG_BODY_QUALITY_ENABLED or fvg.body_pct >= FVG_BODY_MIN_PCT)
+                                    and (not FVG_SWEEP_REQUIRED or fvg.sweep)
+                                    and (not FVG_VWAP_RUBBER_BAND_ENABLED or fvg.vwap_dist_at_creation >= FVG_VWAP_MIN_EXTENSION_PTS)
+                                    and (not FVG_OVERLAP_REQUIRED or _has_fvg_overlap(fvg, active_fvgs))
                                     and price_in_fvg(fvg, current_price)):
                                 entry_fvg       = fvg
                                 entry_dir       = "short"
@@ -2351,6 +3289,7 @@ def run_backtest(
                                 break
 
             if (entry_dir is None
+                    and _router_allow_mr
                     and VWAP_MR_ENABLED
                     and state.daily_trades < STRONG_MAX_TRADES):
                 vwap_mr_trades_today = sum(1 for t in day_trades_list if t.entry_type == "VWAP_MR")
@@ -2365,22 +3304,6 @@ def run_backtest(
                     if vwap_mr_setup is not None:
                         entry_dir = vwap_mr_setup["direction"]
                         this_entry_type = "VWAP_MR"
-
-            if (entry_dir is None
-                    and VWAP_EXT_ENABLED
-                    and profile["contracts"] > 0
-                    and state.daily_trades < STRONG_MAX_TRADES):
-                vwap_ext_trades_today = sum(1 for t in day_trades_list if t.entry_type == "VWAP_EXT")
-                if vwap_ext_trades_today < VWAP_EXT_MAX_TRADES_PER_DAY:
-                    vwap_ext_setup = _build_vwap_ext_setup(
-                        prev_row=prev_row,
-                        bar_2=bar_2,
-                        current_price=current_price,
-                        dt_ct=date_ct,
-                    )
-                    if vwap_ext_setup is not None:
-                        entry_dir       = vwap_ext_setup["direction"]
-                        this_entry_type = "VWAP_EXT"
 
             if entry_dir is None:
                 portfolio.append(cash)
@@ -2398,23 +3321,20 @@ def run_backtest(
                 portfolio.append(cash)
                 continue
 
+            # ── idea 6: block FVGs preceded by a key-level sweep (OFF by default) ──
+            if FVG_BLOCK_LEVEL_SWEEP_ENABLED and this_entry_type == "FVG":
+                sweep_result = _detect_prior_sweep(
+                    df=df, current_bar_idx=i, session_date=session_date,
+                    session_level_data=sl,
+                )
+                if sweep_result["swept"] and sweep_result["level"] in FVG_BLOCK_LEVEL_SWEEP_LEVELS:
+                    portfolio.append(cash)
+                    continue
+
             # ── Drawdown scaling ──────────────────────────────────────────────
             # ORB with strong regime: 5 contracts
             # ORB without strong regime: 3 contracts (ORB_INDEPENDENT_CONTRACTS)
             # FVG: uses regime profile contracts
-            sweep_result = _detect_prior_sweep(
-                df=df,
-                current_bar_idx=i,
-                session_date=session_date,
-                session_level_data=sl,
-            ) if this_entry_type == "FVG" else {"swept": False, "level": "", "bars_ago": 0}
-
-            if (FVG_BLOCK_SWEEP_LEVELS
-                    and sweep_result.get("swept")
-                    and sweep_result.get("level") in FVG_BLOCK_SWEEP_LEVELS):
-                portfolio.append(cash)
-                continue
-
             fvg_quality = _compute_fvg_quality_score(
                 prev_row=prev_row,
                 dt_ct=date_ct,
@@ -2422,7 +3342,6 @@ def run_backtest(
                 entry_fvg=entry_fvg,
                 current_bar=i,
                 session_level_data=sl,
-                sweep_result=sweep_result,
             )
 
             peak_equity  = state.eod_high_balance
@@ -2441,8 +3360,18 @@ def run_backtest(
                 base_contracts = FB_CONTRACTS
             elif this_entry_type == "VWAP_MR":
                 base_contracts = VWAP_MR_CONTRACTS
-            elif this_entry_type == "VWAP_EXT":
-                base_contracts = VWAP_EXT_CONTRACTS
+            elif this_entry_type == "PDH_RETEST":
+                base_contracts = profile["contracts"]
+            elif this_entry_type == "VWAP_PB":
+                base_contracts = profile["contracts"]
+            elif this_entry_type == "SWEEP_REV":
+                base_contracts = SWEEP_REV_CONTRACTS
+            elif this_entry_type == "HTF_FVG":
+                base_contracts = HTF_FVG_CONTRACTS
+            elif this_entry_type == "VPOC_REV":
+                base_contracts = VPOC_CONTRACTS
+            elif this_entry_type == "GAP_FILL":
+                base_contracts = GAP_FILL_CONTRACTS
             else:
                 base_contracts = profile["contracts"]
             if drawdown_pct > -2.5:
@@ -2459,6 +3388,10 @@ def run_backtest(
             elif entry_dir == "short" and above_vwap_now:
                 contracts = max(2, contracts - 2)
 
+            # NOTE: this additive score-sizing step is OVERWRITTEN below whenever
+            # FVG_SCORE_CONTRACT_MAP_ENABLED is True (the map assigns `contracts`
+            # outright). With both flags True (current config) this block has no
+            # effect on final size. Kept only for the map-disabled fallback path.
             if this_entry_type == "FVG" and FVG_SCORE_SIZING_ENABLED:
                 fvg_score = int(fvg_quality["score"])
                 if drawdown_pct > -2.5:
@@ -2466,6 +3399,13 @@ def run_backtest(
                         contracts = min(STRONG_CONTRACTS, contracts + FVG_SCORE_HIGH_SIZE_STEP)
                     elif fvg_score >= FVG_SCORE_MEDIUM_THRESHOLD:
                         contracts = min(STRONG_CONTRACTS, contracts + FVG_SCORE_MEDIUM_SIZE_STEP)
+
+            if this_entry_type == "FVG" and FVG_SCORE_CONTRACT_MAP_ENABLED:
+                fvg_score = int(fvg_quality["score"])
+                for threshold in sorted(FVG_SCORE_CONTRACT_MAP.keys(), reverse=True):
+                    if fvg_score >= threshold:
+                        contracts = FVG_SCORE_CONTRACT_MAP[threshold]
+                        break
             elif (this_entry_type == "FAILED_BREAKOUT"
                   and FB_QUALITY_SIZING_ENABLED
                   and drawdown_pct > -2.5
@@ -2500,9 +3440,66 @@ def run_backtest(
                 elif this_entry_type == "VWAP_MR":
                     fvg_stop = vwap_mr_setup["stop_price"]
                     target_ticks = int(vwap_mr_setup["target_ticks"])
-                elif this_entry_type == "VWAP_EXT":
-                    fvg_stop = vwap_ext_setup["stop_price"]
-                    target_ticks = int(vwap_ext_setup["target_ticks"])
+                elif this_entry_type == "PDH_RETEST":
+                    _pdh_s = sl.get("prev_day_high", 0.0)
+                    _pdl_s = sl.get("prev_day_low", 0.0)
+                    if entry_dir == "long":
+                        fvg_stop = _pdh_s - PDH_STOP_TICKS * MNQ_TICK_SIZE
+                        pdhr.pdh_fired_today = True
+                    else:
+                        fvg_stop = _pdl_s + PDH_STOP_TICKS * MNQ_TICK_SIZE
+                        pdhr.pdl_fired_today = True
+                    target_ticks = PDH_TARGET_TICKS
+                elif this_entry_type == "VWAP_PB":
+                    _pb_vwap_stop = float(prev_row["vwap"]) if not pd.isna(prev_row["vwap"]) else current_price
+                    if entry_dir == "long":
+                        fvg_stop = _pb_vwap_stop - VWAP_PB_STOP_TICKS * MNQ_TICK_SIZE
+                    else:
+                        fvg_stop = _pb_vwap_stop + VWAP_PB_STOP_TICKS * MNQ_TICK_SIZE
+                    target_ticks = VWAP_PB_TARGET_TICKS
+                    vwap_pb.trades_today += 1
+                elif this_entry_type == "SWEEP_REV":
+                    # Stop is structural: beyond the sweep bar's extreme + small buffer.
+                    # If price goes back through the level the stop-hunt "succeeded" — exit.
+                    if entry_dir == "short":
+                        fvg_stop = sweeprev.sweep_extreme + SWEEP_REV_STOP_BUFFER * MNQ_TICK_SIZE
+                    else:
+                        fvg_stop = sweeprev.sweep_extreme - SWEEP_REV_STOP_BUFFER * MNQ_TICK_SIZE
+                    target_ticks = SWEEP_REV_TARGET_TICKS
+                    sweeprev.trades_today += 1
+                elif this_entry_type == "HTF_FVG":
+                    # Stop: beyond the far edge of the 30-min gap + small buffer.
+                    # Target: fixed HTF_FVG_TARGET_TICKS (larger because the gap is bigger).
+                    if entry_dir == "long":
+                        fvg_stop = _htffvg_zone["bottom"] - HTF_FVG_STOP_BUFFER * MNQ_TICK_SIZE
+                    else:
+                        fvg_stop = _htffvg_zone["top"] + HTF_FVG_STOP_BUFFER * MNQ_TICK_SIZE
+                    target_ticks = HTF_FVG_TARGET_TICKS
+                    htffvg_today += 1
+                elif this_entry_type == "VPOC_REV":
+                    # Tight ATR stop from entry — keeps losses small so high R:R is preserved.
+                    # Target: the POC price (where the most volume was done today).
+                    _vp_atr2 = float(prev_row["atr"]) if not pd.isna(prev_row["atr"]) else 0.0
+                    _vp_stop_dist = max(VPOC_STOP_TICKS * MNQ_TICK_SIZE, 0.15 * _vp_atr2)
+                    if entry_dir == "short":
+                        fvg_stop     = current_price + _vp_stop_dist
+                        target_ticks = max(8, int((current_price - vpocrev.entry_poc) / MNQ_TICK_SIZE))
+                    else:
+                        fvg_stop     = current_price - _vp_stop_dist
+                        target_ticks = max(8, int((vpocrev.entry_poc - current_price) / MNQ_TICK_SIZE))
+                    vpocrev.trades_today += 1
+                elif this_entry_type == "GAP_FILL":
+                    _gf_pdc_s = sl.get("prev_day_close", 0.0)
+                    # Stop = beyond the 9:30 open price (the gap's outer extreme)
+                    # plus a buffer. This is structural — the gap-and-go is only
+                    # confirmed if price exceeds where the session opened.
+                    if entry_dir == "short":
+                        fvg_stop = gapfill.open_price + GAP_FILL_STOP_TICKS * MNQ_TICK_SIZE
+                    else:
+                        fvg_stop = gapfill.open_price - GAP_FILL_STOP_TICKS * MNQ_TICK_SIZE
+                    # Target = the gap fill price (prev day close)
+                    target_ticks = max(4, int(abs(current_price - _gf_pdc_s) / MNQ_TICK_SIZE))
+                    gapfill.fired_today = True
                 else:
                     # FVG stop: beyond FVG boundary
                     if entry_dir == "long":
@@ -2518,7 +3515,64 @@ def run_backtest(
                         entry_dir=entry_dir,
                         entry_type=this_entry_type,
                     )
+                    # ATR-scaled target (research toggle): constant reward
+                    # geometry across price eras instead of fixed ticks.
+                    if ATR_TARGET_ENABLED and not pd.isna(prev_row["atr"]):
+                        target_ticks = int(min(max(
+                            ATR_TARGET_MULT * float(prev_row["atr"]) / MNQ_TICK_SIZE,
+                            ATR_TARGET_MIN_TICKS), ATR_TARGET_MAX_TICKS))
                     active_fvgs  = [f for f in active_fvgs if f is not entry_fvg]
+
+            # ATR constant-dollar-risk sizing: after stop is known, rescale FVG
+            # contracts so the dollar exposure stays near ATR_CDR_TARGET_USD.
+            # For score-mapped contracts, scale the CDR target proportionally so
+            # per-contract risk stays constant (same $16/contract = 8-pt equivalent).
+            # Risk-budget sizing (DLL-headroom aware) takes precedence when
+            # enabled; otherwise fall back to the legacy constant-dollar-risk.
+            if RISK_BUDGET_SIZING_ENABLED and this_entry_type == "FVG" and fvg_stop != 0.0:
+                _stop_dist = abs(current_price - fvg_stop)
+                if _stop_dist > 0:
+                    _worst_slip   = max(_t for _cap, _t in SLIPPAGE_SCALE_TIERS)
+                    _per_ctr_cost = COMMISSION_PER_CONTRACT + _worst_slip * MNQ_TICK_VALUE * 2
+                    # Gap-aware: budget against a stop that fills GAP_STOP_MULT x
+                    # its width worse, so a gapped fill still fits the budget.
+                    _eff_stop_dist = _stop_dist * (GAP_STOP_MULT if GAP_AWARE_SIZING_ENABLED else 1.0)
+                    _per_ctr_risk = _eff_stop_dist * MNQ_POINT_VALUE + _per_ctr_cost
+                    _score  = int(fvg_quality["score"])
+                    _budget = RISK_BUDGET_DEFAULT
+                    for _th in sorted(RISK_BUDGET_MAP.keys(), reverse=True):
+                        if _score >= _th:
+                            _budget = RISK_BUDGET_MAP[_th]
+                            break
+                    _headroom     = state.daily_pnl_usd - BOT_DAILY_LOSS_LIMIT
+                    _headroom_cap = max(0.0, _headroom) * HEADROOM_SAFETY_FRAC
+                    _allowed_risk = min(_budget, _headroom_cap)
+                    contracts     = max(0, min(contracts, int(_allowed_risk / _per_ctr_risk)))
+            elif ATR_CDR_ENABLED and this_entry_type == "FVG" and fvg_stop != 0.0:
+                _stop_dist = abs(current_price - fvg_stop)
+                if _stop_dist > 0:
+                    _risk_per_ctr = _stop_dist * MNQ_POINT_VALUE
+                    _cdr_target = ATR_CDR_TARGET_USD
+                    if FVG_SCORE_CONTRACT_MAP_ENABLED:
+                        _sc = int(fvg_quality["score"])
+                        for _th in sorted(FVG_SCORE_CONTRACT_MAP.keys(), reverse=True):
+                            if _sc >= _th:
+                                _cdr_target = ATR_CDR_TARGET_USD * (FVG_SCORE_CONTRACT_MAP[_th] / STRONG_CONTRACTS)
+                                break
+                    contracts = max(1, min(contracts, int(_cdr_target / _risk_per_ctr)))
+
+            # News-day size cap: on scheduled high-impact news days (gap-prone),
+            # cap size so a gap-through fill cannot breach the DLL. Other days
+            # keep full size, so the P&L cost is confined to these few sessions.
+            if (NEWS_DAY_SIZE_CAP_ENABLED and this_entry_type == "FVG"
+                    and str(session_date) in ALL_NEWS_DATES):
+                contracts = min(contracts, NEWS_DAY_MAX_CONTRACTS)
+
+            # Risk-budget may zero out size when headroom is nearly exhausted;
+            # skip the trade rather than force a minimum (the FVG is consumed).
+            if RISK_BUDGET_SIZING_ENABLED and this_entry_type == "FVG" and contracts < 1:
+                portfolio.append(cash)
+                continue
 
             if this_entry_type == "FVG":
                 entry_regime = profile["regime"]
@@ -2528,21 +3582,38 @@ def run_backtest(
                 entry_regime = od_setup["regime"]
             elif this_entry_type == "FAILED_BREAKOUT":
                 entry_regime = fb_setup["regime"]
-            elif this_entry_type == "VWAP_MR":
-                entry_regime = vwap_mr_setup["regime"]
-            elif this_entry_type == "VWAP_EXT":
-                entry_regime = "mean_revert"
-            else:
+            elif this_entry_type == "PDH_RETEST":
                 entry_regime = profile["regime"]
-            in_trade     = True
-            direction    = entry_dir
-            entry_price  = current_price
-            entry_type   = this_entry_type
-            entry_bar_idx = i
-            trade_mfe    = 0.0
-            trade_mae    = 0.0
-            partial_taken      = False
-            partial_pnl_banked = 0.0
+            elif this_entry_type == "VWAP_PB":
+                entry_regime = profile["regime"]
+            elif this_entry_type == "SWEEP_REV":
+                entry_regime = profile["regime"]
+            elif this_entry_type == "HTF_FVG":
+                entry_regime = profile["regime"]
+            elif this_entry_type == "VPOC_REV":
+                entry_regime = profile["regime"]
+            elif this_entry_type == "GAP_FILL":
+                entry_regime = profile["regime"]
+            else:
+                entry_regime = vwap_mr_setup["regime"]
+            # Missed-fill stress: randomly skip a committed entry (models latency /
+            # rejected orders / setup gone). Default off; seeded for reproducibility.
+            if MISS_FILL_PROB > 0.0 and _miss_rng.random() < MISS_FILL_PROB:
+                portfolio.append(cash)
+                continue
+
+            # ADX-based bar regime (used by consistency scorecard to filter chop subset)
+            entry_bar_adx_regime = classify_regime_adx(prev_row)
+            in_trade             = True
+            direction            = entry_dir
+            entry_price          = current_price
+            entry_type           = this_entry_type
+            entry_bar_idx        = i
+            trade_mfe            = 0.0
+            trade_mae            = 0.0
+            partial_taken        = False
+            partial_pnl_banked   = 0.0
+            breakeven_triggered  = False
             trade_number_overall += 1
             trade_number_today   += 1
 
@@ -2607,9 +3678,6 @@ def run_backtest(
                 "fvg_type":                    (entry_fvg.direction if entry_fvg else ""),
                 "fvg_quality_score":           (int(fvg_quality["score"]) if entry_fvg else 0),
                 "fvg_quality_flags":           (str(fvg_quality["flags"]) if entry_fvg else ""),
-                "sweep_preceded":              sweep_result.get("swept", False),
-                "sweep_level":                 sweep_result.get("level", ""),
-                "sweep_bars_ago":              sweep_result.get("bars_ago", 0),
                 "orb_range_ticks":             orb.range_ticks if orb.formed else 0.0,
                 "orb_high":                    orb.high if orb.formed else 0.0,
                 "orb_low":                     orb.low  if orb.formed else 0.0,
@@ -2676,6 +3744,7 @@ def run_backtest(
                 "daily_loss_used_pct":         dl_pct,
                 "mll_used_pct":                mll_pct,
                 "qualifying_days_banked":      0,
+                "bar_adx_regime":              entry_bar_adx_regime,
             }
 
         portfolio.append(cash)
@@ -2780,9 +3849,6 @@ def _build_trade_record(
         fvg_type               = snap.get("fvg_type", ""),
         fvg_quality_score      = snap.get("fvg_quality_score", 0),
         fvg_quality_flags      = snap.get("fvg_quality_flags", ""),
-        sweep_preceded         = snap.get("sweep_preceded", False),
-        sweep_level            = snap.get("sweep_level", ""),
-        sweep_bars_ago         = snap.get("sweep_bars_ago", 0),
         orb_range_ticks        = snap.get("orb_range_ticks", 0.0),
         orb_high               = snap.get("orb_high", 0.0),
         orb_low                = snap.get("orb_low", 0.0),
@@ -2826,6 +3892,7 @@ def _build_trade_record(
         fb_reentry_distance_ticks = snap.get("fb_reentry_distance_ticks", 0.0),
         fb_target_ticks         = snap.get("fb_target_ticks", 0),
         fb_bars_from_sweep_to_entry = snap.get("fb_bars_from_sweep_to_entry", 0),
+        bar_adx_regime           = snap.get("bar_adx_regime", ""),
         mae=trade_mae, mfe=trade_mfe, bars_to_exit=bars_to_exit,
         r_multiple=r_multiple, edge_ratio=edge_ratio, efficiency_ratio=efficiency,
         combine_profit_at_entry  = snap.get("combine_profit_at_entry", 0.0),
@@ -3019,6 +4086,127 @@ def build_monthly_records(
 
 # ── STATS ─────────────────────────────────────────────────────────────────────
 
+def _compute_consistency_scorecard(
+    trades: List[TradeRecord],
+    daily_records: List[DailyRecord],
+    avg_round_turn_cost: float = 0.0,
+) -> dict:
+    """Consistency-first scorecard (§1.2 of research spec).
+
+    Returns a dict with every metric plus a 'viable' bool (cleared all minimums)
+    and a 'fundable' bool (cleared all targets AND best_day_pct <= 30%).
+    Designed to be called on a subset of trades (e.g. chop-only).
+    """
+    n = len(trades)
+    if n == 0:
+        return {k: None for k in (
+            "n_trades", "profit_factor", "expectancy", "expectancy_in_cost_units",
+            "sqn", "win_rate", "pct_profitable_days", "best_day_pct_of_net",
+            "sharpe_daily", "sortino_daily", "max_consec_losses", "calmar",
+            "viable", "fundable",
+        )}
+
+    pnls      = [t.pnl_usd for t in trades]
+    wins      = [p for p in pnls if p > 0]
+    losses    = [p for p in pnls if p <= 0]
+
+    gross_win  = sum(wins)
+    gross_loss = abs(sum(losses))
+    pf         = gross_win / gross_loss if gross_loss > 0 else float("inf")
+
+    total_net  = sum(pnls)
+    expectancy = total_net / n
+
+    cost_units = (expectancy / avg_round_turn_cost
+                  if avg_round_turn_cost > 0 else 0.0)
+
+    pnl_arr = np.array(pnls, dtype=float)
+    std_pnl = float(np.std(pnl_arr))
+    sqn     = (float(np.mean(pnl_arr)) / std_pnl * np.sqrt(n)) if std_pnl > 0 else 0.0
+
+    win_rate = len(wins) / n * 100
+
+    # Per-day metrics from daily_records that have at least one matching trade.
+    trade_dates = set(t.date.date() if hasattr(t.date, "date") else t.date for t in trades)
+    relevant_dr = [d for d in daily_records
+                   if (d.session_date.date() if hasattr(d.session_date, "date")
+                       else d.session_date) in trade_dates]
+    if relevant_dr:
+        prof_days = sum(1 for d in relevant_dr if d.daily_pnl_net > 0)
+        pct_prof  = prof_days / len(relevant_dr) * 100
+        day_pnls  = [d.daily_pnl_net for d in relevant_dr]
+        best_day  = max(day_pnls)
+        best_day_pct = (best_day / total_net * 100) if total_net > 0 else float("inf")
+        # daily Sharpe/Sortino on subset days
+        arr = np.array(day_pnls, dtype=float)
+        mu  = float(arr.mean())
+        sd  = float(arr.std())
+        sharpe_d  = (mu / sd * np.sqrt(252)) if sd > 0 else 0.0
+        down      = float(arr[arr < 0].std()) if (arr < 0).any() else 0.0
+        sortino_d = (mu / down * np.sqrt(252)) if down > 0 else 0.0
+    else:
+        pct_prof      = 0.0
+        best_day_pct  = float("inf")
+        sharpe_d      = 0.0
+        sortino_d     = 0.0
+
+    # Max consecutive losses
+    max_streak = streak = 0
+    for p in pnls:
+        if p <= 0:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+
+    # Calmar: annualised return / max DD on these trades' equity curve
+    eq = np.cumsum(pnl_arr)
+    pk = np.maximum.accumulate(eq)
+    dd = pk - eq
+    max_dd_abs = float(dd.max()) if len(dd) > 0 else 0.0
+    first_t = trades[0].date
+    last_t  = trades[-1].date
+    days_span = max(((last_t - first_t).days if hasattr(first_t, "__sub__") else 1), 1)
+    ann_net  = total_net * 365.0 / days_span
+    calmar   = ann_net / max_dd_abs if max_dd_abs > 0 else 0.0
+
+    viable = (
+        pf         >= 1.30
+        and cost_units >= 2.0
+        and sqn        >= 1.6
+        and pct_prof   >= 50.0
+        and best_day_pct <= 40.0
+        and sharpe_d   >= 1.0
+        and calmar     >= 0.5
+    )
+    fundable = viable and (
+        pf         >= 1.75
+        and cost_units >= 3.0
+        and sqn        >= 2.5
+        and pct_prof   >= 55.0
+        and best_day_pct <= 30.0
+        and sortino_d  >= 1.5
+        and calmar     >= 1.0
+    )
+
+    return {
+        "n_trades":               n,
+        "profit_factor":          round(pf, 3),
+        "expectancy":             round(expectancy, 2),
+        "expectancy_in_cost_units": round(cost_units, 2),
+        "sqn":                    round(sqn, 3),
+        "win_rate":               round(win_rate, 1),
+        "pct_profitable_days":    round(pct_prof, 1),
+        "best_day_pct_of_net":    round(best_day_pct, 1),
+        "sharpe_daily":           round(sharpe_d, 3),
+        "sortino_daily":          round(sortino_d, 3),
+        "max_consec_losses":      max_streak,
+        "calmar":                 round(calmar, 3),
+        "viable":                 viable,
+        "fundable":               fundable,
+    }
+
+
 def compute_stats(
     df: pd.DataFrame,
     trades: List[TradeRecord],
@@ -3082,6 +4270,10 @@ def compute_stats(
     orb_stats = entry_type_stats.get("ORB", {"count": 0, "win_rate": 0.0, "net_pnl": 0.0})
     fvg_stats = entry_type_stats.get("FVG", {"count": 0, "win_rate": 0.0, "net_pnl": 0.0})
 
+    # Full consistency scorecard across all trades
+    consistency_scorecard = _compute_consistency_scorecard(trades, daily_records, avg_cost)
+
+    # ATR-profile regime breakdown (original behaviour)
     regime_stats = {}
     for r in sorted(set(t.regime for t in trades)):
         rt = [t for t in trades if t.regime == r]
@@ -3094,6 +4286,23 @@ def compute_stats(
                 "net_pnl":  sum(t.pnl_usd for t in rt),
                 "avg_win":  float(np.mean(rw)) if rw else 0.0,
                 "avg_loss": float(np.mean(rl)) if rl else 0.0,
+                "scorecard": _compute_consistency_scorecard(rt, daily_records, avg_cost),
+            }
+
+    # ADX bar-regime breakdown (used by experiment runner chop scorecard)
+    adx_regime_stats = {}
+    for r in sorted(set(t.bar_adx_regime for t in trades)):
+        rt = [t for t in trades if t.bar_adx_regime == r]
+        if rt:
+            rw = [t.pnl_usd for t in rt if t.won]
+            rl = [t.pnl_usd for t in rt if not t.won]
+            adx_regime_stats[r] = {
+                "count":    len(rt),
+                "win_rate": len(rw) / len(rt) * 100,
+                "net_pnl":  sum(t.pnl_usd for t in rt),
+                "avg_win":  float(np.mean(rw)) if rw else 0.0,
+                "avg_loss": float(np.mean(rl)) if rl else 0.0,
+                "scorecard": _compute_consistency_scorecard(rt, daily_records, avg_cost),
             }
 
     return dict(
@@ -3104,6 +4313,8 @@ def compute_stats(
         win_rate=win_rate, bayes_wr=state.bayesian_win_rate * 100,
         avg_win=avg_win, avg_loss=avg_loss,
         total_gross=total_gross, total_costs=total_costs,
+        consistency_scorecard=consistency_scorecard,
+        adx_regime_stats=adx_regime_stats,
         total_net=total_net, avg_cost=avg_cost,
         floor_breached=state.floor_breached,
         min_buffer_over_floor=state.min_buffer_over_floor,
@@ -3138,7 +4349,7 @@ def print_stats(
     print(f"  {'Sharpe Ratio':<30} {stats['sharpe']:>12.2f}")
     print(f"  {'Sortino Ratio':<30} {stats['sortino']:>12.2f}")
     print(f"  {'Profit Factor':<30} {stats['profit_factor']:>12.2f}")
-    print(f"  {'Floor Breached':<30} {'YES (!)' if stats['floor_breached'] else 'NO':>12}")
+    print(f"  {'Floor Breached':<30} {'YES ⚠️' if stats['floor_breached'] else 'NO ✅':>12}")
     print(f"  {'Min Buffer Over Floor':<30} ${stats['min_buffer_over_floor']:>11,.2f}")
     print("-" * 60)
     print(f"  {'Total Trades':<30} {stats['num_trades']:>12}")
@@ -3301,72 +4512,6 @@ def monte_carlo(stats: dict) -> dict:
 
 
 # ── EXPORT ────────────────────────────────────────────────────────────────────
-
-def print_vwap_ext_slice(trades: List[TradeRecord], limit: int = VWAP_EXT_DEBUG_PRINT_LIMIT) -> None:
-    ext_trades = [t for t in trades if t.entry_type == "VWAP_EXT"]
-
-    print("\n  VWAP EXT (MODULE E) DIAGNOSTIC")
-    print("=" * 60)
-    if not ext_trades:
-        print("  No VWAP EXT trades in this run.")
-        print("=" * 60)
-        return
-
-    total_pnl = sum(t.pnl_usd for t in ext_trades)
-    win_rate  = np.mean([t.won for t in ext_trades]) * 100
-    wins  = [t for t in ext_trades if t.won]
-    losses = [t for t in ext_trades if not t.won]
-    avg_win  = np.mean([t.pnl_usd for t in wins])  if wins   else 0.0
-    avg_loss = np.mean([t.pnl_usd for t in losses]) if losses else 0.0
-    pf = abs(sum(t.pnl_usd for t in wins) / sum(t.pnl_usd for t in losses)) if losses else float("inf")
-    years = sorted({str(t.date)[:4] for t in ext_trades})
-
-    print(f"  {'VWAP EXT trades':<28} {len(ext_trades):>6}")
-    print(f"  {'Win rate':<28} {win_rate:>6.2f}%")
-    print(f"  {'Net P&L':<28} ${total_pnl:>10,.2f}")
-    print(f"  {'Avg P&L / trade':<28} ${total_pnl / len(ext_trades):>10,.2f}")
-    print(f"  {'Avg win':<28} ${avg_win:>10,.2f}")
-    print(f"  {'Avg loss':<28} ${avg_loss:>10,.2f}")
-    print(f"  {'Profit factor':<28} {pf:>10.2f}")
-    print(f"  {'Avg bars to exit':<28} {np.mean([t.bars_to_exit for t in ext_trades]):>10.2f}")
-    print("-" * 60)
-    print("  By exit reason:")
-    reason_groups: dict = {}
-    for t in ext_trades:
-        reason_groups.setdefault(t.exit_reason, []).append(t)
-    for reason in sorted(reason_groups):
-        grp = reason_groups[reason]
-        print(
-            f"    {reason:<16}  trades={len(grp):>3}  "
-            f"wr={np.mean([x.won for x in grp]) * 100:>6.2f}%  "
-            f"pnl=${sum(x.pnl_usd for x in grp):>8,.2f}"
-        )
-    print("-" * 60)
-    print("  By year:")
-    for yr in years:
-        grp = [t for t in ext_trades if str(t.date)[:4] == yr]
-        print(
-            f"    {yr}  trades={len(grp):>3}  "
-            f"wr={np.mean([x.won for x in grp]) * 100:>6.2f}%  "
-            f"pnl=${sum(x.pnl_usd for x in grp):>8,.2f}"
-        )
-    print("-" * 60)
-    print("  Sample trades:")
-    print("    date               side   entry     exit      pnl    bars  reason")
-    for t in ext_trades[:limit]:
-        print(
-            f"    {str(t.date)[:16]:<16} "
-            f"{t.direction:<5} "
-            f"{t.entry:>8.2f} "
-            f"{t.exit:>8.2f} "
-            f"{t.pnl_usd:>8.2f} "
-            f"{t.bars_to_exit:>5} "
-            f"{t.exit_reason}"
-        )
-    if len(ext_trades) > limit:
-        print(f"  ... showing first {limit} of {len(ext_trades)} VWAP EXT trades")
-    print("=" * 60)
-
 
 def print_vwap_mr_slice(trades: List[TradeRecord], limit: int = VWAP_MR_DEBUG_PRINT_LIMIT) -> None:
     vwap_trades = [t for t in trades if t.entry_type == "VWAP_MR"]
@@ -3721,29 +4866,6 @@ def print_fvg_quality_score_diagnostic(trades: List[TradeRecord]) -> None:
     print(f"  Score model                 {'ON' if FVG_QUALITY_SCORE_ENABLED else 'OFF'}")
     score_df = _build_group_stats(fvg, ["fvg_quality_score"]).sort_values("fvg_quality_score")
     _print_segment_lines("By score", score_df, ["fvg_quality_score"])
-
-    # Sweep segmentation
-    if "sweep_preceded" in fvg.columns:
-        sweep_fvg  = fvg[fvg["sweep_preceded"] == True]
-        plain_fvg  = fvg[fvg["sweep_preceded"] == False]
-        print(f"\n  POST-SWEEP FVG SEGMENTATION  (lookback=10 bars, 3-8 NQ pts)")
-        print(f"  {'':30} {'Count':>6} {'WR%':>6} {'AvgPnL':>8} {'NetPnL':>10}")
-        for label, grp in [("Sweep-preceded", sweep_fvg), ("Non-sweep", plain_fvg), ("All FVG", fvg)]:
-            if grp.empty:
-                continue
-            wr  = grp["won"].mean() * 100
-            avg = grp["pnl_usd"].mean()
-            net = grp["pnl_usd"].sum()
-            n   = len(grp)
-            print(f"  {label:<30} {n:>6} {wr:>5.1f}% {avg:>8.2f} {net:>10,.0f}")
-
-        if not sweep_fvg.empty:
-            print(f"\n  Sweep level breakdown:")
-            for lvl, grp in sweep_fvg.groupby("sweep_level"):
-                wr  = grp["won"].mean() * 100
-                avg = grp["pnl_usd"].mean()
-                print(f"    {lvl:<28} n={len(grp):>4}  WR={wr:.1f}%  avg=${avg:.2f}")
-
     print("=" * 60)
 
 
@@ -3955,9 +5077,10 @@ def _parse_cli_args():
 
 
 def _apply_cli_overrides(args) -> None:
-    global SLIPPAGE_TICKS
+    global SLIPPAGE_TICKS, SLIPPAGE_SCALE_ENABLED
     if getattr(args, "slippage_ticks", None) is not None:
         SLIPPAGE_TICKS = float(args.slippage_ticks)
+        SLIPPAGE_SCALE_ENABLED = False  # flat override takes precedence over scaling
 
 
 def main(args=None):
@@ -3969,9 +5092,13 @@ def main(args=None):
     print(f"  Run mode: {RUN_MODE}  |  Profile: {EXECUTION_PROFILE}  |  Live execution: {'ON' if LIVE_EXECUTION_ENABLED else 'OFF'}")
     print(f"  Instrument: MNQ  |  Point value: ${MNQ_POINT_VALUE}/pt")
     print(f"  ORB: {ORB_RANGE_BARS} bars (9:30-10:00 CT) | FVG: all session")
-    print(f"  ATR cap: 2.0  |  July: DISABLED")
-    print(f"  Max trades/day: {STRONG_MAX_TRADES} (shared cap across modules)")
-    print(f"  Max contracts: {STRONG_CONTRACTS} (Topstep scaling plan)")
+    print(f"  ATR cap: 2.0  |  CALM_ATR_RATIO: {CALM_ATR_RATIO}  |  July: {'SKIP' if SKIP_JULY else 'ON'}")
+    print(
+        f"  Regimes: strong={STRONG_CONTRACTS}c/{STRONG_TARGET_TICKS}t/{STRONG_MAX_TRADES}max"
+        f" | normal={NORMAL_CONTRACTS}c/{NORMAL_TARGET_TICKS}t/{NORMAL_MAX_TRADES}max"
+        f" | calm=0c (atr<1.5 or ratio<{CALM_ATR_RATIO})"
+    )
+    print(f"  Breakeven stop: {BREAKEVEN_TRIGGER_TICKS} ticks ({'ON' if BREAKEVEN_TRIGGER_TICKS > 0 else 'OFF'})")
     print(
         "  One-account filters:"
         f" late-longs={'ON' if LONG_QUALITY_FILTERS_ENABLED else 'OFF'}"
@@ -3980,6 +5107,9 @@ def main(args=None):
         f" | long-ema-aged={'ON' if FVG_LONG_EMA_FILTER_ENABLED else 'OFF'}"
         f" (age>={FVG_LONG_EMA_FILTER_MIN_AGE_BARS}, {FVG_LONG_MIN_EMA_SPREAD_PTS:.0f}pts)"
         f" | skip_fomc={'ON' if SKIP_FOMC_ENTRIES else 'OFF'}"
+        f" | fomc_blackout={'ON' if FOMC_BLACKOUT_ENABLED else 'OFF'}"
+        f" ({FOMC_BLACKOUT_START_CT[0]:02d}:{FOMC_BLACKOUT_START_CT[1]:02d}"
+        f"-{FOMC_BLACKOUT_END_CT[0]:02d}:{FOMC_BLACKOUT_END_CT[1]:02d} CT)"
         f" | skip_hour11={'ON' if SKIP_HOUR_11_ENTRIES else 'OFF'}"
         f" | skip_long_10_11={'ON' if SKIP_LONG_HOUR_10_11 else 'OFF'}"
     )
@@ -4073,19 +5203,17 @@ def main(args=None):
     df, trades, daily_records, state = run_backtest(df, session_levels)
     print(f"  Backtest complete: {len(trades)} trades, {len(daily_records)} sessions.")
 
-    orb_count  = sum(1 for t in trades if t.entry_type == "ORB")
-    fb_count   = sum(1 for t in trades if t.entry_type == "FAILED_BREAKOUT")
-    od_count   = sum(1 for t in trades if t.entry_type == "OD_PULLBACK")
-    fvg_count  = sum(1 for t in trades if t.entry_type == "FVG")
+    orb_count = sum(1 for t in trades if t.entry_type == "ORB")
+    fb_count = sum(1 for t in trades if t.entry_type == "FAILED_BREAKOUT")
+    od_count = sum(1 for t in trades if t.entry_type == "OD_PULLBACK")
+    fvg_count = sum(1 for t in trades if t.entry_type == "FVG")
     vwap_count = sum(1 for t in trades if t.entry_type == "VWAP_MR")
-    vext_count = sum(1 for t in trades if t.entry_type == "VWAP_EXT")
     print(
         f"  ORB trades: {orb_count}"
         f"  |  FB trades: {fb_count}"
         f"  |  OD trades: {od_count}"
         f"  |  FVG trades: {fvg_count}"
         f"  |  VWAP trades: {vwap_count}"
-        f"  |  VWAP_EXT trades: {vext_count}"
     )
 
     monthly_records = build_monthly_records(daily_records, trades)
@@ -4097,7 +5225,6 @@ def main(args=None):
     print_failed_breakout_cap_diagnostic(state)
     print_od_pullback_slice(trades)
     print_vwap_mr_slice(trades)
-    print_vwap_ext_slice(trades)
     print_fvg_quality_score_diagnostic(trades)
     print_analysis_highlights(trades)
 

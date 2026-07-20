@@ -254,6 +254,31 @@ class TopstepXClient:
     def cancel_order(self, account_id: int, order_id: int) -> Dict[str, Any]:
         return self._post("/api/Order/cancel", {"accountId": account_id, "orderId": order_id})
 
+    def modify_order(
+        self,
+        account_id: int,
+        order_id: int,
+        *,
+        size: Optional[int] = None,
+        stop_price: Optional[float] = None,
+        limit_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Atomically modify a working order in place (ProjectX /api/Order/modify).
+
+        Used by the live stop manager to move a protective stop WITHOUT the
+        unprotected cancel-then-replace window. Raises TopstepXAPIError if the
+        gateway rejects the modification (caller falls back to
+        place-new-confirm-then-cancel-old, never cancel-first).
+        """
+        payload: Dict[str, Any] = {"accountId": account_id, "orderId": order_id}
+        if size is not None:
+            payload["size"] = int(size)
+        if stop_price is not None:
+            payload["stopPrice"] = float(stop_price)
+        if limit_price is not None:
+            payload["limitPrice"] = float(limit_price)
+        return self._post("/api/Order/modify", payload)
+
     def close_contract(self, account_id: int, contract_id: str) -> Dict[str, Any]:
         return self._post("/api/Position/closeContract", {"accountId": account_id, "contractId": contract_id})
 
