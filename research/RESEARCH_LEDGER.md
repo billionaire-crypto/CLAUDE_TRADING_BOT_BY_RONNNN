@@ -13,6 +13,49 @@ root as modules, e.g. `python -m research.run_bias_validation`.
 
 ---
 
+## 2026-07-19 — Port: FVG_BLOCK_LEVEL_SWEEP_ENABLED (candidate, not shipped)
+
+### Background
+Auditing `codex/topstepx-hardening-checkpoint` (main) against this branch found main
+has one commit this branch never absorbed: `f4d76cd` (2026-04-19), "Add post-sweep
+FVG filter blocking globex_high sweep entries." That commit found FVGs preceded by a
+globex_high liquidity sweep (wick 3-8 NQ pts beyond the level, closing back inside,
+within 10 bars) win at 39.1% vs 46% baseline — a real structural weakness. Main forked
+from this branch's lineage on 2026-04-07, before that fix landed, so it was never
+carried forward. The other main-only commit (EOD flatten, `b74cf48`) was independently
+re-implemented on this branch already — not a gap.
+
+### What was done
+Ported ONLY the detection mechanism into `src/bot.py`, as a new OFF-by-default
+experiment flag (`FVG_BLOCK_LEVEL_SWEEP_ENABLED = False`), matching the existing
+pattern of `FVG_LUNCH_FILTER_ENABLED` / `FVG_VWAP_RUBBER_BAND_ENABLED`:
+- `_detect_prior_sweep()` — looks back up to 10 bars in-session for a wick-sweep
+  (3-8 pts) of prev_day_high/low or globex_high/low that closed back inside.
+- Wired into `run_backtest`'s FVG entry gate, right after `_passes_strategy_filters`:
+  when `FVG_BLOCK_LEVEL_SWEEP_ENABLED` is True and a swept level is in
+  `FVG_BLOCK_LEVEL_SWEEP_LEVELS` (default `{"globex_high"}`), the entry is skipped.
+- **Not ported:** the old commit's TradeRecord/LiveSignalSnapshot diagnostic fields
+  and quality-score bonus point — not needed to make the candidate testable, and
+  skipping them keeps the footprint minimal.
+
+Confirmed inert: `FVG_BLOCK_LEVEL_SWEEP_ENABLED` defaults to `False`, so
+`_detect_prior_sweep()` is never called and `run_backtest`/live signal generation are
+byte-identical to before this port. 129/129 tests pass (no test exercises this flag
+yet — the nightly gauntlet is the test).
+
+### Decision — PARKED, seeded to nightly backlog as `fvg_block_level_sweep_on`
+The April validation is 3+ months stale against the current config (`vwap_only` bias,
+ATR-scaled targets, `FVG_MAX_AGE_BARS=4`, `CALM_ATR_RATIO=0.70` all postdate it). Do
+**not** trust the old 39.1%/46% numbers as current truth — the nightly researcher will
+re-run the full gauntlet against today's baseline and report SHIP or REJECT on its own
+evidence, same as every other candidate.
+
+### Notes for the next session
+If the nightly researcher SHIPs this, it still needs a human decision per the standing
+rule — automated SHIP is never auto-applied to `src/bot.py`.
+
+---
+
 ## 2026-07-04 — 🏆 BREAKTHROUGH: the FVG frequency handbrake was the EMA trend-bias
 
 ### Background — the question that started it
@@ -603,6 +646,34 @@ Full 7-year gauntlet: 3-way split (dev 19-22 / val1 23-24 / val2 25-26+), walk-f
 
 ### Decision
 **REJECT** — dev_2019_2022: candidate net $196,842 < 95% of baseline $217,509; val1_2023_2024: candidate net $96,994 < 95% of baseline $109,435; val2_2025_2026: candidate net $81,048 < 95% of baseline $102,820; combine pass rate -1.3pp (worse than -1pp tolerance)
+
+### Notes for the next session
+Automated overnight result. Verify independently before changing the live config — this is a candidate for human review, not an applied change.
+
+---
+
+## 2026-07-19 — 🌙 NIGHTLY RESEARCHER: FVG_VWAP_RUBBER_BAND_ENABLED False -> True — **REJECT**
+
+### Hypothesis
+Regime study (ledger 2026-07-17): composite choppy days (high VWAP-crossing frequency) run PF 2.53 vs 5.14 on trending days. A day-level filter is not causal (day type known only in hindsight), but this existing flag is a causal intraday proxy: it requires price to be extended >= 12 pts from VWAP when the FVG is created, which is exactly what churny VWAP-hugging days fail. A TIGHTENING. Gauntlet decides whether the chop it removes is worth the trades it costs.
+
+### Method (script: research/nightly_researcher.py — automated, unattended)
+Full 7-year gauntlet: 3-way split (dev 19-22 / val1 23-24 / val2 25-26+), walk-forward (half-year windows), stress (slip x2/x3, 10% missed fills), 100k-path combine bootstrap, floor safety vs baseline worst trade. Parameter set via in-memory setattr on `bot.py`, restored after each run — **src/bot.py was not modified on disk.**
+
+### Result
+
+- **dev_2019_2022**: baseline net $217,509 (PF 4.03, n=1607) vs candidate net $194,532 (PF 3.85, n=1386)
+- **val1_2023_2024**: baseline net $109,435 (PF 3.92, n=768) vs candidate net $100,622 (PF 3.88, n=713)
+- **val2_2025_2026**: baseline net $102,820 (PF 4.27, n=502) vs candidate net $90,962 (PF 3.97, n=481)
+- **Walk-forward**: 16 windows, 0 negative, avg $24,132/window
+- **Stress slip_x2**: net $339,286, PF 3.47
+- **Stress slip_x3**: net $305,503, PF 3.06
+- **Stress miss_10pct**: net $339,658, PF 3.83
+- **Combine sim**: pass rate 97.7% -> 95.3%, daily-limit fails 1.96% -> 3.25%
+- **Floor safety**: worst trade $-983 -> $-2,318
+
+### Decision
+**REJECT** — dev_2019_2022: candidate net $194,532 < 95% of baseline $217,509; val1_2023_2024: candidate net $100,622 < 95% of baseline $109,435; val2_2025_2026: candidate net $90,962 < 95% of baseline $102,820; combine pass rate -2.4pp (worse than -1pp tolerance); worst trade $-2,318 worse than baseline $-983
 
 ### Notes for the next session
 Automated overnight result. Verify independently before changing the live config — this is a candidate for human review, not an applied change.

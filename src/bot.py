@@ -226,6 +226,17 @@ FVG_BODY_QUALITY_ENABLED     = False  # idea 3: require strong impulse candle
 FVG_BODY_MIN_PCT             = 0.60
 FVG_SWEEP_REQUIRED           = False  # idea 4: require liquidity sweep before FVG
 FVG_OVERLAP_REQUIRED         = False  # idea 5: require 2+ overlapping active FVGs
+# idea 6: block FVGs preceded by a liquidity sweep+reject at a key level (distinct
+# from idea 4 above — this checks a SESSION LEVEL like globex_high, not the FVG's
+# own formation). Ported from an older branch's validated finding (sweep-preceded
+# FVGs: 39.1% WR vs 46% baseline) but never re-tested against the current vwap_only
+# + ATR-target config. OFF by default pending nightly-researcher re-validation
+# (see research/RESEARCH_LEDGER.md 2026-07-19 and nightly_backlog.json).
+FVG_BLOCK_LEVEL_SWEEP_ENABLED       = False
+FVG_BLOCK_LEVEL_SWEEP_LEVELS: set   = {"globex_high"}
+FVG_BLOCK_LEVEL_SWEEP_LOOKBACK_BARS = 10
+FVG_BLOCK_LEVEL_SWEEP_MIN_PTS       = 3.0
+FVG_BLOCK_LEVEL_SWEEP_MAX_PTS       = 8.0
 
 # ── V28: ORB SETTINGS ─────────────────────────────────────────────────────────
 # ORB is DISABLED. It was cut for a 26% WR under the shared FVG/ORB trade cap.
@@ -1618,6 +1629,47 @@ def _passes_strategy_filters(
             return False
 
     return True
+
+
+def _detect_prior_sweep(
+    df: pd.DataFrame,
+    current_bar_idx: int,
+    session_date: object,
+    session_level_data: dict,
+    lookback_bars: int = FVG_BLOCK_LEVEL_SWEEP_LOOKBACK_BARS,
+    min_sweep_pts: float = FVG_BLOCK_LEVEL_SWEEP_MIN_PTS,
+    max_sweep_pts: float = FVG_BLOCK_LEVEL_SWEEP_MAX_PTS,
+) -> dict:
+    """Look back up to lookback_bars within the current session to detect if a
+    key level (prev day high/low, globex high/low) was swept (wick crossed by
+    min_sweep_pts-max_sweep_pts NQ points) with the bar closing back inside.
+    Returns {"swept": bool, "level": str, "bars_ago": int}."""
+    levels = {
+        "prev_day_high": float(session_level_data.get("prev_day_high", 0.0)),
+        "prev_day_low":  float(session_level_data.get("prev_day_low", 0.0)),
+        "globex_high":   float(session_level_data.get("globex_high", 0.0)),
+        "globex_low":    float(session_level_data.get("globex_low", 0.0)),
+    }
+
+    start = max(0, current_bar_idx - lookback_bars)
+    window = df.iloc[start:current_bar_idx]
+
+    for bars_ago, (ts, bar) in enumerate(reversed(list(window.iterrows())), 1):
+        if ts.date() != session_date:
+            continue
+        for level_name, level_price in levels.items():
+            if level_price <= 0:
+                continue
+            if level_name.endswith("_high"):
+                sweep_pts = float(bar["high"]) - level_price
+                closed_inside = float(bar["close"]) < level_price
+            else:
+                sweep_pts = level_price - float(bar["low"])
+                closed_inside = float(bar["close"]) > level_price
+            if min_sweep_pts <= sweep_pts <= max_sweep_pts and closed_inside:
+                return {"swept": True, "level": level_name, "bars_ago": bars_ago}
+
+    return {"swept": False, "level": "", "bars_ago": 0}
 
 
 def _compute_fvg_quality_score(
@@ -3268,6 +3320,16 @@ def run_backtest(
             ):
                 portfolio.append(cash)
                 continue
+
+            # ── idea 6: block FVGs preceded by a key-level sweep (OFF by default) ──
+            if FVG_BLOCK_LEVEL_SWEEP_ENABLED and this_entry_type == "FVG":
+                sweep_result = _detect_prior_sweep(
+                    df=df, current_bar_idx=i, session_date=session_date,
+                    session_level_data=sl,
+                )
+                if sweep_result["swept"] and sweep_result["level"] in FVG_BLOCK_LEVEL_SWEEP_LEVELS:
+                    portfolio.append(cash)
+                    continue
 
             # ── Drawdown scaling ──────────────────────────────────────────────
             # ORB with strong regime: 5 contracts
