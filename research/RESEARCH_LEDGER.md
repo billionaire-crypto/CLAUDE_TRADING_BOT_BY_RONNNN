@@ -13,6 +13,90 @@ root as modules, e.g. `python -m research.run_bias_validation`.
 
 ---
 
+## 2026-07-20 — PRE-REGISTRATION: Unfinished Inventory Hypothesis (DES study)
+
+### Hypothesis (registered BEFORE any results were computed)
+FVG retest expectancy is governed by the character of the retracement path into
+the gap: passive, low-participation, high-impact-per-contract retracements
+(institutional parent order still working) precede defended gaps; aggressive,
+high-participation retracements precede failures. Measured as DES (Defense
+Expectancy Score) = mean of trailing-1-year percentile ranks of three fixed
+features computed on 1-minute bars:
+- F1 Retrace Participation Ratio = mean(vol retrace)/mean(vol impulse)  [low=good]
+- F2 BVC Counterflow Fraction = signed-volume flow against the FVG direction
+  during retrace, signed via Bulk Volume Classification sv=V*(2*Phi(dP/sigma)-1),
+  sigma = trailing 50-bar 1-min std  [low=good]
+- F3 Impact Asymmetry = mean(|r|/V) retrace / mean(|r|/V) impulse  [high=good]
+All windows FIXED by convention. NO weights, NO tuning, NO sweeps. DES requires
+>=100 prior trades in the trailing year, else undefined. Trades entered on the
+bar immediately after FVG creation (age=1) have an empty retrace window; their
+DES is undefined by construction and they are reported as uncovered.
+
+### Pre-registered kill criteria (any one -> REJECT)
+1. No monotone increase of per-contract expectancy across DES quintiles in dev.
+2. Q5-Q1 expectancy spread < $40/trade per contract... [NOTE: original proposal
+   said $40/trade at full size; per-contract equivalent at ~4ct avg = $10/ct.
+   Registered as: spread < $10 per contract.]
+3. Spread sign flips between dev (2019-2022) and validation (2023+).
+4. |correlation(DES, fvg_quality_score)| > 0.5 (re-measuring known information).
+5. Permutation p >= 0.05 for the Q5-Q1 spread.
+
+### Method
+Script: research/run_inventory_echo_study.py. Deterministic re-run of the frozen
+V29 backtest to reproduce the identical FVG trade set (no signal changes, no
+entry/exit changes); features computed post-hoc from raw 1-minute bars; full
+battery: distribution, quintiles, permutation, bootstrap CI, Spearman,
+incremental value vs quality score (OLS + partial rank correlation), yearly,
+regime splits, interactions, failure analysis, and a resize-only sizing
+simulation (Q1 -1ct / Q5 +1ct, clipped [1,5]) with compact combine bootstrap.
+Results appended below AFTER this entry was committed to disk.
+
+### RESULT (2026-07-20, script run after pre-registration) — ❌ REJECT
+
+Coverage: 2,877 FVG trades reproduced (100.0% entry-bar mapping validation).
+Features defined for 2,054 (71.4%) — 823 trades (28.6%) enter at age 0-1 with an
+EMPTY retrace window; the hypothesis is structurally untestable on the
+strategy's fastest entries. DES computed for 1,954 after warm-up.
+
+Kill criteria: **4 of 5 triggered.**
+1. Monotonicity: FAILED. Expectancy by quintile ($/ct): 10.53 / 11.77 / 14.08 /
+   9.30 / 9.81 — peak at Q3, no trend.
+2. Spread: FAILED. Q5-Q1 = **-$0.72/ct** (registered floor: +$10).
+3. Sign stability: FAILED. Yearly spreads: +13.3 (2020), -5.5 (2021), -3.8
+   (2022), +8.7 (2023), +3.0 (2024), +2.8 (2025), -16.4 (2026). Noise.
+4. Score overlap: NOT triggered — corr(DES, quality score) = 0.04. DES is
+   genuinely orthogonal to the score… and orthogonal to profit too.
+5. Significance: FAILED. Permutation p=0.59; bootstrap 95% CI [-6.74, +5.40]
+   straddles zero; Spearman(DES, pnl/ct) = -0.012 (p=0.58); incremental OLS
+   beta p=0.64; partial rank corr p=0.62. Nothing anywhere — no year, no
+   regime, no session, no age/size/trend slice reached significance.
+
+Falsification checks: DES uncorrelated with ATR ratio (0.03), ADX (-0.00), FVG
+size (-0.01) — it is NOT a hidden volatility/trend proxy. It IS correlated with
+FVG age (rho=0.29): window length mechanically leaks into the features. Part of
+DES's variance was "how long did the retrace take," which the age gate already
+caps.
+
+Sizing simulation: INVALID — implementation bug (sizes clipped to [1,5] but the
+score-map runs 8-50 contracts on 819 trades carrying $291k of $430k net; the
+clip, not DES, produced the sim's net difference). Not re-run: with the signal
+dead upstream, a corrected sim cannot change the verdict.
+
+### Why it failed (mechanism, worth remembering)
+(a) Sample-size floor: retrace windows are 5-15 one-minute bars — BVC and
+impact estimates from so few bars are noise-dominated. (b) The age<=4 cap means
+all retraces are <=20 minutes; institutional re-engagement footprints, if they
+exist, likely need longer horizons. (c) 29% of trades have no retrace window at
+all. (d) The strategy's upstream filters (regime, bias, score) may already
+harvest whatever conditioning information exists.
+
+### Decision — REJECT. Do not revisit retrace-character features on 1-min OHLCV
+for this strategy without materially different data (true tick/order flow) or a
+materially different trade horizon. A null this clean is a closed door, not an
+invitation to tune.
+
+---
+
 ## 2026-07-19 — Port: FVG_BLOCK_LEVEL_SWEEP_ENABLED (candidate, not shipped)
 
 ### Background
