@@ -544,13 +544,57 @@ def _extract_position_size(position: Dict[str, Any]) -> int:
 
 
 def _extract_signed_position_size(position: Dict[str, Any]) -> int:
+    """Signed net position from a ProjectX position payload.
+
+    ProjectX sends UNSIGNED sizes with the direction in `type`: 1 = long,
+    2 = short (confirmed from live REST + hub captures 2026-07-20, see
+    payload_forensics.jsonl — a 21-lot short arrived as {"type": 2,
+    "size": 21}). Sign the size from `type` when present; a payload that
+    already carries a signed/negative size passes through unchanged.
+    """
     for key in ("size", "netPos", "quantity", "qty", "positionSize"):
         value = position.get(key)
         try:
-            return int(float(value))
+            signed = int(float(value))
         except (TypeError, ValueError):
             continue
+        try:
+            position_type = int(position.get("type"))
+        except (TypeError, ValueError):
+            position_type = None
+        if position_type == 2 and signed > 0:
+            return -signed
+        return signed
     return 0
+
+
+def _hub_event_data(payload: Any) -> Dict[str, Any]:
+    """ProjectX user-hub payloads arrive enveloped: {"action": N, "data":
+    {...actual fields...}} (confirmed from live captures 2026-07-20). REST
+    payloads are flat. Return the inner dict either way; never raises."""
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return data
+        return payload
+    return {}
+
+
+# ProjectX numeric order-status codes, mapped from live captures 2026-07-20
+# (6 = fresh submission, 8 = bracket awaiting parent fill, 1 = working with
+# prices populated, 2 = filled with fillVolume==size) plus the documented enum.
+_ORDER_STATUS_NAMES = {
+    0: "none", 1: "open", 2: "filled", 3: "cancelled", 4: "expired",
+    5: "rejected", 6: "pending", 8: "suspended",
+}
+
+
+def _order_status_name(order: Dict[str, Any]) -> str:
+    status = order.get("status")
+    try:
+        return _ORDER_STATUS_NAMES.get(int(status), str(status).strip().lower())
+    except (TypeError, ValueError):
+        return str(status or "").strip().lower()
 
 
 def _order_matches_contract(order: Dict[str, Any], contract_id: str) -> bool:
@@ -586,20 +630,22 @@ def _is_protective_stop_like_order(order: Dict[str, Any], entry_side: int, contr
 
 
 _TERMINAL_ORDER_STATUSES = {"filled", "cancelled", "canceled", "rejected", "complete", "done", "expired"}
+# Statuses under which a stop order actually protects the position. Whitelist,
+# not blacklist: an UNKNOWN status must NOT confirm brackets — verification then
+# falls back to the REST check, which is the safe failure direction.
+# (Finding 5 + Finding 8 fix: cancelled stops must never confirm, and live
+# statuses are numeric codes, not strings — see _ORDER_STATUS_NAMES.)
+_WORKING_ORDER_STATUSES = {"open", "working", "accepted", "new", "pending", "suspended", "untriggered"}
 
 
 def _user_hub_confirms_protective_order(event: Dict[str, Any], order_payload: Dict[str, Any]) -> bool:
     if event.get("event_type") != "GatewayUserOrder":
         return False
-    payload = event.get("payload") or {}
-    # Reject terminal statuses: a cancelled or rejected stop must never count as
-    # bracket confirmation. Only working/accepted/new orders actually protect the
-    # position. (Finding 5 fix: hub confirmation previously accepted cancelled stops.)
-    order_status = str(payload.get("status", "")).strip().lower()
-    if order_status in _TERMINAL_ORDER_STATUSES:
+    data = _hub_event_data(event.get("payload") or {})
+    if _order_status_name(data) not in _WORKING_ORDER_STATUSES:
         return False
     return _is_protective_stop_like_order(
-        payload,
+        data,
         entry_side=int(order_payload["side"]),
         contract_id=str(order_payload["contractId"]),
     )
@@ -1091,56 +1137,63 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
         event_type = str(event.get("event_type", ""))
         payload = event.get("payload", {}) or {}
         state["last_hub_message_at"] = event.get("logged_at")
-        # Raw capture (capped/day): live hub logs show status=None/size=0 on every
-        # event, so the real payload shape is unknown — record it to find out.
+        # Raw capture (capped/day): keeps a per-day sample of true payload shapes
+        # so any future ProjectX schema change is diagnosable from evidence.
         _log_payload_forensics(f"hub_{event_type or 'unknown'}", event)
+        # Live payloads arrive enveloped as {"action": N, "data": {...}}; all
+        # field reads below must use the unwrapped data (Finding 8 fix — the
+        # old flat reads returned None/0 for every field, leaving slippage
+        # monitoring and hub order/position tracking blind).
+        data = _hub_event_data(payload)
         if event_type == "GatewayUserAccount":
-            _apply_hub_account_update(state, payload)
-            _write_log("INFO", f"user_hub_account_update balance={payload.get('balance')}")
+            _apply_hub_account_update(state, data)
+            _write_log("INFO", f"user_hub_account_update balance={data.get('balance')}")
         elif event_type == "GatewayUserPosition":
-            try:
-                signed_size = int(float(payload.get("size", 0)))
-            except (TypeError, ValueError):
-                signed_size = 0
+            signed_size = _extract_signed_position_size(data)
             state["in_trade"] = bool(signed_size)
             state["current_position"] = signed_size
-            try:
-                state["current_contracts"] = abs(signed_size)
-            except (TypeError, ValueError):
-                state["current_contracts"] = 0
+            state["current_contracts"] = abs(signed_size)
             _write_log(
                 "INFO",
-                f"user_hub_position_update contract={payload.get('contractId', '')} size={payload.get('size', 0)}",
+                f"user_hub_position_update contract={data.get('contractId', '')} "
+                f"size={signed_size} (raw size={data.get('size', 0)} type={data.get('type')})",
             )
         elif event_type == "GatewayUserOrder":
-            order_status = str(payload.get("status", "")).lower()
-            if order_status in {"working", "open", "accepted", "new"}:
+            order_status = _order_status_name(data)
+            if order_status in _WORKING_ORDER_STATUSES:
                 state["open_order_count"] = max(1, int(state.get("open_order_count", 0) or 0))
-            elif order_status in {"filled", "cancelled", "canceled", "rejected", "complete", "done"}:
+            elif order_status in _TERMINAL_ORDER_STATUSES:
                 state["open_order_count"] = max(0, int(state.get("open_order_count", 0) or 0) - 1)
             _log_trade_event(
                 event_type="user_hub_order",
                 signal_payload={"signal": {}, "run_mode": bot.RUN_MODE, "execution_profile": bot.EXECUTION_PROFILE},
                 account_name=account_name,
-                contract_name=str(payload.get("contractId", "")),
+                contract_name=str(data.get("contractId", "")),
                 dry_run=False,
                 executed=False,
-                notes=f"User hub order event status={payload.get('status')} orderId={payload.get('id')}",
+                notes=f"User hub order event status={order_status}({data.get('status')}) orderId={data.get('id')}",
                 broker_response=payload,
             )
         elif event_type == "GatewayUserTrade":
-            trade_id = payload.get("id")
+            trade_id = data.get("id")
             if trade_id == state.get("last_user_trade_id"):
                 continue
             state["last_user_trade_id"] = trade_id
             state["session_trade_count"] = int(state.get("session_trade_count", 0) or 0) + 1
             state["in_trade"] = True
-            trade_pnl = _extract_numeric(payload, "profitAndLoss", "pnl", "profit")
+            trade_pnl = _extract_numeric(data, "profitAndLoss", "pnl", "profit")
             if trade_pnl is not None:
                 state["session_daily_pnl_usd"] = float(state.get("session_daily_pnl_usd", 0.0) or 0.0) + float(trade_pnl)
             prev_position = int(state.get("current_position", 0) or 0)
             try:
-                signed_trade_size = int(float(payload.get("size", prev_position)))
+                # Trade sizes are unsigned; direction is in `side` (0=buy,
+                # 1=sell — confirmed from live captures 2026-07-20).
+                _raw_trade_size = int(float(data.get("size", prev_position)))
+                try:
+                    _trade_side = int(data.get("side"))
+                except (TypeError, ValueError):
+                    _trade_side = None
+                signed_trade_size = -abs(_raw_trade_size) if _trade_side == 1 else _raw_trade_size
                 if prev_position == 0:
                     # Entry from flat: the trade size IS the new position.
                     # When already in a position, leave position tracking to
@@ -1152,9 +1205,10 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
             except (TypeError, ValueError):
                 signed_trade_size = prev_position
             fill_timestamp = (
-                payload.get("fillTime")
-                or payload.get("timestamp")
-                or payload.get("tradeTime")
+                data.get("fillTime")
+                or data.get("timestamp")
+                or data.get("tradeTime")
+                or data.get("creationTimestamp")
                 or event.get("logged_at")
             )
             latency_submit_to_fill_ms = _duration_ms(state.get("last_order_submitted_at"), fill_timestamp)
@@ -1169,7 +1223,7 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
             # partial-fills from being mistaken for exits. The backtest assumes ~1
             # tick; if a rolling average exceeds SLIPPAGE_ALERT_TICKS the edge
             # assumption is broken -> halt.
-            actual = _extract_numeric(payload, "price", "fillPrice", "averagePrice", "avgPrice")
+            actual = _extract_numeric(data, "price", "fillPrice", "averagePrice", "avgPrice")
             _fill_dir = "long" if int(state.get("current_position", 0) or 0) > 0 else "short"
             if state.get("awaiting_entry_fill") and trade_pnl is None:
                 intended = state.get("last_signal_entry_price")
@@ -1180,8 +1234,8 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
                     state["awaiting_exit_fill"] = True   # arm exit monitoring
                     state["last_entry_fill_price"] = float(actual)  # anchor for live stop mgmt
                     _row = _log_fill_forensics(state, kind="entry",
-                        contract=str(payload.get("contractId", "")), direction=_fill_dir,
-                        size=payload.get("size"), intended=intended, actual=actual, trade_pnl=None)
+                        contract=str(data.get("contractId", "")), direction=_fill_dir,
+                        size=data.get("size"), intended=intended, actual=actual, trade_pnl=None)
                     _alert_fill("entry", _row)
                     _emit_slippage_log_and_halt(
                         "entry", state["rolling_entry_slippage_ticks"], intended, actual,
@@ -1197,8 +1251,8 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
                         state.get("rolling_exit_slippage_ticks"), intended, actual)
                     state["awaiting_exit_fill"] = False
                     _row = _log_fill_forensics(state, kind=f"exit_{exit_kind}",
-                        contract=str(payload.get("contractId", "")), direction=_fill_dir,
-                        size=payload.get("size"), intended=intended, actual=actual, trade_pnl=trade_pnl)
+                        contract=str(data.get("contractId", "")), direction=_fill_dir,
+                        size=data.get("size"), intended=intended, actual=actual, trade_pnl=trade_pnl)
                     _alert_fill(f"exit_{exit_kind}", _row)
                     _emit_slippage_log_and_halt(
                         f"exit_{exit_kind}", state["rolling_exit_slippage_ticks"], intended, actual,
@@ -1214,12 +1268,12 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
                 event_type="user_hub_trade",
                 signal_payload={"signal": {}, "run_mode": bot.RUN_MODE, "execution_profile": bot.EXECUTION_PROFILE},
                 account_name=account_name,
-                contract_name=str(payload.get("contractId", "")),
+                contract_name=str(data.get("contractId", "")),
                 dry_run=False,
                 executed=True,
                 notes=(
-                    f"User hub trade fill id={trade_id} size={payload.get('size')} "
-                    f"pnl={payload.get('profitAndLoss')} "
+                    f"User hub trade fill id={trade_id} size={data.get('size')} "
+                    f"pnl={data.get('profitAndLoss')} "
                     f"bar_to_signal_ms={state.get('latency_bar_to_signal_ms')} "
                     f"signal_to_submit_ms={state.get('latency_signal_to_submit_ms')} "
                     f"submit_to_fill_ms={state.get('latency_submit_to_fill_ms')}"

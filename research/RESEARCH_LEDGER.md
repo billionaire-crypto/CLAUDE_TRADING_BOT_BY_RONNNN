@@ -13,6 +13,68 @@ root as modules, e.g. `python -m research.run_bias_validation`.
 
 ---
 
+## 2026-07-20 — Payload forensics analyzed: Findings 1/8/B CLOSED + a live false-flatten hazard found & fixed
+
+### What the first live captures showed (raw evidence, payload_forensics.jsonl)
+The 2026-07-20 trades produced full captures of every hub event type + REST
+snapshots. Facts established:
+- **Hub envelope (Finding 8):** every user-hub payload arrives as
+  `{"action": N, "data": {...}}`. The parser read fields from the top level →
+  every field extracted None/0 → slippage monitoring, hub order/position/
+  account tracking ALL silently blind since go-live.
+- **Status enums (Finding 8):** numeric. Observed: 6=fresh submission,
+  8=bracket awaiting parent fill (stopPrice not yet populated), 1=working
+  (prices populated), 2=filled (fillVolume==size). Mapped with the documented
+  enum: 3=cancelled, 4=expired, 5=rejected.
+- **Unsigned sizes (Finding 1 — CONFIRMED REAL):** positions arrive as
+  `{"type": 2, "size": 21}` for a 21-lot SHORT (type 1=long, 2=short), in BOTH
+  hub and REST. Trades likewise unsigned with `side` 0=buy/1=sell.
+- **Auto-OCO (Finding B — RESOLVED, no bug):** REST after entry shows exactly
+  2 orders (SL type 4 + TP type 1), properly parented. No duplicate brackets.
+
+### The serious discovery: false-flatten hazard on shorts (live since 07-18)
+Because REST sizes are unsigned, `_extract_signed_position_size` returned +21
+for a short → `_unprotected_position_detected` derived entry_side=long → the
+buy-side brackets of a SHORT failed the opposite-side test → detector returned
+**True on a fully protected short** (verified empirically by running the
+deployed functions against the captured payloads). Consequence: the first
+reconcile tick that caught a short open would have emergency-flattened +
+kill-switched a healthy position. It never fired only by luck: the 07-16
+shorts ran under the OLD pre-restart code (order-count check only), and the
+07-20 shorts closed in <60s, between reconcile ticks.
+
+### Fixes shipped (src/topstepx_runtime.py, all evidence-driven)
+1. `_extract_signed_position_size`: type-aware signing (type 2 → negative);
+   signed legacy payloads pass through.
+2. `_hub_event_data()`: envelope unwrap with flat fallback; all four
+   Gateway branches now read the inner `data`.
+3. `_order_status_name()` + numeric enum map; bracket confirmation switched
+   from terminal-status blacklist to working-status WHITELIST (unknown codes
+   fail safe to the REST check).
+4. Trade events: size signed from `side`; `creationTimestamp` added to fill
+   latency candidates.
+Verified against the real captures: short = -21; protected short no longer
+flagged; SL confirms at status 8/1, TP and terminal/unknown statuses do not;
+entry fill records slippage (2.0 ticks measured on the 07-20 entry — first
+live slippage measurement ever) and advances lifecycle flags; exit fill at
+the exact stop price records 0.0 ticks. 13 new regression tests pin the real
+wire shapes; suite 142/142. Bot restarted onto the fixed code 07-20 evening.
+
+### Process note (honesty entry)
+The ad-hoc verification harness imported the live module without neutralizing
+`_write_log`, leaking a few INFO lines into live_log_20260720.txt (~21:20 CDT)
+and a couple of forensics captures. No state/orders/Telegram touched. Rule
+going forward: ad-hoc harnesses monkeypatch `_write_log` and redirect export
+paths, same as the test suite's autouse fixture.
+
+### Also noted for the future
+On hub (re)connect ProjectX REPLAYS recent events (stale position/trade
+snapshots arrived at 21:20 after restart). State self-corrects at the next
+REST reconcile, but hub-derived `in_trade` may be briefly stale-true after a
+reconnect. Known, tolerated; do not "fix" without evidence it causes harm.
+
+---
+
 ## 2026-07-20 — PRE-REGISTRATION: Unfinished Inventory Hypothesis (DES study)
 
 ### Hypothesis (registered BEFORE any results were computed)
@@ -758,6 +820,34 @@ Full 7-year gauntlet: 3-way split (dev 19-22 / val1 23-24 / val2 25-26+), walk-f
 
 ### Decision
 **REJECT** — dev_2019_2022: candidate net $194,532 < 95% of baseline $217,509; val1_2023_2024: candidate net $100,622 < 95% of baseline $109,435; val2_2025_2026: candidate net $90,962 < 95% of baseline $102,820; combine pass rate -2.4pp (worse than -1pp tolerance); worst trade $-2,318 worse than baseline $-983
+
+### Notes for the next session
+Automated overnight result. Verify independently before changing the live config — this is a candidate for human review, not an applied change.
+
+---
+
+## 2026-07-20 — 🌙 NIGHTLY RESEARCHER: FVG_BLOCK_LEVEL_SWEEP_ENABLED False -> True — **REJECT**
+
+### Hypothesis
+Ported from an older, since-diverged commit on main (codex/topstepx-hardening-checkpoint, f4d76cd, 2026-04-19) that found FVGs preceded by a globex_high liquidity sweep (wick 3-8 NQ pts beyond the level, closing back inside, within 10 bars) win at 39.1% vs 46% baseline -- a real structural weakness, not noise. That validation predates vwap_only bias, ATR-scaled targets, FVG_MAX_AGE_BARS=4, and CALM_ATR_RATIO=0.70, so it is STALE against the current config and must be re-earned, not assumed. Detection logic ported into bot.py as FVG_BLOCK_LEVEL_SWEEP_ENABLED (default False, fully inert -- current live bot behavior is unchanged by this port). The gauntlet decides whether the filter still holds up now.
+
+### Method (script: research/nightly_researcher.py — automated, unattended)
+Full 7-year gauntlet: 3-way split (dev 19-22 / val1 23-24 / val2 25-26+), walk-forward (half-year windows), stress (slip x2/x3, 10% missed fills), 100k-path combine bootstrap, floor safety vs baseline worst trade. Parameter set via in-memory setattr on `bot.py`, restored after each run — **src/bot.py was not modified on disk.**
+
+### Result
+
+- **dev_2019_2022**: baseline net $217,509 (PF 4.03, n=1607) vs candidate net $207,390 (PF 4.01, n=1502)
+- **val1_2023_2024**: baseline net $109,435 (PF 3.92, n=768) vs candidate net $105,751 (PF 3.94, n=716)
+- **val2_2025_2026**: baseline net $102,820 (PF 4.27, n=502) vs candidate net $100,754 (PF 4.40, n=470)
+- **Walk-forward**: 16 windows, 0 negative, avg $25,868/window
+- **Stress slip_x2**: net $363,418, PF 3.61
+- **Stress slip_x3**: net $326,206, PF 3.17
+- **Stress miss_10pct**: net $363,658, PF 3.92
+- **Combine sim**: pass rate 97.7% -> 96.7%, daily-limit fails 1.96% -> 3.08%
+- **Floor safety**: worst trade $-983 -> $-1,034
+
+### Decision
+**REJECT** — combine pass rate -1.1pp (worse than -1pp tolerance); worst trade $-1,034 worse than baseline $-983
 
 ### Notes for the next session
 Automated overnight result. Verify independently before changing the live config — this is a candidate for human review, not an applied change.

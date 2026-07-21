@@ -33,6 +33,10 @@ def _no_real_telegram(monkeypatch, tmp_path):
     monkeypatch.setattr(tr, "PAYLOAD_FORENSICS_PATH",
                         str(tmp_path / "payload_forensics.jsonl"), raising=False)
     monkeypatch.setattr(tr, "_payload_forensics_counts", {}, raising=False)
+    # Fill forensics likewise: hub-trade tests exercise the slippage path,
+    # which appends rows — those must land in tmp, not the live CSV.
+    monkeypatch.setattr(tr, "FILL_FORENSICS_CSV_PATH",
+                        str(tmp_path / "fill_forensics.csv"), raising=False)
 
 
 # ── round_turn_cost: tiered slippage (1 tk <=10, 2 tk 11-20, 3 tk 21+) ──────────
@@ -1147,3 +1151,152 @@ def test_hub_event_capture_records_raw_event(monkeypatch):
     # The FULL event is captured (not the pre-parsed extract), so the true
     # payload shape is preserved even if the parser's key assumptions are wrong.
     assert hub_rec["payload"]["payload"]["size"] == -4
+
+
+# ── Real ProjectX payload shapes (captured live 2026-07-20, forensics JSONL) ────
+# These fixtures mirror the exact wire format: hub events enveloped as
+# {"action": N, "data": {...}}, numeric status/type codes, UNSIGNED position
+# and trade sizes with direction in `type` (positions: 1=long/2=short) or
+# `side` (orders/trades: 0=buy/1=sell).
+
+_REAL_SHORT_POSITION = {
+    "id": 793089049, "accountId": 24808178, "contractId": "CON.F.US.MNQ.U26",
+    "type": 2, "size": 21, "averagePrice": 28876.0,
+}
+_REAL_SL_ORDER = {
+    "id": 3293159491, "accountId": 24808178, "contractId": "CON.F.US.MNQ.U26",
+    "status": 1, "type": 4, "side": 0, "size": 21,
+    "limitPrice": None, "stopPrice": 28881.25, "fillVolume": 0,
+    "customTag": "V29-FVG-short-2026-07-20T135500-0500-a1784574013-SL",
+}
+_REAL_TP_ORDER = {
+    "id": 3293159492, "accountId": 24808178, "contractId": "CON.F.US.MNQ.U26",
+    "status": 1, "type": 1, "side": 0, "size": 21,
+    "limitPrice": 28816.0, "stopPrice": None, "fillVolume": 0,
+    "customTag": "V29-FVG-short-2026-07-20T135500-0500-a1784574013-TP",
+}
+
+
+def _enveloped(event_type, data):
+    return {"event_type": event_type, "payload": {"action": 1, "data": data},
+            "logged_at": "2026-07-20T19:00:15Z"}
+
+
+class _UnprotCfg:
+    enable_order_routing = True
+    dry_run = False
+
+
+def test_signed_size_short_position_real_shape():
+    assert tr._extract_signed_position_size(_REAL_SHORT_POSITION) == -21
+
+
+def test_signed_size_long_position_type1():
+    assert tr._extract_signed_position_size({"type": 1, "size": 5}) == 5
+
+
+def test_signed_size_flat_position_type0():
+    assert tr._extract_signed_position_size({"type": 0, "size": 0}) == 0
+
+
+def test_signed_size_legacy_signed_payload_passthrough():
+    # A payload already carrying a signed size (no type field) is unchanged.
+    assert tr._extract_signed_position_size({"size": -3}) == -3
+
+
+def test_unprotected_detector_accepts_real_short_brackets():
+    """Regression: before the type-aware sign fix, a live short read as +21 ->
+    entry_side long -> buy-side brackets unrecognized -> FALSE emergency
+    flatten of a fully protected position."""
+    state = {"open_position_count": 1, "open_order_count": 2}
+    assert not tr._unprotected_position_detected(
+        state, _UnprotCfg(),
+        open_orders=[_REAL_SL_ORDER, _REAL_TP_ORDER],
+        open_positions=[_REAL_SHORT_POSITION])
+
+
+def test_unprotected_detector_fires_when_short_has_only_tp():
+    state = {"open_position_count": 1, "open_order_count": 1}
+    assert tr._unprotected_position_detected(
+        state, _UnprotCfg(),
+        open_orders=[_REAL_TP_ORDER],
+        open_positions=[_REAL_SHORT_POSITION])
+
+
+def test_hub_envelope_suspended_stop_confirms_short_bracket():
+    ev = _enveloped("GatewayUserOrder", dict(_REAL_SL_ORDER, status=8, stopPrice=None))
+    assert tr._user_hub_confirms_protective_order(
+        ev, {"side": 1, "contractId": "CON.F.US.MNQ.U26"})
+
+
+def test_hub_envelope_filled_entry_order_does_not_confirm():
+    entry = {"id": 1, "contractId": "CON.F.US.MNQ.U26", "status": 2,
+             "type": 2, "side": 1, "size": 21, "fillVolume": 21}
+    ev = _enveloped("GatewayUserOrder", entry)
+    assert not tr._user_hub_confirms_protective_order(
+        ev, {"side": 1, "contractId": "CON.F.US.MNQ.U26"})
+
+
+def test_hub_envelope_cancelled_stop_does_not_confirm():
+    ev = _enveloped("GatewayUserOrder", dict(_REAL_SL_ORDER, status=3))
+    assert not tr._user_hub_confirms_protective_order(
+        ev, {"side": 1, "contractId": "CON.F.US.MNQ.U26"})
+
+
+def test_hub_envelope_unknown_status_does_not_confirm():
+    # Whitelist semantics: an unknown status code must fail safe (fall back to
+    # the REST bracket check) rather than confirm protection.
+    ev = _enveloped("GatewayUserOrder", dict(_REAL_SL_ORDER, status=99))
+    assert not tr._user_hub_confirms_protective_order(
+        ev, {"side": 1, "contractId": "CON.F.US.MNQ.U26"})
+
+
+def test_hub_position_event_short_sets_negative_position(monkeypatch):
+    monkeypatch.setattr(tr, "_log_trade_event", lambda **k: None)
+    state = tr._default_state()
+    tr._process_user_hub_events(
+        [_enveloped("GatewayUserPosition", _REAL_SHORT_POSITION)], state, _HubCfg())
+    assert state["current_position"] == -21
+    assert state["current_contracts"] == 21
+    assert state["in_trade"] is True
+
+
+def test_hub_trade_entry_fill_arms_slippage_monitoring(monkeypatch, tmp_path):
+    """End-to-end on the REAL captured entry-fill shape: envelope unwrapped,
+    price seen, slippage recorded, lifecycle flags advanced."""
+    monkeypatch.setattr(tr, "_log_trade_event", lambda **k: None)
+    monkeypatch.setattr(tr, "KILL_SWITCH_PATH", str(tmp_path / "HALT.txt"))
+    trade = {"id": 2884287598, "accountId": 24808178,
+             "contractId": "CON.F.US.MNQ.U26", "price": 28876.0,
+             "fees": 7.56, "side": 1, "size": 21, "voided": False,
+             "orderId": 3293159486, "profitAndLoss": None,
+             "creationTimestamp": "2026-07-20T19:00:15.260089+00:00"}
+    state = tr._default_state()
+    state.update({"current_position": 0, "awaiting_entry_fill": True,
+                  "last_signal_entry_price": 28875.5,
+                  "rolling_entry_slippage_ticks": []})
+    tr._process_user_hub_events(
+        [_enveloped("GatewayUserTrade", trade)], state, _HubCfg())
+    assert state["awaiting_entry_fill"] is False
+    assert state["awaiting_exit_fill"] is True
+    assert state["last_entry_fill_price"] == 28876.0
+    assert state["rolling_entry_slippage_ticks"] == [2.0]   # 0.5 pts = 2 ticks
+    assert state["current_position"] == -21                 # sell 21 from flat
+
+
+def test_hub_trade_exit_fill_records_exit_slippage(monkeypatch, tmp_path):
+    monkeypatch.setattr(tr, "_log_trade_event", lambda **k: None)
+    monkeypatch.setattr(tr, "KILL_SWITCH_PATH", str(tmp_path / "HALT.txt"))
+    exit_trade = {"id": 2884287777, "contractId": "CON.F.US.MNQ.U26",
+                  "price": 28881.25, "side": 0, "size": 21,
+                  "profitAndLoss": -220.5, "orderId": 3293159491}
+    state = tr._default_state()
+    state.update({"current_position": -21, "awaiting_entry_fill": False,
+                  "awaiting_exit_fill": True,
+                  "last_signal_stop_price": 28881.25,
+                  "last_signal_target_price": 28816.0,
+                  "rolling_exit_slippage_ticks": []})
+    tr._process_user_hub_events(
+        [_enveloped("GatewayUserTrade", exit_trade)], state, _HubCfg())
+    assert state["awaiting_exit_fill"] is False
+    assert state["rolling_exit_slippage_ticks"] == [0.0]    # exact stop fill
