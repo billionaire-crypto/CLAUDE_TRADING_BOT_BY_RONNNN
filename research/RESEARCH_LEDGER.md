@@ -851,3 +851,169 @@ Full 7-year gauntlet: 3-way split (dev 19-22 / val1 23-24 / val2 25-26+), walk-f
 
 ### Notes for the next session
 Automated overnight result. Verify independently before changing the live config — this is a candidate for human review, not an applied change.
+
+---
+
+## 2026-07-24 — Execution-integrity fixes + baseline artifact regeneration
+
+**Not a strategy change.** No entry logic, no sizing, no parameter touched. Recorded here
+because it corrects numbers that earlier ledger/PLAYBOOK entries relied on.
+
+### Hypothesis
+Live execution was believed to be running ~20x worse than the backtest's 1-tick slippage
+assumption, which would have invalidated the shipped baseline.
+
+### Method
+Direction-aware recomputation of every fill in `v29_fill_forensics.csv`, cross-checked
+against realised session P&L in the live logs.
+
+### Result — the premise was FALSE
+- `_record_slippage()` and `_log_fill_forensics()` both used `abs()`, so fills that landed
+  *better* than intended were recorded as slippage. Two of five measured fills were
+  favorable and had been counted as 19 and 3 ticks of loss.
+- The alarming "136 ticks" fill (2026-07-22 14:55) was **not real money**. Session P&L moved
+  −65.98 → −94.86, i.e. that trade lost **$28.88** (~1.5 pts). A genuine 34-pt adverse entry
+  on 8 contracts would have cost ~$544. The fill was at the true market price; the recorded
+  `intended` was stale because 2–3 run-loop processes were sharing one state file that day.
+- Slippage is therefore **effectively unmeasured**: 11 of 14 live trades (Jul 15–20) produced
+  no records at all (pre-fix hub parser was blind), Jul 22's are corrupt, leaving Jul 24's
+  single clean pair at 3 ticks each way. **No live slippage average may be quoted yet.**
+- ~60 "slippage" records in logs dated Jul 1–8 are unit-test leakage (`unit_test_reason`,
+  `intended=20000.0`). Already fixed by the autouse fixture in commit 5ca8a60; residue left
+  in the historical logs deliberately rather than rewriting records.
+
+### Fixes shipped
+1. `_adverse_slippage_ticks()` — single definition of "worse", signed by side. Applied to both
+   the halt path and the forensics CSV.
+2. Fill direction now read from the trade's own `side` field, not `current_position`. The
+   position event can arrive after the trade event, which had been mislabelling every entry
+   as short and flipping the sign.
+3. Single-fill guards: alert ≥8 ticks, halt ≥32 ticks (= `STOP_TICKS`). The pre-existing
+   rolling-average halt needs 20 fills — 15+ trading days at the live rate — so it could not
+   have caught a one-off catastrophic fill. Both thresholds are chosen safety values, **not**
+   swept/validated numbers.
+4. `_reserve_signal_id()` — atomic `O_CREAT|O_EXCL` claim immediately before `place_order()`.
+   Closes the check-then-act race that produced 8 contracts on a 4-contract signal on
+   2026-07-22. Never released on failure: skipping a bar is free, double-sizing is not.
+5. `_sorted_or_empty()` in `bot.py` — pre-existing `KeyError: 'fb_level_type'` crashed the CSV
+   export step whenever FAILED_BREAKOUT had zero trades (i.e. always, in the live config).
+
+Tests: `tests/test_risk_and_safety.py` 126 → **136 passing**, including regression guards
+pinned to the real Jul 22 / Jul 24 wire prices.
+
+### Baseline artifacts regenerated
+`v29_trades_full.csv` and `v29_daily_summary.csv` were dated 2026-06-30 and described a config
+two shipped changes stale (pre-`vwap_only`, pre-`CALM_ATR_RATIO` 0.70): 2,303 trades /
+$278,317 / 35.0% WR. Old files preserved under
+`src/exports/archive/stale_20260630_preserved/` with provenance.
+
+**Re-run from the current live config, verified to match the "4 (live)" baseline row above:**
+
+| | Regenerated | Ledger baseline |
+|---|---|---|
+| Trades | 2,877 | 2877 |
+| Net | $429,763.60 | $429,764 |
+| PF | 4.06 | 4.06 |
+| Worst trade | −$983.40 | −$983 |
+| Win rate | 29.06% | — |
+| Range | 2019-05-06 → 2026-07-01 | — |
+
+⚠️ The figure **$416,436 / PF 4.10 / 2,697 trades** quoted earlier in this ledger is the
+`vwap_only` validation run and is now SUPERSEDED — it predates the `CALM_ATR_RATIO`
+0.75→0.70 change of 2026-07-07 (which added ~7% trade count, 2,697 → 2,877).
+The current live baseline is **$429,764 / PF 4.06 / 2,877**.
+
+### Decision
+**SHIPPED** (execution integrity only). Strategy untouched and unvalidated by this work.
+
+### Notes for the next session
+The combine simulator's 97.7% remains unrewritten: `run_combine_sim.py:59` uses an IID day
+bootstrap that breaks up losing streaks. That is the highest-value remaining correction and it
+is still open.
+
+---
+
+## 2026-07-24 — Combine simulator rewritten (`run_combine_sim_v2.py`); my IID critique was WRONG
+
+### Hypothesis (mine, and it did not survive)
+`run_combine_sim.py:59` draws days IID, which breaks up losing streaks. I predicted this
+inflated P(pass) materially and that a block bootstrap would pull 97.7% down sharply.
+
+### Method
+Measured clustering directly on the 1,848-day series before changing anything, then rebuilt
+the simulator with a decomposition so each correction's effect is attributable.
+
+### Result 1 — daily P&L does NOT cluster. The critique was theoretical, not real.
+| test | value |
+|---|---|
+| autocorrelation of P&L, lags 1/2/3/5/10 | +0.002 / +0.034 / +0.014 / +0.014 / +0.010 |
+| autocorrelation of \|P&L\| (vol clustering) | −0.014 / +0.037 / +0.008 / +0.022 / −0.009 |
+| max losing streak, real vs 5,000 shuffles | 10 vs mean 8.6, **p = 0.218** |
+| max drawdown, real vs 5,000 shuffles | −$1,857 vs mean −$1,798, **p = 0.363** |
+
+Neither significant. Shuffled day order is indistinguishable from real, so IID sampling was
+close to harmless *for this series*. Block bootstrap is implemented anyway (closes the
+objection with evidence), but re-run `--clustering` after any strategy change before relying
+on this.
+
+### Result 2 — two genuine rule bugs, both making v1 too HARSH
+- **Wrong failure threshold.** v1 failed an attempt on any day worse than `BOT_DAILY_LOSS_LIMIT`
+  (−$750) — the bot's own brake, a normal risk event. Topstep fails at
+  `COMBINE_DAILY_LOSS_LIMIT` (−$1,000). Measured: **2 of 1,848 days breach −$750, ZERO breach
+  −$1,000** (worst day −$983.40). v1's ~1.9% "daily limit" failures were entirely fictional.
+- **Trailing drawdown never locked.** Topstep's floor stops rising at $50,000 (peak $52,000);
+  v1 trailed forever, enforcing a ~$50.9k floor at a $52.9k peak. Since the target is $53,000
+  every winning path crosses the lock point, so this hit exactly the passing paths.
+
+### Result 3 — the real gap: v1 does not model the CONSISTENCY RULE at all
+`grep -ci consistency run_combine_sim.py` = **0**. The live bot *does* enforce it
+(`state.consistency_limit = 0.5`) and is in `status: "block"` right now (all $593.90 of live
+profit came from one day → ratio 1.0). This is the rule that specifically penalises V29's
+"rare huge day" profile, and the simulator ignored it.
+
+### Decomposition (100k runs each, current live config)
+| config | P(pass) | median days | E[$/attempt] |
+|---|---|---|---|
+| A — v1 legacy (reproduces old 97.7%) | 97.8% | 17d | +$4,302 |
+| B — + real Topstep DLL (−$1,000) | 99.6% | 17d | +$4,365 |
+| C — + trailing-DD lock at $50k | 99.7% | 17d | +$4,368 |
+| D — + block bootstrap (L=10) | 99.5% | 17d | +$4,338 |
+| E — + consistency rule (50%) | 99.5% | **20d** | +$5,228 |
+| F — + 60-day cap (lab-judge rules) | **98.2%** | 20d | +$5,200 |
+
+**My predicted fix (block bootstrap) is worth −0.2pp.** The two rule bugs are worth +1.9pp the
+other way. Consistency costs +3 median days (dilution) and −1.3pp once a time cap applies.
+Validated: running the untouched v1 still prints 97.7% / median 17d / 25-75th 12-23d, matching
+config A. Block length L ∈ {5,10,20,40} and stationary(L=10) all land 99.5-99.9% — insensitive.
+
+### Result 4 — the 22.5% vs 97.7% "contradiction" was a FALSE FRAMING (mine)
+Read the lab judge at `claude/bot-troubleshooting-vclkmv:src/combine_sim.py`. Its own docstring:
+*"Bootstrap assumes days are independent (ignores autocorrelation/streak clustering)."*
+**Both studies used IID.** The bootstrap was never the source of disagreement, so "the block
+bootstrap will tell you which is closer" was wrong. The numbers differ because they judge
+**different strategies**: the lab's regime-router ($84.5k net, PF 2.75) vs V29 ($429.8k, PF
+4.06). A PF-2.75 system passing 22.5% and a PF-4.06 system passing 98.2% are not in conflict.
+The lab judge is nonetheless the more complete instrument — it models consistency, an eval fee,
+a payout phase and a 60-day cap; v1 modeled none of those.
+
+### Decision
+**SHIPPED** as `research/run_combine_sim_v2.py`. v1 left in place for provenance.
+
+### The honest conclusion — and it is NOT reassuring
+Correcting the simulator moved P(pass) **up** (97.8% → 98.2%). That is the point: **the
+simulator was never the weak link.** A 98.2% pass rate is not credible for a prop-firm
+challenge, and no bootstrap sophistication can fix that, because the bootstrap can only
+resample days the backtest produced. The result follows mechanically from a daily distribution
+with mean **+$232.56**, sd $645, and a worst day of **−$983** across 1,848 days — if that
+distribution is real, 98.2% is right.
+
+**So the open question was never "is the simulator honest" — it is "is the backtest real."**
+That is an overfitting question (~20 parameters tuned on this same 7-year window) and it cannot
+be settled by simulation at all. Only out-of-sample live data can settle it. Current live
+sample: 14 trades. **Do not treat 98.2% as a forecast.**
+
+### Notes for the next session
+Remaining genuinely open: (a) V29 is unvalidated out-of-sample; (b) the consistency rule is a
+structural mismatch with a "rare huge day" edge — E[$] rises but eligibility is gated on
+diluting the very days that produce the edge; (c) the lab judge's payout modeling has no V29
+equivalent, so P(get paid) for V29 is still unmeasured.

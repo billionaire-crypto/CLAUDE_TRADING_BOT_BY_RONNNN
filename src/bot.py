@@ -4739,6 +4739,20 @@ def _prepare_trade_df(trades: List[TradeRecord]) -> pd.DataFrame:
     return td
 
 
+def _sorted_or_empty(df: pd.DataFrame, by: List[str]) -> pd.DataFrame:
+    """sort_values(by) but tolerant of an empty stats frame.
+
+    _build_group_stats returns a bare DataFrame() with no columns when its input
+    is empty, so sorting it raises KeyError. Entry types that are disabled in the
+    live config (FAILED_BREAKOUT, OD_PULLBACK, VWAP_*) legitimately produce zero
+    trades, which crashed the whole CSV export step after the main artifacts had
+    already been written (observed 2026-07-24: KeyError 'fb_level_type').
+    """
+    if df is None or df.empty or any(c not in df.columns for c in by):
+        return df
+    return df.sort_values(by)
+
+
 def _build_group_stats(td: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
     if td.empty:
         return pd.DataFrame()
@@ -5032,10 +5046,13 @@ def export_all_csvs(
                 filter_mask=(td["entry_type"] == "OD_PULLBACK"),
                 bucket_name="od_bars_from_drive_bucket",
             ),
-            "v29_fb_level_type.csv": _build_group_stats(
-                td[td["entry_type"] == "FAILED_BREAKOUT"],
+            "v29_fb_level_type.csv": _sorted_or_empty(
+                _build_group_stats(
+                    td[td["entry_type"] == "FAILED_BREAKOUT"],
+                    ["fb_level_type", "direction"],
+                ),
                 ["fb_level_type", "direction"],
-            ).sort_values(["fb_level_type", "direction"]),
+            ),
             "v29_fb_sweep_distance_bins.csv": _build_bucket_stats(
                 td,
                 value_col="abs_fb_sweep_distance_ticks",

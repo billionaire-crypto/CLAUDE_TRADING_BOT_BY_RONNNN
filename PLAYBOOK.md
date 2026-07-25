@@ -1,7 +1,10 @@
 # MNQ Bot — Operating Playbook
 
 **Read this before you touch anything. Especially when you're stressed.**
-Last updated: 2026-07-07. Config: V29 FVG, `vwap_only` bias, ATR targets (2.0×, cap 240t), breakeven live, trail OFF, CALM_ATR_RATIO 0.70 (gauntlet-validated change, 07-07).
+Last updated: 2026-07-24. Config: V29 FVG, `vwap_only` bias, ATR targets (2.0×, cap 240t), breakeven live, trail OFF, CALM_ATR_RATIO 0.70 (gauntlet-validated change, 07-07).
+All config values above re-verified against `src/bot.py` on 2026-07-24.
+Backtest baseline re-generated 2026-07-24 from the live config:
+**2,877 trades | net $429,763.60 | PF 4.06 | win rate 29.06% | worst trade −$983.40 | 2019-05-06 → 2026-07-01.**
 
 ---
 
@@ -19,8 +22,19 @@ Last updated: 2026-07-07. Config: V29 FVG, `vwap_only` bias, ATR targets (2.0×,
 |---|---|---|
 | Win rate | **~29%** (recent ~31–36%) | You LOSE ~7 of 10 trades. **This is by design.** |
 | Trades per day | **~1.2–1.3 in the current regime** (7-yr avg 1.5) | ~**1 in 3** days: **zero trades** (normal NOW — the market supplies fewer pullback days each year: idle rate 13%→32% from 2019→2026. Measured, not a malfunction). |
-| Combine pass | **~17–25 trading days** (slower than the 17-day median, which assumed the older, busier regime) | ~98% likely *if* live matches testing. |
-| Profit factor | 4.10 backtest → **plan for ~3 live** | Real fills are worse than backtests. Per-trade edge has RISEN as frequency fell. |
+| Combine pass | **~17–25 trading days** (slower than the 17-day median, which assumed the older, busier regime) | ~98% *per the simulator* — but see the warning below. Treat as an upper bound, not a forecast. |
+| Profit factor | **4.06 backtest** → **plan for ~3 live** | Real fills are worse than backtests. Per-trade edge has RISEN as frequency fell. |
+
+> ⚠️ **The 97.7% pass rate is optimistic and you should not plan around it.**
+> `research/run_combine_sim.py:59` draws each simulated day independently
+> (`RNG.integers(0, n)`). Real losing days cluster — regimes persist — so an
+> independent-draw bootstrap under-samples exactly the losing streak that
+> breaches the trailing drawdown. A block bootstrap (contiguous 5–20 day blocks)
+> would give a lower and more honest number; that rewrite has **not** been done
+> yet, so the size of the gap is unquantified.
+> For contrast, the separate clean-data study in `[[project_strategy_lab]]`
+> judged the same strategy family at **P(pass) 22.5%, P(payout) 0.6%**. The truth
+> is very likely between the two, and nobody has yet resolved which is closer.
 
 **The single most important mindset:** this is a *"lose small, win big"* machine. A few huge winners pay for everything (top 10% of trades = 85% of profit). So:
 - **A losing streak of 5–7 in a row is NORMAL. Do not panic-halt.**
@@ -42,8 +56,39 @@ Last updated: 2026-07-07. Config: V29 FVG, `vwap_only` bias, ATR targets (2.0×,
 
 - **8 quiet sessions in a row** (no trades) → beyond the 7-year record. Stop, investigate (feed vs. market), don't just wait.
 - **Trade rate stays below ~0.6/day over 30 sessions** → the backtest overstates live opportunity. Stop, re-validate, resize expectations.
-- **Live win rate far below ~25% over 30+ trades**, or **live slippage averaging >3 ticks** → the bot auto-halts on the slippage one; investigate before resuming.
+- **Live win rate far below ~25% over 30+ trades** → investigate before resuming. **This one is NOT automatic — you have to notice it.**
 - If a tripwire fires: **halt, don't tinker.** Diagnose first.
+
+### What the slippage guards actually do (corrected 2026-07-24)
+
+Three separate guards, in the order they can fire:
+
+| Guard | Threshold | Action | Fires after |
+|---|---|---|---|
+| Single-fill halt | **≥ 32 ticks** adverse (= `STOP_TICKS`) | **Auto-halts** | 1 fill |
+| Single-fill alert | **≥ 8 ticks** adverse | Telegram only, keeps trading | 1 fill |
+| Rolling-average halt | avg **> 3 ticks** adverse | **Auto-halts** | 20 fills |
+
+**Read the word "adverse" literally.** A fill that lands *better* than intended
+records a NEGATIVE number and pulls the average down. Until 2026-07-24 this used
+`abs()`, so price improvement counted as slippage — two real Jul 22 fills were
+logged as "19 ticks" and "3 ticks" of slippage when both were actually better
+than asked. Any slippage figure in a log dated before 2026-07-24 is inflated and
+should not be quoted.
+
+**Previous versions of this file claimed the bot auto-halts at a >3 tick average.
+That was wrong in practice** — the rolling guard needs a full 20-fill window, and
+at the live rate (~1.3 trades/day) that takes 15+ trading days to arm. One
+catastrophic fill passed through unnoticed on 2026-07-22 for exactly this reason.
+The single-fill guards above were added to close that gap.
+
+**Known reality check on slippage:** as of 2026-07-24 only **one** fill pair has
+ever been measured on trustworthy (single-instance, post-parser-fix) data — the
+Jul 24 trade, at 3 ticks each way, one favorable and one adverse. Everything
+earlier is either unmeasured (the 11 trades of Jul 15-20, when the hub parser was
+blind) or corrupted (Jul 22, when multiple bot processes overwrote each other's
+state). **There is not yet enough data to state a live slippage average.** Do not
+quote one until ~10-20 clean fills have accumulated.
 
 ---
 

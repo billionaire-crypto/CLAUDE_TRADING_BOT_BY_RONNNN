@@ -41,8 +41,11 @@ FILL_FORENSICS_FIELDS = [
     "bar_to_signal_ms", "signal_to_submit_ms", "submit_to_fill_ms",
 ]
 STATE_PATH = os.path.join(bot.EXPORT_DIR, "v29_topstep_runtime_state.json")
+SIGNAL_RESERVATION_DIR = os.path.join(bot.EXPORT_DIR, "signal_reservations")
 KILL_SWITCH_PATH = os.path.join(bot.EXPORT_DIR, "HALT.txt")
 ERROR_LOG_PATH = os.path.join(bot.EXPORT_DIR, "live_errors.txt")
+
+RUN_LOCK_PORT = 47382  # loopback port used as a single-instance mutex
 
 SESSION_ROLLOVER_HOUR_CT = 17
 DEFAULT_LOOP_INTERVAL_SECONDS = 5
@@ -70,8 +73,26 @@ STRATEGY_BAR_SECONDS = 300
 # Live slippage monitoring: compare intended entry price vs actual fill price.
 # The backtest assumes ~1 tick; if live fills are systematically worse the edge
 # is not real, so halt. Rolling average over the last SLIPPAGE_WINDOW entries.
+#
+# Samples are ADVERSE-SIGNED (see _adverse_slippage_ticks): positive = filled
+# worse than intended, negative = filled better. Before 2026-07-24 this used
+# abs(), so favorable fills counted as slippage and inflated the average — the
+# Jul 22 live fills logged 19 and 3 ticks of "slippage" that were actually
+# price improvement. Never reintroduce abs() here.
 SLIPPAGE_WINDOW = 20
 SLIPPAGE_ALERT_TICKS = 3.0
+# Single-fill outlier guards. The rolling-average halt needs a FULL window of
+# SLIPPAGE_WINDOW fills; at the measured live rate (~1.3 trades/day) that takes
+# 15+ trading days to arm, so one catastrophic fill would otherwise pass
+# unnoticed (it did, on 2026-07-22). These fire on a single sample instead.
+# Both are chosen safety thresholds, NOT values derived from a backtest sweep:
+#   ALERT — 8 ticks is ~2.7x the x3 slippage stress case the strategy was
+#           validated against; worth a look, not worth stopping for.
+#   HALT  — tied to bot.STOP_TICKS (32): a fill a full stop-width away from
+#           intended means the trade's risk geometry is destroyed, not merely
+#           unlucky, so stop trading and make a human look.
+SLIPPAGE_SINGLE_FILL_ALERT_TICKS = 8.0
+SLIPPAGE_SINGLE_FILL_HALT_TICKS = float(bot.STOP_TICKS)
 MANUAL_FLATTEN_COOLDOWN_MINUTES = 10   # block new entries for this long after a manual flatten
 
 QUARTER_MONTH_CODES = {
@@ -772,7 +793,11 @@ def _log_fill_forensics(state: Dict[str, Any], *, kind: str, contract: str, dire
     }
     slip_ticks = slip_usd = None
     if intended and actual:
-        slip_ticks = round(abs(float(actual) - float(intended)) / bot.MNQ_TICK_SIZE, 2)
+        # Adverse-signed, same convention as the halt path: positive = filled
+        # worse, negative = price improvement. Was abs() until 2026-07-24, which
+        # made favorable fills look like losses in this CSV and led to a wrong
+        # "live slippage is 20x backtest" conclusion during review.
+        slip_ticks = _adverse_slippage_ticks(kind, direction, intended, actual)
         try:
             slip_usd = round(slip_ticks * bot.MNQ_TICK_VALUE * abs(int(size or 0)), 2)
         except (TypeError, ValueError):
@@ -1101,17 +1126,95 @@ def _apply_hub_account_update(state: Dict[str, Any], payload: Dict[str, Any]) ->
         state["last_known_account_profit"] = metrics["total_profit"]
 
 
-def _record_slippage(window: Optional[List[float]], intended: float, actual: float) -> List[float]:
-    """Append |actual-intended| in ticks to a rolling window (last SLIPPAGE_WINDOW)."""
+def _reserve_signal_id(signal_id: str, session_date: str) -> bool:
+    """Atomically claim a signal ID before routing it. Returns False if already claimed.
+
+    The state-file duplicate check (`last_routed_signal_id`) is check-then-act with
+    the broker round-trip inside the window: on 2026-07-22 two run-loop processes
+    both passed that check ~30ms apart and both submitted, opening 8 contracts on a
+    4-contract signal. Read-modify-write on a shared JSON file cannot fix that.
+
+    os.open(O_CREAT|O_EXCL) is atomic at the filesystem level, so exactly one caller
+    can create the marker no matter how many processes race. Deliberately NOT
+    released on submit failure: a signal ID encodes its bar timestamp, so a blocked
+    retry costs at most that one bar, whereas releasing risks a duplicate order
+    against real money. Skipping a trade is free; double-sizing is not.
+    """
+    try:
+        os.makedirs(SIGNAL_RESERVATION_DIR, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{session_date}_{signal_id}")
+        path = os.path.join(SIGNAL_RESERVATION_DIR, f"{safe}.lock")
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"signal_id": signal_id, "session_date": session_date,
+                       "pid": os.getpid(),
+                       "reserved_at": datetime.now(bot.TIMEZONE).isoformat()}, fh)
+        return True
+    except OSError as exc:
+        # Fail OPEN: if the filesystem guard itself is broken, fall back to the
+        # state-file check rather than blocking all trading. Logged loudly.
+        _write_log("ERROR", f"signal_reservation_failed signal_id={signal_id}: {exc}",
+                   error_only=True)
+        return True
+
+
+def _prune_signal_reservations(keep_days: int = 3) -> None:
+    """Drop reservation markers older than keep_days so the dir cannot grow forever."""
+    try:
+        cutoff = time.time() - keep_days * 86400
+        for name in os.listdir(SIGNAL_RESERVATION_DIR):
+            path = os.path.join(SIGNAL_RESERVATION_DIR, name)
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+    except OSError:
+        pass
+
+
+def _adverse_slippage_ticks(kind: str, direction: str, intended: float, actual: float) -> float:
+    """Slippage in ticks, signed so POSITIVE always means "filled worse".
+
+    Which side of the market we are on decides what "worse" means, so the raw
+    price difference alone is not enough — direction is the POSITION direction:
+
+        entry + long   = buying  -> worse when actual > intended
+        entry + short  = selling -> worse when actual < intended
+        exit  + long   = selling -> worse when actual < intended
+        exit  + short  = buying  -> worse when actual > intended
+
+    A negative return is price improvement and must stay negative so it pulls
+    the rolling average down rather than tripping the halt.
+    """
+    diff_ticks = (float(actual) - float(intended)) / bot.MNQ_TICK_SIZE
+    buying = (str(kind).startswith("entry")) == (str(direction) == "long")
+    return round(diff_ticks if buying else -diff_ticks, 2)
+
+
+def _record_slippage(window: Optional[List[float]], adverse_ticks: float) -> List[float]:
+    """Append an adverse-signed tick sample to a rolling window (last SLIPPAGE_WINDOW).
+
+    Takes the already-signed value from _adverse_slippage_ticks — it deliberately
+    does no abs()/direction math of its own so there is exactly one place where
+    "worse" is defined.
+    """
     w = list(window or [])
-    w.append(round(abs(float(actual) - float(intended)) / bot.MNQ_TICK_SIZE, 2))
+    w.append(round(float(adverse_ticks), 2))
     return w[-SLIPPAGE_WINDOW:]
 
 
 def _emit_slippage_log_and_halt(kind: str, window: List[float], intended: float,
                                 actual: float, halt_reason: str) -> None:
-    """Log the latest slippage sample + rolling average; halt if the average
-    exceeds SLIPPAGE_ALERT_TICKS over a full window."""
+    """Log the latest slippage sample + rolling average, then apply three guards:
+
+      1. single fill >= SLIPPAGE_SINGLE_FILL_HALT_TICKS  -> halt now
+      2. single fill >= SLIPPAGE_SINGLE_FILL_ALERT_TICKS -> Telegram alert only
+      3. full window averaging > SLIPPAGE_ALERT_TICKS    -> halt (systematic)
+
+    Guard 1 exists because guard 3 cannot fire until SLIPPAGE_WINDOW fills have
+    accumulated, which at the live trade rate takes weeks.
+    """
     slip_ticks = window[-1] if window else 0.0
     avg_slip = sum(window) / len(window) if window else 0.0
     _write_log(
@@ -1119,6 +1222,28 @@ def _emit_slippage_log_and_halt(kind: str, window: List[float], intended: float,
         f"{kind}_slippage ticks={slip_ticks} rolling_avg={avg_slip:.2f} "
         f"n={len(window)} intended={intended} actual={actual}",
     )
+    if slip_ticks >= SLIPPAGE_SINGLE_FILL_HALT_TICKS:
+        _write_log(
+            "ERROR",
+            f"{halt_reason}_single_fill ticks={slip_ticks} >= "
+            f"{SLIPPAGE_SINGLE_FILL_HALT_TICKS} (intended={intended} actual={actual}); "
+            f"engaging kill switch.",
+            error_only=True,
+        )
+        engage_kill_switch(f"{halt_reason}_single_fill")
+        return
+    if slip_ticks >= SLIPPAGE_SINGLE_FILL_ALERT_TICKS:
+        _write_log(
+            "WARN",
+            f"{kind}_slippage_outlier ticks={slip_ticks} >= "
+            f"{SLIPPAGE_SINGLE_FILL_ALERT_TICKS} intended={intended} actual={actual}",
+        )
+        _send_telegram_lines([
+            "MNQ Bot — slippage outlier",
+            f"{kind}: {slip_ticks} ticks worse than intended",
+            f"intended {intended} -> actual {actual}",
+            "Not halted; watch the next fills.",
+        ])
     if len(window) >= SLIPPAGE_WINDOW and avg_slip > SLIPPAGE_ALERT_TICKS:
         _write_log(
             "ERROR",
@@ -1224,12 +1349,36 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
             # tick; if a rolling average exceeds SLIPPAGE_ALERT_TICKS the edge
             # assumption is broken -> halt.
             actual = _extract_numeric(data, "price", "fillPrice", "averagePrice", "avgPrice")
-            _fill_dir = "long" if int(state.get("current_position", 0) or 0) > 0 else "short"
+
+            def _fill_direction(is_entry: bool) -> str:
+                """Position direction from the trade's own `side` (0=buy, 1=sell).
+
+                Authoritative and ORDER-INDEPENDENT. current_position is only
+                updated by the separate GatewayUserPosition event, which may
+                arrive after this trade event — on an entry fill it is still 0,
+                so deriving direction from it silently mislabels every entry as
+                short and flips the sign of the slippage measurement.
+                    entry: buy -> long,  sell -> short
+                    exit : buy -> was short, sell -> was long
+                """
+                raw_side = data.get("side")
+                if raw_side is None:
+                    return "long" if int(state.get("current_position", 0) or 0) > 0 else "short"
+                try:
+                    buy = int(raw_side) == 0
+                except (TypeError, ValueError):
+                    return "long" if int(state.get("current_position", 0) or 0) > 0 else "short"
+                if is_entry:
+                    return "long" if buy else "short"
+                return "short" if buy else "long"
+
+            _fill_dir = _fill_direction(is_entry=True)
             if state.get("awaiting_entry_fill") and trade_pnl is None:
                 intended = state.get("last_signal_entry_price")
                 if intended and actual:
+                    _adv = _adverse_slippage_ticks("entry", _fill_dir, intended, actual)
                     state["rolling_entry_slippage_ticks"] = _record_slippage(
-                        state.get("rolling_entry_slippage_ticks"), intended, actual)
+                        state.get("rolling_entry_slippage_ticks"), _adv)
                     state["awaiting_entry_fill"] = False
                     state["awaiting_exit_fill"] = True   # arm exit monitoring
                     state["last_entry_fill_price"] = float(actual)  # anchor for live stop mgmt
@@ -1247,11 +1396,14 @@ def _process_user_hub_events(events: List[Dict[str, Any]], state: Dict[str, Any]
                               (("stop", _stop_px), ("target", _tgt_px)) if v]
                 if actual and candidates:
                     exit_kind, intended = min(candidates, key=lambda c: abs(float(actual) - c[1]))
+                    # Exit side inverts the mapping: a sell closes a long.
+                    _exit_dir = _fill_direction(is_entry=False)
+                    _adv = _adverse_slippage_ticks("exit", _exit_dir, intended, actual)
                     state["rolling_exit_slippage_ticks"] = _record_slippage(
-                        state.get("rolling_exit_slippage_ticks"), intended, actual)
+                        state.get("rolling_exit_slippage_ticks"), _adv)
                     state["awaiting_exit_fill"] = False
                     _row = _log_fill_forensics(state, kind=f"exit_{exit_kind}",
-                        contract=str(data.get("contractId", "")), direction=_fill_dir,
+                        contract=str(data.get("contractId", "")), direction=_exit_dir,
                         size=data.get("size"), intended=intended, actual=actual, trade_pnl=trade_pnl)
                     _alert_fill(f"exit_{exit_kind}", _row)
                     _emit_slippage_log_and_halt(
@@ -2038,6 +2190,20 @@ def _submit_order_plan(
 
     submit_started_at = datetime.now(bot.TIMEZONE).isoformat()
     _check_kill_switch_or_raise()
+    # Atomic cross-process claim — last gate before real money leaves. Must stay
+    # immediately above place_order(): any work inserted between them reopens the
+    # race window this closes.
+    if not _reserve_signal_id(signal_id, str(signal.get("session_date", ""))):
+        _log_trade_event(
+            event_type="submit_blocked_duplicate_reservation",
+            signal_payload=signal_payload,
+            account_name=str(order_payload.get("accountName", "")),
+            contract_name=str(order_payload.get("contractName", "")),
+            dry_run=bool(config.dry_run),
+            notes="Signal routing blocked: another process already reserved this signal ID.",
+        )
+        raise TopstepXAPIError(
+            "Refusing to route signal: signal ID already reserved by another process.")
     response = client.place_order(
         account_id=int(account_id),
         contract_id=str(contract_id),
@@ -2867,7 +3033,35 @@ def _maybe_send_status_heartbeat(state: Dict[str, Any]) -> None:
         _save_state(state)
 
 
+_run_lock_socket: Optional[socket.socket] = None
+
+
+def _acquire_run_lock() -> None:
+    """Bind a loopback port as a single-instance mutex.
+
+    The OS releases the bind automatically when the process exits, so no
+    cleanup is needed and stale locks are impossible.
+    """
+    global _run_lock_socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        sock.bind(("127.0.0.1", RUN_LOCK_PORT))
+        sock.listen(1)
+        _run_lock_socket = sock
+    except OSError:
+        msg = (
+            f"run_loop_duplicate_blocked port={RUN_LOCK_PORT} — "
+            "another run-loop instance is already running. Exiting."
+        )
+        _write_log("ERROR", msg, error_only=True)
+        print(f"ERROR: {msg}")
+        raise SystemExit(1)
+
+
 def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
+    _acquire_run_lock()
+    _prune_signal_reservations()
     config = TopstepXConfig.from_env()
     client = TopstepXClient(config)
     user_stream: Optional[TopstepXUserHubStream] = None

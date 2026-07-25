@@ -8,3 +8,5 @@ date,signal_id,direction,bar_time_ct,contracts,live_pnl_usd,source_log
 2026-07-16,V29-FVG-short-2026-07-16T133500-0500,short,13:35,4,-76.88,live_log_20260716.txt
 2026-07-16,V29-FVG-short-2026-07-16T134000-0500,short,13:40,3,-53.16,live_log_20260716.txt
 2026-07-17,V29-FVG-long-2026-07-17T120000-0500,long,12:00,3,-18.66,live_log_20260717.txt
+2026-07-20,V29-FVG-short-2026-07-20T135500-0500,short,13:55,21,-246.12,live_log_20260720.txt
+2026-07-20,V29-FVG-short-2026-07-20T140000-0500,short,14:00,18,-210.96,live_log_20260720.txt

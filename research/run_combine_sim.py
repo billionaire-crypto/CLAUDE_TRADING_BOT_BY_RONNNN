@@ -1,4 +1,20 @@
 """
+!! SUPERSEDED 2026-07-24 by research/run_combine_sim_v2.py — do NOT quote this file's number.
+
+Three defects, quantified in RESEARCH_LEDGER.md:
+  1. Fails an attempt on any day worse than BOT_DAILY_LOSS_LIMIT (-$750), which is the bot's
+     own brake, not a Topstep failure. Real limit is COMBINE_DAILY_LOSS_LIMIT (-$1,000).
+     2 of 1,848 backtest days breach -$750; ZERO breach -$1,000.
+  2. The trailing drawdown never locks at $50,000, so it stays harsher than Topstep on
+     exactly the paths that pass.
+  3. Does not model the CONSISTENCY RULE at all (best day <= 50% of profit), which the live
+     bot does enforce and which specifically penalises this strategy's rare-huge-day shape.
+The IID day sampling on line ~59 is NOT a material defect here: measured autocorrelation is
+~0 at every lag and a 5,000-run permutation test cannot distinguish real day order from
+shuffled (p=0.218 streaks, p=0.363 drawdown).
+
+Kept only so config A of v2 can be checked against it (it still prints 97.7%).
+
 Topstep $50k combine simulator.
 
 Uses bootstrap resampling of actual backtest daily returns to estimate the

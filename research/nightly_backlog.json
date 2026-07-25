@@ -63,10 +63,10 @@
   "id": "fvg_block_level_sweep_on",
   "param": "FVG_BLOCK_LEVEL_SWEEP_ENABLED",
   "candidate_value": true,
-  "status": "pending",
+  "status": "rejected",
   "source": "main_branch_port_2026_07_19",
   "rationale": "Ported from an older, since-diverged commit on main (codex/topstepx-hardening-checkpoint, f4d76cd, 2026-04-19) that found FVGs preceded by a globex_high liquidity sweep (wick 3-8 NQ pts beyond the level, closing back inside, within 10 bars) win at 39.1% vs 46% baseline -- a real structural weakness, not noise. That validation predates vwap_only bias, ATR-scaled targets, FVG_MAX_AGE_BARS=4, and CALM_ATR_RATIO=0.70, so it is STALE against the current config and must be re-earned, not assumed. Detection logic ported into bot.py as FVG_BLOCK_LEVEL_SWEEP_ENABLED (default False, fully inert -- current live bot behavior is unchanged by this port). The gauntlet decides whether the filter still holds up now.",
-  "tested_at": null,
-  "verdict": null
+  "tested_at": "2026-07-20T20:05:09.313853-05:00",
+  "verdict": "REJECT"
  }
 ]

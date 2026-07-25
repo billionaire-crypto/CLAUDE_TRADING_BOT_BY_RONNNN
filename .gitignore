@@ -58,3 +58,6 @@ src/exports/
 # env backups (contain secrets)
 .env.bak*
 *.bak
+
+# Large research data pulls (keep on disk, not in git history)
+research/euro_5m.csv

@@ -285,13 +285,105 @@ def test_routing_disabled_never_flagged():
 
 # ── Slippage recording helpers (entry + exit share these) ───────────────────────
 def test_record_slippage_ticks_and_window():
-    # 20000.00 intended vs 20000.75 actual = 3 ticks (0.25 each).
-    w = tr._record_slippage([], 20000.00, 20000.75)
+    # A long entry filled 0.75 above intended = 3 ticks WORSE (paid up).
+    w = tr._record_slippage([], tr._adverse_slippage_ticks("entry", "long", 20000.00, 20000.75))
     assert w == [3.0]
     # window is capped at SLIPPAGE_WINDOW
-    big = tr._record_slippage([1.0] * tr.SLIPPAGE_WINDOW, 20000.0, 20000.25)
+    big = tr._record_slippage([1.0] * tr.SLIPPAGE_WINDOW,
+                              tr._adverse_slippage_ticks("entry", "long", 20000.0, 20000.25))
     assert len(big) == tr.SLIPPAGE_WINDOW
     assert big[-1] == 1.0
+
+
+# ── Direction-aware slippage: favorable fills must record NEGATIVE ──────────────
+# Regression guard for the 2026-07-24 abs() bug: price improvement was recorded
+# as slippage, which inflated the average and produced a false "live slippage is
+# 20x backtest" reading from real Jul 22 fills.
+def test_adverse_slippage_sign_by_side():
+    # entry long = buying: above intended is worse, below is better
+    assert tr._adverse_slippage_ticks("entry", "long", 20000.0, 20001.0) == 4.0
+    assert tr._adverse_slippage_ticks("entry", "long", 20000.0, 19999.0) == -4.0
+    # entry short = selling: below intended is worse, above is better
+    assert tr._adverse_slippage_ticks("entry", "short", 20000.0, 19999.0) == 4.0
+    assert tr._adverse_slippage_ticks("entry", "short", 20000.0, 20001.0) == -4.0
+    # exit of a long = selling: below intended is worse
+    assert tr._adverse_slippage_ticks("exit_stop", "long", 20000.0, 19999.0) == 4.0
+    assert tr._adverse_slippage_ticks("exit_stop", "long", 20000.0, 20001.0) == -4.0
+    # exit of a short = buying to cover: above intended is worse
+    assert tr._adverse_slippage_ticks("exit_target", "short", 20000.0, 20001.0) == 4.0
+    assert tr._adverse_slippage_ticks("exit_target", "short", 20000.0, 19999.0) == -4.0
+
+def test_real_jul22_favorable_fills_record_negative():
+    # Exact prices from live_log_20260722: a long stop that exited 4.75 pts ABOVE
+    # the stop price is price improvement, not 19 ticks of slippage.
+    assert tr._adverse_slippage_ticks("exit_stop", "long", 29217.75, 29222.5) == -19.0
+    # And the Jul 24 short entry filled 0.75 higher than intended = better.
+    assert tr._adverse_slippage_ticks("entry", "short", 28427.75, 28428.5) == -3.0
+
+def test_favorable_fills_never_trip_the_halt(tmp_path):
+    saved = tr.KILL_SWITCH_PATH
+    tr.KILL_SWITCH_PATH = str(tmp_path / "HALT.txt")
+    try:
+        good = [-tr.SLIPPAGE_ALERT_TICKS - 5.0] * tr.SLIPPAGE_WINDOW
+        tr._emit_slippage_log_and_halt("entry", good, 20000.0, 19990.0,
+                                       "slippage_systematic_excess")
+        assert tr._kill_switch_active() is False
+    finally:
+        tr.KILL_SWITCH_PATH = saved
+
+
+# ── Single-fill outlier guards (the rolling window takes weeks to arm) ──────────
+def test_single_catastrophic_fill_halts_immediately(tmp_path):
+    saved = tr.KILL_SWITCH_PATH
+    tr.KILL_SWITCH_PATH = str(tmp_path / "HALT.txt")
+    try:
+        # One sample only — the rolling-average guard cannot fire at n=1.
+        ticks = tr.SLIPPAGE_SINGLE_FILL_HALT_TICKS
+        tr._emit_slippage_log_and_halt("entry", [ticks], 29224.0, 29190.0,
+                                       "slippage_systematic_excess")
+        assert tr._kill_switch_active() is True
+    finally:
+        tr.clear_kill_switch()
+        tr.KILL_SWITCH_PATH = saved
+
+def test_single_moderate_fill_alerts_without_halting(tmp_path):
+    saved = tr.KILL_SWITCH_PATH
+    tr.KILL_SWITCH_PATH = str(tmp_path / "HALT.txt")
+    try:
+        ticks = tr.SLIPPAGE_SINGLE_FILL_ALERT_TICKS
+        assert ticks < tr.SLIPPAGE_SINGLE_FILL_HALT_TICKS
+        tr._emit_slippage_log_and_halt("entry", [ticks], 20000.0, 20002.0,
+                                       "slippage_systematic_excess")
+        assert tr._kill_switch_active() is False
+    finally:
+        tr.KILL_SWITCH_PATH = saved
+
+def test_halt_threshold_is_tied_to_stop_width():
+    # A fill a full stop-width off destroys the trade's risk geometry.
+    assert tr.SLIPPAGE_SINGLE_FILL_HALT_TICKS == float(bot.STOP_TICKS)
+
+
+# ── Atomic signal reservation (the Jul 22 double-submit race) ───────────────────
+def test_signal_reservation_is_exclusive(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "SIGNAL_RESERVATION_DIR", str(tmp_path / "res"), raising=False)
+    assert tr._reserve_signal_id("V29-FVG-short-X", "2026-07-22") is True
+    # Second caller (models the racing process) must lose.
+    assert tr._reserve_signal_id("V29-FVG-short-X", "2026-07-22") is False
+    # A different signal is unaffected.
+    assert tr._reserve_signal_id("V29-FVG-short-Y", "2026-07-22") is True
+
+def test_signal_reservation_scoped_by_session_date(tmp_path, monkeypatch):
+    monkeypatch.setattr(tr, "SIGNAL_RESERVATION_DIR", str(tmp_path / "res"), raising=False)
+    assert tr._reserve_signal_id("same-id", "2026-07-22") is True
+    assert tr._reserve_signal_id("same-id", "2026-07-23") is True
+
+def test_signal_reservation_fails_open_on_oserror(tmp_path, monkeypatch):
+    # If the guard itself breaks we must not block all trading.
+    monkeypatch.setattr(tr, "SIGNAL_RESERVATION_DIR", str(tmp_path / "res"), raising=False)
+    def _boom(*a, **k):
+        raise OSError("disk gone")
+    monkeypatch.setattr(tr.os, "makedirs", _boom)
+    assert tr._reserve_signal_id("V29-any", "2026-07-22") is True
 
 def test_exit_slippage_attributes_to_nearer_level():
     # Fill at 20010.25 is nearer the target (20010) than the stop (19990):
@@ -301,7 +393,9 @@ def test_exit_slippage_attributes_to_nearer_level():
     candidates = [("stop", stop_px), ("target", tgt_px)]
     kind, intended = min(candidates, key=lambda c: abs(actual - c[1]))
     assert kind == "target"
-    assert tr._record_slippage([], intended, actual) == [1.0]
+    # Exiting a SHORT at 20010.25 vs a 20010.0 target = paid 1 tick more = worse.
+    assert tr._record_slippage(
+        [], tr._adverse_slippage_ticks("exit", "short", intended, actual)) == [1.0]
 
 def test_exit_slippage_halts_over_threshold(tmp_path):
     # A full window averaging above SLIPPAGE_ALERT_TICKS must engage the kill switch.
@@ -1280,8 +1374,37 @@ def test_hub_trade_entry_fill_arms_slippage_monitoring(monkeypatch, tmp_path):
     assert state["awaiting_entry_fill"] is False
     assert state["awaiting_exit_fill"] is True
     assert state["last_entry_fill_price"] == 28876.0
-    assert state["rolling_entry_slippage_ticks"] == [2.0]   # 0.5 pts = 2 ticks
+    # side=1 (sell) from flat = a SHORT entry. Filling 0.5 pts ABOVE the intended
+    # 28875.5 means we sold higher than planned -> price improvement, so the
+    # sample must be NEGATIVE. This asserted +2.0 until 2026-07-24, when
+    # _record_slippage used abs() and the direction came from current_position
+    # (still 0 on an entry fill, so every entry was mislabeled "short").
+    assert state["rolling_entry_slippage_ticks"] == [-2.0]
     assert state["current_position"] == -21                 # sell 21 from flat
+
+
+def test_entry_fill_direction_comes_from_side_not_position(monkeypatch, tmp_path):
+    """A LONG entry must be read as long even though current_position is still 0.
+
+    The GatewayUserPosition event that sets current_position can arrive after the
+    trade event. Deriving direction from position state made every entry look
+    short, which flipped the sign of the slippage sample.
+    """
+    monkeypatch.setattr(tr, "_log_trade_event", lambda **k: None)
+    monkeypatch.setattr(tr, "KILL_SWITCH_PATH", str(tmp_path / "HALT.txt"))
+    trade = {"id": 1, "accountId": 24808178, "contractId": "CON.F.US.MNQ.U26",
+             "price": 29228.0, "fees": 1.0, "side": 0, "size": 5, "voided": False,
+             "orderId": 2, "profitAndLoss": None,
+             "creationTimestamp": "2026-07-22T14:15:06.000000+00:00"}
+    state = tr._default_state()
+    state.update({"current_position": 0, "awaiting_entry_fill": True,
+                  "last_signal_entry_price": 29223.0,
+                  "rolling_entry_slippage_ticks": []})
+    tr._process_user_hub_events(
+        [_enveloped("GatewayUserTrade", trade)], state, _HubCfg())
+    # Buying at 29228 when we intended 29223 = paid 5 pts = 20 ticks WORSE.
+    assert state["rolling_entry_slippage_ticks"] == [20.0]
+    assert state["current_position"] == 5
 
 
 def test_hub_trade_exit_fill_records_exit_slippage(monkeypatch, tmp_path):
