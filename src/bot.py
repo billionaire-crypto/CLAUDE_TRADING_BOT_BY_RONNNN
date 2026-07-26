@@ -152,6 +152,20 @@ RISK_BUDGET_MAP            = {8: 900.0, 7: 675.0, 6: 350.0}  # $ stop-risk budge
 RISK_BUDGET_DEFAULT        = 150.0   # budget for scores below the lowest key
 HEADROOM_SAFETY_FRAC       = 0.80    # max fraction of remaining DLL headroom risked per trade
 
+# Aged-entry risk scaling (EXPERIMENT — inert at 1.0, which is the shipped value).
+# Context (ledger 2026-07-07 age sweep + 2026-07-26 agenda): raising
+# FVG_MAX_AGE_BARS 4->5 RAISES net ~7.5% and adds ~10% more trades, but was
+# rejected because the worst modeled trade went -$983 -> -$1,246 (a $50k-combine
+# DLL breach). That sweep varied ONLY the age gate, so aged entries kept the full
+# per-score budget below. Since a gap-through overshoot scales linearly with
+# size, trimming the budget for aged entries should scale the tail down with it.
+# Applied to the risk budget when the entry FVG's age >= FVG_AGED_ENTRY_MIN_AGE.
+# Only meaningful together with FVG_MAX_AGE_BARS > FVG_AGED_ENTRY_MIN_AGE - 1;
+# test the pair with research/run_aged_entry_sizing.py, never the single-param
+# nightly runner (which would silently produce a no-op result).
+FVG_AGED_ENTRY_RISK_MULT   = 1.0     # 1.0 = inert (no aged-entry trim)
+FVG_AGED_ENTRY_MIN_AGE     = 5       # entry FVG age in bars at/above which the mult applies
+
 # ── GAP-RISK MITIGATIONS (both off by default; A/B swept) ─────────────────────
 # Option A — gap-aware budget: size the risk budget against a stop that fills
 # GAP_STOP_MULT x its width worse (models gap-through), so even a gapped fill
@@ -3544,6 +3558,12 @@ def run_backtest(
                         if _score >= _th:
                             _budget = RISK_BUDGET_MAP[_th]
                             break
+                    # Aged-entry trim (inert at mult 1.0). Staler gaps carry the
+                    # fatter gap-through tail; shrink the budget so the worst
+                    # modeled fill scales down with the size.
+                    if (FVG_AGED_ENTRY_RISK_MULT != 1.0 and entry_fvg is not None
+                            and (i - entry_fvg.created_bar) >= FVG_AGED_ENTRY_MIN_AGE):
+                        _budget *= FVG_AGED_ENTRY_RISK_MULT
                     _headroom     = state.daily_pnl_usd - BOT_DAILY_LOSS_LIMIT
                     _headroom_cap = max(0.0, _headroom) * HEADROOM_SAFETY_FRAC
                     _allowed_risk = min(_budget, _headroom_cap)

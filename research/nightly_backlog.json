@@ -68,5 +68,45 @@
   "rationale": "Ported from an older, since-diverged commit on main (codex/topstepx-hardening-checkpoint, f4d76cd, 2026-04-19) that found FVGs preceded by a globex_high liquidity sweep (wick 3-8 NQ pts beyond the level, closing back inside, within 10 bars) win at 39.1% vs 46% baseline -- a real structural weakness, not noise. That validation predates vwap_only bias, ATR-scaled targets, FVG_MAX_AGE_BARS=4, and CALM_ATR_RATIO=0.70, so it is STALE against the current config and must be re-earned, not assumed. Detection logic ported into bot.py as FVG_BLOCK_LEVEL_SWEEP_ENABLED (default False, fully inert -- current live bot behavior is unchanged by this port). The gauntlet decides whether the filter still holds up now.",
   "tested_at": null,
   "verdict": null
+ },
+ {
+  "id": "trail_after_mfe_on",
+  "param": "TRAIL_AFTER_MFE_ENABLED",
+  "candidate_value": true,
+  "status": "pending",
+  "source": "supply_decay_agenda_2026_07_26",
+  "rationale": "C2b. Exit-side flags (PARTIAL_PROFIT / TRAIL_AFTER_MFE / TIME_STOP) are fully wired into run_backtest, all False, and appear NOWHERE in the research ledger - every experiment to date has been entry-side. Supply-decay study (2026-07-26) shows frequency is the binding constraint and every entry-side lever is exhausted, so the exit side is the remaining unexplored axis. Trail is sequenced FIRST of the three because it is the only one already supported by live execution (topstepx_runtime._manage_position_stops uses the shared bot.desired_stop_price, which already honours TRAIL_AFTER_MFE_ENABLED) - a SHIP here is a config flip, not new live order code. Judge primarily on combine pass rate / qualifying days / daily-limit-fail %, with the net gate loosened to 90% of baseline: trading net for pass-rate is the explicit hypothesis. Tail gate unchanged and absolute (worst trade <= -983).",
+  "tested_at": null,
+  "verdict": null
+ },
+ {
+  "id": "fvg_aged_entry_risk_mult",
+  "param": "FVG_AGED_ENTRY_RISK_MULT",
+  "candidate_value": 0.5,
+  "status": "blocked_needs_dedicated_runner",
+  "source": "supply_decay_agenda_2026_07_26",
+  "rationale": "C1. The age sweep (2026-07-07) REJECTED age 5/6/7 on the SAFETY gates only - net rose +7.5% at age 5 (+288 trades) but worst trade went -983 -> -1246 and combine pass 97.7% -> 95.9%. What that sweep never varied was SIZING: run_age_sweep.py mutates only FVG_MAX_AGE_BARS and inherits RISK_BUDGET_SIZING_ENABLED intact, so an age-5 entry was sized from the same per-score budget map ({8:900,7:675,6:350}) as a fresh age-1 entry. Under risk-budget sizing a -1246 loss on a <=900 budgeted stop IS the gap-through overshoot, and it scales linearly with size - so halving the budget on aged entries should scale the worst case with it (~ -623) while keeping most of the added frequency. Requires a new OFF-by-default flag pair (FVG_AGED_ENTRY_RISK_MULT + FVG_AGED_ENTRY_MIN_AGE=5) tested with FVG_MAX_AGE_BARS=5. Grid is {0.50, 0.35} and NOTHING MORE: if 0.50 fails the tail gate, do not walk the grid hunting a passing value - that is the tuning failure mode TDC/SPC were killed for. Pass requires ALL of: worst trade <= -983 (baseline, not merely better than -1246), combine pass >= 96.7%, net >= 95% of baseline in every split, and trade count strictly above baseline. BLOCKED FOR THE GENERIC RUNNER ON PURPOSE: this candidate is a PAIR of parameters (FVG_MAX_AGE_BARS=5 AND FVG_AGED_ENTRY_RISK_MULT). nightly_researcher.py sets exactly one attribute, so running it here would leave the age gate at 4, admit no aged entries at all, and record a no-op as a clean 'no change' verdict - a misleading result in the ledger. Run research/run_aged_entry_sizing.py instead (same imported decide() rules, plus the trade-count gate). The inert flags are already in src/bot.py (FVG_AGED_ENTRY_RISK_MULT=1.0 default = byte-identical live behavior).",
+  "tested_at": null,
+  "verdict": null
+ },
+ {
+  "id": "partial_profit_on",
+  "param": "PARTIAL_PROFIT_ENABLED",
+  "candidate_value": true,
+  "status": "pending",
+  "source": "supply_decay_agenda_2026_07_26",
+  "rationale": "C2a. At 29.6% WR the book is a few large winners and a losing day is the common case, while the combine needs 5 qualifying days >= $150 plus a $3k target without a -$1,000 breach. Taking partial profit at the wired defaults (40 ticks, 60% of size) converts trades that reach +40 ticks and then round-trip into small GREEN days - a direct attack on the qualifying-day-count and daily-limit-fail gates, requiring no additional trades, which is the right shape given the supply-decay study shows supply is the binding constraint. Expected to cost net; the gauntlet decides whether it buys pass-rate faster than it sells net (net gate loosened to 90%, tail gate unchanged at -983). WARNING - do not treat a SHIP here as a config flip: topstepx_runtime.py submits a single full-size bracket and manages only the stop, with no scale-out path (see the ~1-exit-fill assumption at line 1169), so shipping C2a requires new live order-management code plus test_risk_and_safety.py coverage on BOTH the backtest and live signal paths. Sequenced after trail_after_mfe_on for that reason.",
+  "tested_at": null,
+  "verdict": null
+ },
+ {
+  "id": "time_stop_on",
+  "param": "TIME_STOP_ENABLED",
+  "candidate_value": true,
+  "status": "pending",
+  "source": "supply_decay_agenda_2026_07_26",
+  "rationale": "C2c. Third of the three never-tested exit-side flags. Kills trades that have sat 24 bars without prior-bar MFE reaching 8 ticks, freeing the single-position slot. Lowest prior of the three: with supply already scarce (1.2 trades/day, 31.8% zero-trade sessions) the position slot is rarely the binding resource, so the mechanism it targets may not bind. Run it last, single-flag, standard gauntlet, same combine-first judging as C2a/C2b. Do not combine with the other exit flags until at least one has cleared on its own.",
+  "tested_at": null,
+  "verdict": null
  }
 ]

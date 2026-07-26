@@ -13,6 +13,233 @@ root as modules, e.g. `python -m research.run_bias_validation`.
 
 ---
 
+## 2026-07-26 — 📉 SUPPLY-DECAY DIAGNOSIS: the core is not losing its edge, it is losing its *supply* — and the decay is entirely in the retrace step
+
+### Question
+Ron: "we need to find a new strategy." Before designing one, establish what is
+actually wrong — because the ledger has already killed the second-edge program at
+Phase 0 (2026-07-06) and set a specific reopening condition: *"Do not reopen the
+second-edge hunt without materially new information (different instrument,
+different timeframe, or **live data contradicting this census**)."* So the first
+job is to test whether that condition is met, not to start sketching candidates.
+
+### Method (script: `research/run_supply_decay_study.py`)
+Re-analysis of the committed 1,847-session census
+(`research/day_type_study_results.csv`, 2019-05 → 2026-07). No Databento CSV
+needed, so this is reproducible in any environment. Separates three things the
+earlier entries had conflated into "supply":
+1. **Gap supply** — FVGs detected per session (does the market still make gaps?)
+2. **Regime-gate openness** — share of in-session bars with the ATR gate open
+   (is the bot's own gate shutting more often?)
+3. **Conversion** — entries ÷ detected gaps (do the gaps get retraced in time?)
+
+### Result
+
+| year | FVGs/day | conversion % | trades/day | zero-trade day % | regime-open % |
+|---|---|---|---|---|---|
+| 2019 | 13.39 | **13.14** | 1.76 | 12.9 | 82.6 |
+| 2020 | 15.01 | 10.35 | 1.55 | 19.0 | 86.1 |
+| 2021 | 15.13 | 10.50 | 1.59 | 19.0 | 83.4 |
+| 2022 | 15.55 | 9.67 | 1.50 | 18.6 | 88.0 |
+| 2023 | 14.79 | 10.47 | 1.55 | 21.0 | 88.6 |
+| 2024 | 14.18 | 9.10 | 1.29 | 26.3 | 86.5 |
+| 2025 | 14.18 | 8.42 | 1.19 | 28.4 | 83.0 |
+| 2026 | 15.31 | **8.00** | 1.23 | 31.8 | 82.3 |
+
+Trend vs calendar year (|corr| ≈ 1 ⇒ monotone, not noise):
+
+| metric | corr | slope/yr | 2019 → 2026 |
+|---|---|---|---|
+| FVGs/day | **+0.23** | +0.07 | 13.39 → 15.31 |
+| regime-open % | **−0.10** | −0.10 | 82.6 → 82.3 |
+| conversion % | **−0.90** | −0.58 | 13.14 → **8.00** |
+| trades/day | **−0.93** | −0.08 | 1.76 → **1.23** |
+| zero-trade day % | **+0.96** | +2.43 | 12.9 → **31.8** |
+
+### What this establishes (the three-way split is the whole finding)
+1. **Gap supply is fine — slightly UP.** The market makes as many FVGs as ever
+   (13.4 → 15.3/day). Detection is not the problem, consistent with 2026-07-04's
+   "detection is already maximally loose."
+2. **Our own regime gate is NOT the culprit.** regime-open % is *flat* (corr
+   −0.10, 82.6% → 82.3%, non-monotone in between). This is new and it matters:
+   it rules out the tempting "loosen CALM_ATR_RATIO further" reflex. That dial is
+   already spent, and the data says it was never the binding gate anyway.
+3. **The decay is 100% in the retrace step.** Conversion fell 13.1% → 8.0%
+   (corr −0.90) with supply flat and the gate flat. Gaps are simply not being
+   retraced inside the 4-bar window the way they were. Trade frequency is down
+   **−30%** and nearly one session in three now trades nothing.
+
+### The critical companion fact — the edge itself is NOT degrading
+From the shipped 3-way split (ledger 2026-07-07 onward), per-trade quality is
+*strongest in the most recent period*:
+
+| split | PF | n |
+|---|---|---|
+| dev 2019–2022 | 4.03 | 1,607 |
+| val1 2023–2024 | 3.92 | 768 |
+| **val2 2025–2026** | **4.27** | 502 |
+
+So: **fewer trades, each at least as good.** The strategy is starving, not
+breaking. That is a completely different disease from "the edge is gone," and it
+rules out the instinct behind "we need a new strategy" in its literal form —
+replacing the core would discard the one thing measurably still working.
+
+### Bearing on the live losing streak
+The 9-trade / −$485.70 live streak (ledger 2026-07-17) remains fully explained by
+July-worst-month + score-4-tier + routine variance (P=4.55%, expected ~131× over
+the backtest). Nothing in this study contradicts that, and n=9 contributes no
+signal either way. **This decay finding is not evidence the live bot is broken.**
+
+### Decision — the reopening condition IS met, but narrowly and specifically
+This is "materially new information" in the ledger's own sense: a monotone,
+7-year, in-repo measurement that the core's opportunity set is shrinking ~0.58pp
+of conversion per year while its per-trade edge holds. **The second-edge hunt is
+therefore reopened — but ONLY along axes this study actually implicates.**
+
+What it does **NOT** license (all still dead, do not re-run):
+- Idle-day monetization — Phase 0 census measured the prize at ~zero/negative.
+- Trend-day continuation in any entry variant — TDC 0.84, SPC 0.84, aftermath
+  study measured the mechanism (price levitates, −0.04 ATR expectancy).
+- European session — unbounded venue tail (51× overshoot).
+- Further loosening of the regime/bias/detection gates — finding #2 above kills
+  the rationale, and 2026-07-07 already closed "are we self-limiting?" with *no*.
+
+### The agenda this points at (ranked, pre-registered — see next entry)
+Frequency is the binding constraint and every *entry-side* lever is exhausted.
+That leaves two under-explored directions, both of which take the existing
+1.2 trades/day as given rather than hunting for more:
+- **C1 — aged entries at tail-matched size** (recover the +7.5–10% net that the
+  age sweep proved exists but rejected on the tail gate).
+- **C2 — the exit side**, which the ledger has *never* tested against the current
+  baseline (partials / trailing / time-stop are all wired and all OFF).
+
+### Notes for the next session
+- The half-year table shows the decline is smooth, not a 2024 step-change; there
+  is no single event to attribute it to. Treat it as secular, not an anomaly.
+- `regime_open_pct` being flat is the load-bearing new fact. If a future session
+  is tempted to loosen a regime dial "because the bot trades less," re-read it.
+- 2026H2 in the table is 2 sessions — ignore it, it is not a data point.
+
+---
+
+## 2026-07-26 — 📋 PRE-REGISTERED AGENDA: two candidates, specs frozen before results
+
+Written **before** any backtest is run, per the frozen-spec protocol that TDC and
+SPC followed. Neither candidate could be executed in the session that wrote this
+(the Databento CSV lives on Ron's machine; this container has no market data), so
+both are specified here and seeded to `research/nightly_backlog.json` for the
+nightly gauntlet to adjudicate. **No `src/bot.py` change was made.**
+
+### C1 — Aged FVG entries at tail-matched size  *(highest confidence)*
+
+**The gap in the evidence.** The age sweep (2026-07-07) walked
+`FVG_MAX_AGE_BARS` 4→5→6→7 and found a clean monotone trade-off: net **+7.5%**
+at age 5 (+288 trades, +10%), but worst trade **−$983 → −$1,246** and combine
+pass **97.7% → 95.9%**. It was rejected on the *safety* gates only — never on
+P&L. Ron's read that later entries carry more money was correct; the cost was a
+fatter gap-through tail, which on a $50k combine (−$1,000 DLL) is a breach.
+
+**What was never varied: the sizing.** `run_age_sweep.py` mutates exactly one
+attribute (`FVG_MAX_AGE_BARS`) and inherits `RISK_BUDGET_SIZING_ENABLED` intact —
+so an age-5 entry was sized from the same per-score budget map
+(`{8: $900, 7: $675, 6: $350}`) as a fresh age-1 entry. Under risk-budget sizing
+a −$1,246 realized loss on a ≤$900 budgeted stop *is* the gap-through overshoot;
+it scales linearly with size. Halving the budget on aged entries should scale the
+worst case with it (≈ −$623) while keeping most of the added frequency.
+
+**Spec (frozen).** New OFF-by-default flag pair, in the existing experiment-flag
+style: `FVG_AGED_ENTRY_RISK_MULT` applied to the risk budget when an entry's FVG
+age ≥ `FVG_AGED_ENTRY_MIN_AGE` (=5), tested with `FVG_MAX_AGE_BARS = 5`.
+Grid: mult ∈ {0.50, 0.35}. Full standard gauntlet (3-way split, walk-forward,
+slip ×2/×3, miss-10%, 100k combine bootstrap, floor safety).
+
+**Pre-registered pass condition — all four, no exceptions:**
+- worst modeled trade ≤ **−$983** (baseline; not merely "better than −$1,246"),
+- combine pass rate ≥ **96.7%** (baseline 97.7% − 1pp tolerance),
+- net ≥ **95%** of baseline in *every* one of the three splits,
+- trade count strictly > baseline (if it isn't, the whole point is gone → REJECT).
+
+**Kill condition:** if mult 0.50 fails the tail gate, do **not** walk the grid
+downward hunting for a passing value — that is the tuning failure mode TDC/SPC
+were killed for. Two values, then stop.
+
+### C2 — The exit side  *(never tested; the objective-function argument)*
+
+**Why this is the real blind spot.** Every experiment in this ledger — vwap_only,
+CALM_ATR_RATIO, STRONG_MAX_TRADES, age, lunch filter, rubber-band, sweep-block,
+TDC, SPC, EU — is about *which trades to enter*. `PARTIAL_PROFIT_ENABLED`,
+`TRAIL_AFTER_MFE_ENABLED` and `TIME_STOP_ENABLED` are fully wired into
+`run_backtest` (bot.py:2836-2900, 1037), are all `False`, and appear **nowhere in
+this ledger**. They have never been run against the current baseline.
+
+**The argument.** The ledger's own conclusion from the age sweep is that *"net
+P&L is the WRONG objective for a combine — combine pass rate is."* At 29.6% WR
+the book is a small number of large winners; a losing day is the common case and
+the combine needs **5 qualifying days ≥ $150** plus a $3k target without a
+−$1,000 breach. Taking partial profit converts trades that reach +40 ticks and
+then round-trip into small *green* days. That is a direct attack on the two gates
+that killed C1's predecessor — qualifying-day count and daily-limit-fail rate —
+and it requires **no additional trades**, which is exactly right given supply is
+the binding constraint. It should cost net; the question the gauntlet must answer
+is whether it buys pass-rate faster than it sells net.
+
+**Spec (frozen).** Three independent single-flag runs, no combinations on the
+first pass (combinations are how you overfit):
+- C2a `PARTIAL_PROFIT_ENABLED = True` at the wired defaults (40 ticks, 60%).
+- C2b `TRAIL_AFTER_MFE_ENABLED = True` at wired defaults (trigger 60, gap 40).
+- C2c `TIME_STOP_ENABLED = True` at wired defaults (24 bars, MFE < 8 ticks).
+
+Standard gauntlet each. **Judged primarily on combine pass rate, qualifying-day
+count and daily-limit-fail %** — with net allowed to fall to 90% of baseline
+(a deliberately looser net gate than the standard 95%, because trading net for
+pass-rate is the explicit hypothesis). Tail gate is unchanged and absolute:
+worst trade ≤ −$983.
+
+**⚠️ Live-execution cost — must be priced in before shipping C2a.**
+`topstepx_runtime.py` submits a single full-size bracket and manages only the
+stop (`_manage_position_stops`, shared `bot.desired_stop_price`). There is **no
+scale-out path**; the code comments at line 1169 explicitly assume ~1 exit fill.
+So a SHIP verdict on C2a implies new live order-management code plus
+`tests/test_risk_and_safety.py` coverage on both the backtest and live signal
+paths — not a config flip. C2b (trail) *is* already supported live via
+`desired_stop_price`, which makes it the cheapest of the three to ship.
+
+### Sequencing
+Run **C2b first** (cheapest to ship live, already supported), then **C1**, then
+**C2a** (most expensive), then C2c. Do not run combinations until at least one
+single flag has cleared on its own.
+
+### What was actually built in this session (no results — no data here)
+- `research/run_supply_decay_study.py` — the diagnosis above, reproducible from
+  the committed census with no Databento CSV.
+- `src/bot.py` — **inert** flag pair `FVG_AGED_ENTRY_RISK_MULT = 1.0` (shipped
+  value) + `FVG_AGED_ENTRY_MIN_AGE = 5`, wired into the risk-budget sizing block.
+  Guarded by `!= 1.0`, so at the shipped default the branch is unreachable and
+  live behavior is byte-identical. Same pattern as the 2026-07-19 sweep-block
+  port. **129/129 tests pass.**
+- `research/run_aged_entry_sizing.py` — the C1 runner. Needed because C1 is a
+  *pair* of parameters; `nightly_researcher.py` sets exactly one attribute, so
+  running C1 through it would leave the age gate at 4, admit no aged entries, and
+  record a no-op as a clean "no change." Verdict rules are imported from
+  `nightly_researcher.decide` so they stay byte-identical, plus the C1-specific
+  trade-count gate.
+- `research/nightly_backlog.json` — seeded `trail_after_mfe_on`,
+  `partial_profit_on`, `time_stop_on` as `pending` (in that sequence, after the
+  already-queued `fvg_block_level_sweep_on`), and `fvg_aged_entry_risk_mult` as
+  **`blocked_needs_dedicated_runner`** so the generic runner cannot pick it up
+  and produce that misleading no-op.
+
+### Notes for the next session
+- **No backtest was run for any of this.** The session that wrote it had no
+  market data (`DATA_PATH` points at Ron's local Databento CSV). Every number in
+  the diagnosis entry above comes from the committed census; every number in this
+  agenda entry is a *prior*, not a result. Nothing here is evidence yet.
+- Do not skip C2b's live-shipping advantage when reading results: if C2b and C2a
+  both SHIP with similar combine numbers, take C2b — it is a config flip, C2a is
+  new live order-management code.
+
+---
+
 ## 2026-07-19 — Port: FVG_BLOCK_LEVEL_SWEEP_ENABLED (candidate, not shipped)
 
 ### Background
