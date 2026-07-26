@@ -16,6 +16,7 @@
 
 import sys, os
 import argparse
+import hashlib
 import json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -25,7 +26,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dataclasses import dataclass, field
 from collections import deque
-from datetime import datetime
+from datetime import date as date_type, datetime, time as dtime, timedelta
 from typing import List, Tuple, Optional, Dict
 import warnings
 warnings.filterwarnings("ignore")
@@ -85,7 +86,15 @@ GAP_THROUGH_STOPS_ENABLED = True
 # their neighbours; a bar detached above/below both is a data artifact (a spike
 # that reverts on the next bar). Without this, gap-through fills at those garbage
 # prices produce fake catastrophic losses. Conservative: only fully-detached bars.
-PHANTOM_BAR_FILTER_ENABLED = True
+# DISABLED 2026-07-25 — root cause fixed upstream, and this filter is NOT causal:
+# it inspects bar k+1 to decide whether to delete bar k, which a live bot can
+# never do for its newest bar. It existed to mop up ~206pt spike-and-revert bars
+# that were an artifact of load_data.py picking the highest-volume contract
+# PER BAR, so the series flip-flopped between expiring and incoming contracts
+# during rollover weeks. select_front_month() now rolls once per day, forward
+# only, and the artifact count went 76 -> 0. Leave this OFF: with the data clean
+# it removes nothing, and re-enabling it would reintroduce a non-causal step.
+PHANTOM_BAR_FILTER_ENABLED = False
 PHANTOM_BAR_DETACH_PCT     = 0.004   # 0.4% margin beyond full detachment
 
 # ── TOPSTEP $50K RULES ────────────────────────────────────────────────────────
@@ -94,7 +103,7 @@ TIMEZONE             = pytz.timezone("America/Chicago")
 SESSION_OPEN_H       = 17
 SESSION_OPEN_M       = 0
 ENTRY_CUTOFF_H       = 15
-ENTRY_CUTOFF_M       = 8
+ENTRY_CUTOFF_M       = 0
 HARD_FLATTEN_H       = 15
 HARD_FLATTEN_M       = 8
 BOT_DAILY_LOSS_LIMIT = -750.0
@@ -709,6 +718,7 @@ class TradeRecord:
 
     # V28: entry type
     entry_type: str = "FVG"       # "FVG", "ORB", "OD_PULLBACK", "VWAP_MR", or "FAILED_BREAKOUT"
+    entry_date: Optional[pd.Timestamp] = None
 
     # Timing
     entry_hour: int = 0
@@ -744,6 +754,11 @@ class TradeRecord:
     stop_price: float = 0.0
     target_price: float = 0.0
     stop_width_ticks: float = 0.0
+    base_contracts: int = 0
+    candidate_contracts: int = 0
+    account_scaled_contracts: int = 0
+    modeled_per_contract_risk_usd: float = 0.0
+    modeled_allowed_risk_usd: float = 0.0
 
     # Sequence
     trade_number_today: int = 0
@@ -909,6 +924,11 @@ class LiveSignalSnapshot:
     direction: str = ""
     regime: str = ""
     contracts: int = 0
+    base_contracts: int = 0
+    candidate_contracts: int = 0
+    account_scaled_contracts: int = 0
+    modeled_per_contract_risk_usd: float = 0.0
+    modeled_allowed_risk_usd: float = 0.0
     entry_price: float = 0.0
     stop_price: float = 0.0
     target_price: float = 0.0
@@ -1002,6 +1022,178 @@ class RiskState:
         self.daily_trades   = 0
 
 
+def account_floor_allows_entry(cash: float, state: RiskState) -> bool:
+    """An evaluation that breached its trailing floor cannot trade back to life."""
+    if state.floor_breached or cash <= state.max_loss_floor:
+        state.floor_breached = True
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class AccountRiskContext:
+    """All mutable account facts required by deterministic position sizing."""
+
+    cash: float
+    peak_equity: float
+    daily_pnl_usd: float
+    max_loss_floor: float
+    floor_breached: bool = False
+
+
+@dataclass(frozen=True)
+class TradeSizingRequest:
+    """Strategy facts used by both historical and live sizing."""
+
+    entry_type: str
+    direction: str
+    entry_price: float
+    stop_price: float
+    base_contracts: int
+    vwap_price: float = 0.0
+    quality_score: int = 0
+    fb_level_type: str = ""
+    is_news_day: bool = False
+
+
+@dataclass(frozen=True)
+class TradeSizingDecision:
+    contracts: int
+    candidate_contracts: int
+    account_scaled_contracts: int
+    per_contract_risk_usd: float
+    allowed_risk_usd: float
+    drawdown_pct: float
+    rejection_reason: str = ""
+
+
+def _fvg_risk_budget(quality_score: int) -> float:
+    budget = float(RISK_BUDGET_DEFAULT)
+    for threshold in sorted(RISK_BUDGET_MAP, reverse=True):
+        if int(quality_score) >= int(threshold):
+            return float(RISK_BUDGET_MAP[threshold])
+    return budget
+
+
+def determine_trade_size(
+    request: TradeSizingRequest,
+    account: AccountRiskContext,
+) -> TradeSizingDecision:
+    """Single source of truth for backtest and live requested contract size."""
+    peak = float(account.peak_equity)
+    cash = float(account.cash)
+    drawdown_pct = ((cash - peak) / peak * 100.0) if peak > 0 else 0.0
+
+    def reject(reason: str) -> TradeSizingDecision:
+        return TradeSizingDecision(0, 0, 0, 0.0, 0.0, drawdown_pct, reason)
+
+    if account.floor_breached or cash <= float(account.max_loss_floor):
+        return reject("account_floor_breached")
+    if request.direction not in ("long", "short"):
+        return reject("invalid_direction")
+    if int(request.base_contracts) < 1:
+        return reject("base_contracts_below_one")
+
+    entry = float(request.entry_price)
+    stop = float(request.stop_price)
+    if not np.isfinite(entry) or not np.isfinite(stop):
+        return reject("non_finite_entry_or_stop")
+    if request.direction == "long" and stop >= entry:
+        return reject("long_stop_not_below_entry")
+    if request.direction == "short" and stop <= entry:
+        return reject("short_stop_not_above_entry")
+
+    candidate = int(request.base_contracts)
+
+    vwap = float(request.vwap_price)
+    if vwap > 0:
+        wrong_vwap_side = (
+            (request.direction == "long" and entry <= vwap)
+            or (request.direction == "short" and entry >= vwap)
+        )
+        if wrong_vwap_side:
+            candidate = max(1, candidate - 2)
+
+    if request.entry_type == "FVG":
+        score = int(request.quality_score)
+        if FVG_SCORE_CONTRACT_MAP_ENABLED:
+            for threshold in sorted(FVG_SCORE_CONTRACT_MAP, reverse=True):
+                if score >= int(threshold):
+                    candidate = int(FVG_SCORE_CONTRACT_MAP[threshold])
+                    break
+        elif FVG_SCORE_SIZING_ENABLED:
+            if score >= FVG_SCORE_HIGH_THRESHOLD:
+                candidate = min(STRONG_CONTRACTS, candidate + FVG_SCORE_HIGH_SIZE_STEP)
+            elif score >= FVG_SCORE_MEDIUM_THRESHOLD:
+                candidate = min(STRONG_CONTRACTS, candidate + FVG_SCORE_MEDIUM_SIZE_STEP)
+    elif (
+        request.entry_type == "FAILED_BREAKOUT"
+        and FB_QUALITY_SIZING_ENABLED
+        and str(request.fb_level_type).startswith("globex_")
+    ):
+        candidate = min(STRONG_CONTRACTS, candidate + FB_GLOBEX_SIZE_STEP)
+
+    if NEWS_DAY_SIZE_CAP_ENABLED and request.entry_type == "FVG" and request.is_news_day:
+        candidate = min(candidate, NEWS_DAY_MAX_CONTRACTS)
+    candidate = max(0, int(candidate))
+
+    if drawdown_pct > -1.5:
+        account_candidate = candidate
+    elif drawdown_pct > -2.5:
+        account_candidate = min(candidate, max(1, candidate - 2))
+    else:
+        account_candidate = min(candidate, 2)
+
+    stop_distance = abs(entry - stop)
+    gap_multiplier = GAP_STOP_MULT if GAP_AWARE_SIZING_ENABLED else 1.0
+    worst_slip_ticks = max(float(ticks) for _cap, ticks in SLIPPAGE_SCALE_TIERS)
+    per_contract_cost = (
+        COMMISSION_PER_CONTRACT
+        + worst_slip_ticks * MNQ_TICK_VALUE * 2
+    )
+    per_contract_risk = (
+        stop_distance * gap_multiplier * MNQ_POINT_VALUE
+        + per_contract_cost
+    )
+    if per_contract_risk <= 0 or not np.isfinite(per_contract_risk):
+        return reject("invalid_per_contract_risk")
+
+    daily_headroom = max(
+        0.0,
+        float(account.daily_pnl_usd) - float(BOT_DAILY_LOSS_LIMIT),
+    ) * HEADROOM_SAFETY_FRAC
+    floor_headroom = max(
+        0.0,
+        cash - float(account.max_loss_floor),
+    ) * HEADROOM_SAFETY_FRAC
+    allowed_risk = min(daily_headroom, floor_headroom)
+
+    if request.entry_type == "FVG" and RISK_BUDGET_SIZING_ENABLED:
+        allowed_risk = min(allowed_risk, _fvg_risk_budget(request.quality_score))
+    elif request.entry_type == "FVG" and ATR_CDR_ENABLED:
+        allowed_risk = min(allowed_risk, float(ATR_CDR_TARGET_USD))
+
+    contracts = min(account_candidate, int(allowed_risk / per_contract_risk))
+    if contracts < 1:
+        return TradeSizingDecision(
+            0,
+            candidate,
+            account_candidate,
+            per_contract_risk,
+            allowed_risk,
+            drawdown_pct,
+            "risk_headroom_below_one_contract",
+        )
+    return TradeSizingDecision(
+        int(contracts),
+        candidate,
+        account_candidate,
+        per_contract_risk,
+        allowed_risk,
+        drawdown_pct,
+    )
+
+
 # ── COST CALCULATION ──────────────────────────────────────────────────────────
 
 def round_turn_cost(contracts: int) -> float:
@@ -1015,6 +1207,58 @@ def round_turn_cost(contracts: int) -> float:
 
 
 # ── SHARED STOP MANAGEMENT (backtest engine AND live stop manager) ───────────
+
+@dataclass(frozen=True)
+class BracketExitDecision:
+    exit_price: Optional[float]
+    exit_reason: Optional[str]
+    hit_stop: bool
+    hit_target: bool
+
+
+def resolve_ohlc_bracket_exit(
+    *,
+    direction: str,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+    bar_open: float,
+    bar_high: float,
+    bar_low: float,
+) -> BracketExitDecision:
+    """Resolve an OHLC bracket conservatively when intrabar order is unknown."""
+    if direction not in ("long", "short"):
+        raise ValueError(f"Unsupported direction: {direction}")
+    if bar_high < max(bar_open, bar_low) or bar_low > min(bar_open, bar_high):
+        raise ValueError("Invalid OHLC range")
+    if direction == "long" and not (
+        entry_price < target_price and stop_price < target_price
+    ):
+        raise ValueError("Long bracket requires target above entry and stop below target")
+    if direction == "short" and not (
+        target_price < entry_price and target_price < stop_price
+    ):
+        raise ValueError("Short bracket requires target below entry and stop above target")
+
+    if direction == "long":
+        hit_stop = bar_low <= stop_price
+        hit_target = bar_high >= target_price
+        stop_fill = min(bar_open, stop_price) if GAP_THROUGH_STOPS_ENABLED else stop_price
+        stop_fill -= STOP_EXTRA_SLIP_TICKS * MNQ_TICK_SIZE
+    else:
+        hit_stop = bar_high >= stop_price
+        hit_target = bar_low <= target_price
+        stop_fill = max(bar_open, stop_price) if GAP_THROUGH_STOPS_ENABLED else stop_price
+        stop_fill += STOP_EXTRA_SLIP_TICKS * MNQ_TICK_SIZE
+
+    # A five-minute OHLC bar has no event ordering. Stop-first is the only
+    # deterministic conservative assumption when both levels were touched.
+    if hit_stop:
+        return BracketExitDecision(float(stop_fill), "stop", True, hit_target)
+    if hit_target:
+        return BracketExitDecision(float(target_price), "target", False, True)
+    return BracketExitDecision(None, None, False, False)
+
 
 def desired_stop_price(direction: str, entry_price: float, current_stop: float,
                        mfe_prev_bar_pts: float) -> float:
@@ -1257,17 +1501,27 @@ def validate_loaded_data(df: pd.DataFrame) -> Dict[str, object]:
         bad_ts = df.index[bad_ohlc][0]
         raise ValueError(f"Data validation failed: OHLC bounds invalid at {bad_ts}")
 
+    digest = hashlib.sha256()
+    utc_ns = df.index.tz_convert("UTC").asi8.astype("<i8", copy=False)
+    digest.update(utc_ns.tobytes())
+    for column in required_cols:
+        digest.update(column.encode("ascii"))
+        values = df[column].to_numpy(dtype="<f8", copy=True)
+        digest.update(values.tobytes())
+
     summary = {
         "rows": int(len(df)),
         "start": df.index[0].isoformat(),
         "end": df.index[-1].isoformat(),
         "timezone": str(df.index.tz),
+        "sha256": digest.hexdigest(),
     }
     print(
         "  Data validation passed:"
         f" rows={summary['rows']:,}"
         f" | range={summary['start']} -> {summary['end']}"
         f" | tz={summary['timezone']}"
+        f" | sha256={summary['sha256'][:12]}"
     )
     return summary
 
@@ -1301,22 +1555,60 @@ def filter_phantom_bars(df: pd.DataFrame) -> pd.DataFrame:
     return df[keep]
 
 
+def drop_incomplete_historical_sessions(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove sessions that do not match the deterministic CME RTH schedule."""
+    if df.empty:
+        return df
+    bad_dates = []
+    index_ct = df.index.tz_convert(TIMEZONE)
+    for session_date, day in df.groupby(index_ct.date):
+        day_index = day.index.tz_convert(TIMEZONE)
+        expected_end = session_last_bar_start_ct(session_date)
+        expected = pd.date_range(
+            f"{session_date} 08:30",
+            f"{session_date} {expected_end.strftime('%H:%M')}",
+            freq="5min",
+            tz=TIMEZONE,
+        )
+        if not day_index.equals(expected):
+            bad_dates.append(session_date)
+    if bad_dates:
+        bad = set(bad_dates)
+        keep = np.array([timestamp.date() not in bad for timestamp in index_ct])
+        print(
+            "  Historical-session validation: removed "
+            f"{len(bad_dates)} incomplete session(s): "
+            + ", ".join(str(value) for value in bad_dates)
+        )
+        df = df[keep]
+    return df
+
+
 def fetch_data() -> pd.DataFrame:
     print("Loading data...")
     if not os.path.exists(DATA_PATH):
         raise FileNotFoundError(f"Data path does not exist: {DATA_PATH}")
-    df = load_ohlcv_csv(DATA_PATH)
+    df, selected_contract = load_ohlcv_csv(
+        DATA_PATH,
+        return_selected_contract=True,
+    )
     df = filter_phantom_bars(df)
     for ext_path in DATA_PATH_EXTENSIONS:
         if not os.path.exists(ext_path):
             print(f"  (extension not found, skipped: {ext_path})")
             continue
-        ext = filter_phantom_bars(load_ohlcv_csv(ext_path))
+        ext, selected_contract = load_ohlcv_csv(
+            ext_path,
+            initial_contract=selected_contract,
+            return_selected_contract=True,
+        )
+        ext = filter_phantom_bars(ext)
         before = len(df)
         df = pd.concat([df, ext])
         df = df[~df.index.duplicated(keep="last")].sort_index()
         print(f"  Extended with {os.path.basename(ext_path)}: "
               f"+{len(df)-before:,} bars -> {len(df):,} total, to {df.index[-1]}")
+    df = drop_incomplete_historical_sessions(df)
     print(f"Loaded {len(df):,} 5-minute bars.")
     return df
 
@@ -1350,8 +1642,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["_date"]  = df.index.date
     df["_tp"]    = (high + low + close) / 3
-    df["_tpvol"] = df.groupby("_date", group_keys=False).apply(
-        lambda g: (g["_tp"] * g["volume"]).cumsum())
+    df["_tpvol"] = (df["_tp"] * df["volume"]).groupby(df["_date"]).cumsum()
     df["_vcum"]  = df.groupby("_date", group_keys=False)["volume"].cumsum()
     df["vwap"]   = df["_tpvol"] / df["_vcum"].replace(0, np.nan)
     df.drop(columns=["_date", "_tp", "_tpvol", "_vcum"], inplace=True)
@@ -1388,9 +1679,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df_15m       = df["close"].resample("15min").last().dropna()
     ema_fast_15m = df_15m.ewm(span=EMA_FAST, adjust=False).mean()
     ema_slow_15m = df_15m.ewm(span=EMA_SLOW, adjust=False).mean()
-    df["mtf_15m_bull"] = (ema_fast_15m > ema_slow_15m).reindex(
+    # A 15-minute value labelled 09:30 contains 09:30/09:35/09:40 closes and
+    # becomes knowable only at 09:45. Shift one completed bin before ffill.
+    df["mtf_15m_bull"] = (ema_fast_15m > ema_slow_15m).shift(1).reindex(
         df.index, method="ffill").fillna(False)
-    df["mtf_15m_bear"] = (ema_fast_15m < ema_slow_15m).reindex(
+    df["mtf_15m_bear"] = (ema_fast_15m < ema_slow_15m).shift(1).reindex(
         df.index, method="ffill").fillna(False)
 
     # Relative volume: this bar's volume vs its own 20-bar rolling mean.
@@ -1519,6 +1812,88 @@ def is_fvg_valid(fvg: FVG, current_bar: int, current_date: object,
     if fvg.direction == "bearish" and ref > fvg.top:
         return False
     return True
+
+
+def _same_session_window(*timestamps) -> bool:
+    """True only when every timestamp belongs to one Chicago session date."""
+    session_dates = []
+    for timestamp in timestamps:
+        converted = (
+            timestamp.astimezone(TIMEZONE)
+            if getattr(timestamp, "tzinfo", None) is not None
+            else TIMEZONE.localize(timestamp)
+        )
+        session_dates.append(converted.date())
+    return len(set(session_dates)) == 1
+
+
+def _nth_weekday(year: int, month: int, weekday: int, occurrence: int) -> date_type:
+    first = date_type(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (occurrence - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date_type:
+    next_month = (
+        date_type(year + 1, 1, 1)
+        if month == 12
+        else date_type(year, month + 1, 1)
+    )
+    last = next_month - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _observed_fixed_holiday(year: int, month: int, day: int) -> date_type:
+    holiday = date_type(year, month, day)
+    if holiday.weekday() == 5:
+        return holiday - timedelta(days=1)
+    if holiday.weekday() == 6:
+        return holiday + timedelta(days=1)
+    return holiday
+
+
+def session_last_bar_start_ct(session_date: date_type) -> dtime:
+    """Scheduled start time of the final RTH bar for CME equity futures."""
+    year = session_date.year
+    holiday_1155 = {
+        _nth_weekday(year, 1, 0, 3),   # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),   # Presidents Day
+        _last_weekday(year, 5, 0),     # Memorial Day
+        _observed_fixed_holiday(year, 7, 4),
+        _nth_weekday(year, 9, 0, 1),   # Labor Day
+        _nth_weekday(year, 11, 3, 4),  # Thanksgiving
+    }
+    if year >= 2022:
+        holiday_1155.add(_observed_fixed_holiday(year, 6, 19))
+    if session_date in holiday_1155:
+        return dtime(11, 55)
+
+    thanksgiving = _nth_weekday(year, 11, 3, 4)
+    shortened_1210 = {thanksgiving + timedelta(days=1)}
+    july_third = date_type(year, 7, 3)
+    christmas_eve = date_type(year, 12, 24)
+    if july_third.weekday() < 5:
+        shortened_1210.add(july_third)
+    if christmas_eve.weekday() < 5:
+        shortened_1210.add(christmas_eve)
+    if session_date in shortened_1210:
+        return dtime(12, 10)
+    return dtime(15, 0)
+
+
+def session_flatten_time_ct(session_date: date_type) -> dtime:
+    end = datetime.combine(
+        session_date, session_last_bar_start_ct(session_date)
+    ) + timedelta(minutes=5)
+    return end.time()
+
+
+def is_strategy_decision_time_ct(dt_ct: datetime) -> bool:
+    """True only while a new RTH bar may legitimately generate an entry."""
+    if dt_ct.weekday() >= 5:
+        return False
+    current = dt_ct.time()
+    return dtime(8, 30) <= current < session_last_bar_start_ct(dt_ct.date())
 
 
 def price_in_fvg(fvg: FVG, price: float) -> bool:
@@ -1793,6 +2168,10 @@ def _build_live_signal_snapshot(
     entry_type: str,
     target_ticks: int,
 ) -> LiveSignalSnapshot:
+    if getattr(as_of, "tzinfo", None) is not None:
+        as_of_canonical = as_of.tz_convert(TIMEZONE)
+    else:
+        as_of_canonical = TIMEZONE.localize(as_of)
     stop_width_ticks = float(entry_snapshot.get("stop_width_ticks", 0.0))
     reward_risk_ratio = (float(target_ticks) / stop_width_ticks) if stop_width_ticks > 0 else 0.0
     quality_flags = str(entry_snapshot.get("fvg_quality_flags", ""))
@@ -1811,13 +2190,27 @@ def _build_live_signal_snapshot(
     thesis_parts.append(f"rr={reward_risk_ratio:.2f}")
 
     return LiveSignalSnapshot(
-        as_of=as_of.isoformat(),
-        entry_timestamp=as_of.isoformat(),
+        as_of=as_of_canonical.isoformat(),
+        entry_timestamp=as_of_canonical.isoformat(),
         session_date=str(session_date),
         entry_type=entry_type,
         direction=direction,
         regime=entry_regime,
-        contracts=int(contracts),
+        # A live signal carries the context-free candidate. The order planner
+        # applies this same sizing function again with reconciled broker account
+        # state; it must never inherit a short historical replay's fake balance.
+        contracts=int(entry_snapshot.get("candidate_contracts", contracts)),
+        base_contracts=int(entry_snapshot.get("base_contracts", contracts)),
+        candidate_contracts=int(entry_snapshot.get("candidate_contracts", contracts)),
+        account_scaled_contracts=int(
+            entry_snapshot.get("account_scaled_contracts", contracts)
+        ),
+        modeled_per_contract_risk_usd=float(
+            entry_snapshot.get("modeled_per_contract_risk_usd", 0.0)
+        ),
+        modeled_allowed_risk_usd=float(
+            entry_snapshot.get("modeled_allowed_risk_usd", 0.0)
+        ),
         entry_price=float(entry_price),
         stop_price=float(entry_snapshot.get("stop_price", 0.0)),
         target_price=float(entry_snapshot.get("target_price", 0.0)),
@@ -1939,6 +2332,8 @@ def _build_vwap_mr_setup(prev_row, current_price: float, dt_ct, active_fvgs, cur
     fvg_direction_sought = "bullish" if direction == "short" else "bearish"
     recent_failed_fvg = None
     for fvg in reversed(active_fvgs):
+        if fvg.created_bar >= current_bar:
+            continue
         if fvg.direction != fvg_direction_sought:
             continue
         age = current_bar - fvg.created_bar
@@ -2319,8 +2714,9 @@ def compute_session_levels(df: pd.DataFrame) -> Dict:
     dates = sorted(df_ct["_ct_date"].unique())
 
     from datetime import time as dtime
-    reg_open    = dtime(9, 30)
-    reg_close   = dtime(15, 8)
+    # Input is RTH 09:30-16:00 ET, i.e. 08:30-15:00 CT.
+    reg_open    = dtime(8, 30)
+    reg_close   = dtime(15, 0)
     globex_start = dtime(17, 0)
 
     range_list = []
@@ -2364,8 +2760,10 @@ def compute_session_levels(df: pd.DataFrame) -> Dict:
             globex_low   = float(globex_bars["low"].min())
             globex_range = globex_high - globex_low
         else:
-            globex_high  = first_open
-            globex_low   = first_open
+            # The strategy dataframe is RTH-only. Zero explicitly means the
+            # overnight level is unavailable; never relabel cash-session bars.
+            globex_high  = 0.0
+            globex_low   = 0.0
             globex_range = 0.0
 
         opening_gap    = first_open - prev_close if prev_close > 0 else 0.0
@@ -2444,6 +2842,7 @@ def run_backtest(
     df: pd.DataFrame,
     session_levels: Dict,
     live_signal_sink: Optional[Dict[str, object]] = None,
+    enforce_evaluation_floor: bool = True,
 ) -> Tuple[pd.DataFrame, List[TradeRecord], List[DailyRecord], RiskState]:
 
     import random as _random
@@ -2460,12 +2859,15 @@ def run_backtest(
     entry_price   = 0.0
     fvg_stop      = 0.0
     contracts     = 0
+    entry_contracts = 0
     target_ticks  = NORMAL_TARGET_TICKS
     entry_regime  = "unknown"
     entry_type    = "FVG"
     entry_bar_idx = 0
     partial_taken        = False   # has partial profit fired for current trade?
     partial_pnl_banked   = 0.0    # P&L locked in from partial exit
+    partial_gross_banked = 0.0
+    partial_costs_banked = 0.0
     breakeven_triggered  = False   # has stop been moved to entry price?
 
     trade_mfe = 0.0
@@ -2503,35 +2905,174 @@ def run_backtest(
 
     entry_snapshot: dict = {}
 
+    def _finalize_active_trade(exit_price: float, exit_reason: str,
+                               exit_date: pd.Timestamp, exit_bar_idx: int) -> TradeRecord:
+        """Close the active position once and update all accounting atomically."""
+        nonlocal cash, in_trade, trade_mfe, trade_mae
+        nonlocal partial_taken, partial_pnl_banked, partial_gross_banked
+        nonlocal partial_costs_banked, breakeven_triggered
+        nonlocal consecutive_wins, consecutive_losses
+        nonlocal day_peak_cash, day_trough_cash
+
+        pnl_pts = ((exit_price - entry_price) if direction == "long"
+                   else (entry_price - exit_price))
+        remaining_gross_pnl_usd = pnl_pts * MNQ_POINT_VALUE * contracts
+        remaining_costs_usd = round_turn_cost(contracts)
+        remaining_pnl_usd = remaining_gross_pnl_usd - remaining_costs_usd
+        gross_pnl_usd = remaining_gross_pnl_usd + partial_gross_banked
+        costs_usd = remaining_costs_usd + partial_costs_banked
+        pnl_usd = remaining_pnl_usd + partial_pnl_banked
+        pnl_pct = pnl_pts / entry_price
+        won = pnl_usd > 0
+        cash += remaining_pnl_usd
+
+        # Partial realized P&L was added to daily state at its fill. Add only
+        # the remaining leg here, while recording the complete trade totals.
+        state.update(won, pnl_pct, remaining_pnl_usd)
+        day_peak_cash = max(day_peak_cash, cash)
+        day_trough_cash = min(day_trough_cash, cash)
+
+        tr = _build_trade_record(
+            entry_snapshot=entry_snapshot,
+            date=exit_date, direction=direction,
+            entry_price=entry_price, exit_price=exit_price,
+            pnl_pts=pnl_pts, gross_pnl_usd=gross_pnl_usd,
+            costs_usd=costs_usd, pnl_usd=pnl_usd,
+            pnl_pct=pnl_pct, won=won, cash=cash,
+            contracts=entry_contracts, entry_regime=entry_regime,
+            exit_reason=exit_reason, fvg_stop=fvg_stop,
+            trade_mae=trade_mae, trade_mfe=trade_mfe,
+            bars_to_exit=exit_bar_idx - entry_bar_idx, state=state,
+        )
+        trades.append(tr)
+        day_trades_list.append(tr)
+
+        if won:
+            consecutive_wins += 1
+            consecutive_losses = 0
+        else:
+            consecutive_losses += 1
+            consecutive_wins = 0
+
+        in_trade = False
+        trade_mfe = 0.0
+        trade_mae = 0.0
+        partial_taken = False
+        partial_pnl_banked = 0.0
+        partial_gross_banked = 0.0
+        partial_costs_banked = 0.0
+        breakeven_triggered = False
+        return tr
+
+    def _resolve_intrabar_exit(bar: pd.Series) -> Tuple[Optional[float], Optional[str]]:
+        """Apply deterministic OHLC ordering: stop first, then target/partial."""
+        nonlocal cash, contracts, partial_taken, partial_pnl_banked
+        nonlocal partial_gross_banked, partial_costs_banked
+        nonlocal trade_mfe, trade_mae, day_peak_cash, day_trough_cash
+
+        target_pts = target_ticks * MNQ_TICK_SIZE
+        partial_pts = PARTIAL_PROFIT_TICKS * MNQ_TICK_SIZE
+        if direction == "long":
+            stop_px = fvg_stop
+            target_px = entry_price + target_pts
+            partial_px = entry_price + partial_pts
+            hit_partial = (
+                PARTIAL_PROFIT_ENABLED and not partial_taken and contracts > 1
+                and float(bar["high"]) >= partial_px
+            )
+        else:
+            stop_px = fvg_stop
+            target_px = entry_price - target_pts
+            partial_px = entry_price - partial_pts
+            hit_partial = (
+                PARTIAL_PROFIT_ENABLED and not partial_taken and contracts > 1
+                and float(bar["low"]) <= partial_px
+            )
+
+        bracket = resolve_ohlc_bracket_exit(
+            direction=direction,
+            entry_price=entry_price,
+            stop_price=stop_px,
+            target_price=target_px,
+            bar_open=float(bar["open"]),
+            bar_high=float(bar["high"]),
+            bar_low=float(bar["low"]),
+        )
+        hit_stop = bracket.hit_stop
+        exit_price, exit_reason = bracket.exit_price, bracket.exit_reason
+
+        if not hit_stop and hit_partial:
+            partial_contracts = max(1, round(contracts * PARTIAL_PROFIT_FRACTION))
+            remaining = contracts - partial_contracts
+            pp_pts = ((partial_px - entry_price) if direction == "long"
+                      else (entry_price - partial_px))
+            pp_gross = pp_pts * MNQ_POINT_VALUE * partial_contracts
+            pp_costs = round_turn_cost(partial_contracts)
+            pp_net = pp_gross - pp_costs
+            cash += pp_net
+            state.daily_pnl_usd += pp_net
+            partial_pnl_banked += pp_net
+            partial_gross_banked += pp_gross
+            partial_costs_banked += pp_costs
+            contracts = remaining
+            partial_taken = True
+            day_peak_cash = max(day_peak_cash, cash)
+            day_trough_cash = min(day_trough_cash, cash)
+
+        # Do not count excursions assumed to occur after a stop-first exit.
+        if exit_reason == "stop":
+            favorable = 0.0
+            unfavorable = (
+                (entry_price - float(exit_price))
+                if direction == "long"
+                else (float(exit_price) - entry_price)
+            )
+        elif exit_reason == "target":
+            favorable = target_pts
+            unfavorable = ((entry_price - float(bar["low"])) if direction == "long"
+                           else (float(bar["high"]) - entry_price))
+        elif direction == "long":
+            favorable = float(bar["high"]) - entry_price
+            unfavorable = entry_price - float(bar["low"])
+        else:
+            favorable = entry_price - float(bar["low"])
+            unfavorable = float(bar["high"]) - entry_price
+        trade_mfe = max(trade_mfe, max(0.0, favorable))
+        trade_mae = max(trade_mae, max(0.0, unfavorable))
+        return exit_price, exit_reason
+
+    def _stop_is_triggered_at_open(bar: pd.Series) -> bool:
+        opening = float(bar["open"])
+        return (
+            direction == "long" and opening <= fvg_stop
+        ) or (
+            direction == "short" and opening >= fvg_stop
+        )
+
     for i in range(2, len(df)):
         row      = df.iloc[i]
         prev_row = df.iloc[i - 1]
         bar_2    = df.iloc[i - 2]
         date     = df.index[i]
+        position_at_bar_open = in_trade
 
         if hasattr(date, "tzinfo") and date.tzinfo is not None:
             date_ct = date.astimezone(TIMEZONE)
         else:
             date_ct = TIMEZONE.localize(date)
+        prev_date = prev_row.name
+        if hasattr(prev_date, "tzinfo") and prev_date.tzinfo is not None:
+            prev_date_ct = prev_date.astimezone(TIMEZONE)
+        else:
+            prev_date_ct = TIMEZONE.localize(prev_date)
 
         session_date = date_ct.date()
         sl = session_levels.get(session_date, {})
 
-        # Last bar of this RTH session? (next bar is a new day, or end of data).
-        # Used to force an EOD flatten at THIS bar's close and to block entries
-        # that would have no intraday bar left to exit on (prevents overnight holds).
-        if i + 1 < len(df):
-            _nd = df.index[i + 1]
-            _nd_ct = _nd.astimezone(TIMEZONE) if (hasattr(_nd, "tzinfo") and _nd.tzinfo is not None) else TIMEZONE.localize(_nd)
-            is_last_session_bar = (_nd_ct.date() != session_date)
-        else:
-            # End of data is NOT a known session boundary. Critically, in LIVE
-            # signal generation the current bar is always the final bar of the
-            # window — flagging it as last-session-bar would block entry
-            # evaluation there and silence live signals entirely (the sink at
-            # the bottom of run_backtest only emits when in_trade on the final
-            # bar). Only an OBSERVED date change blocks entries / EOD-flattens.
-            is_last_session_bar = False
+        # Exchange schedule is known at the open; no future row is consulted.
+        is_last_session_bar = (
+            date_ct.time() >= session_last_bar_start_ct(session_date)
+        )
 
         # ── Day rollover ──────────────────────────────────────────────────────
         if current_day != session_date:
@@ -2603,26 +3144,21 @@ def run_backtest(
             # bar's excursion, so breakeven can only react to information that
             # was actually available at this bar's open (no intrabar lookahead).
             trade_mfe_prev_bar = trade_mfe
-            if direction == "long":
-                favorable   = row["high"] - entry_price
-                unfavorable = entry_price - row["low"]
-            else:
-                favorable   = entry_price - row["low"]
-                unfavorable = row["high"] - entry_price
-            if favorable  > trade_mfe: trade_mfe = favorable
-            if unfavorable > trade_mae: trade_mae = unfavorable
 
         # ── ORB range formation ───────────────────────────────────────────────
-        # Accumulate highs/lows for the first ORB_RANGE_BARS bars after 9:30
+        # At this bar's open, only the preceding completed bar may extend the
+        # opening range. This also means the first legal ORB entry is the open
+        # immediately after ORB_RANGE_BARS bars have completed.
         if (not orb.formed
                 and orb.session_date == session_date
-                and _is_orb_forming_bar(date_ct)):
+                and prev_date_ct.date() == session_date
+                and _is_orb_forming_bar(prev_date_ct)):
             if orb.bars_seen == 0:
-                orb.high = float(row["high"])
-                orb.low  = float(row["low"])
+                orb.high = float(prev_row["high"])
+                orb.low  = float(prev_row["low"])
             else:
-                if row["high"] > orb.high: orb.high = float(row["high"])
-                if row["low"]  < orb.low:  orb.low  = float(row["low"])
+                if prev_row["high"] > orb.high: orb.high = float(prev_row["high"])
+                if prev_row["low"]  < orb.low:  orb.low  = float(prev_row["low"])
             orb.bars_seen += 1
             if orb.bars_seen >= ORB_RANGE_BARS:
                 orb.range_ticks = (orb.high - orb.low) / MNQ_TICK_SIZE
@@ -2709,18 +3245,24 @@ def run_backtest(
                 if float(prev_row["low"]) < _pdl_ref - PDH_BREAK_TICKS * MNQ_TICK_SIZE:
                     pdhr.pdl_break_confirmed = True
 
-        # Build opening-drive state from the first three 5m bars after 9:30
-        if od.session_date == session_date and _is_od_drive_bar(date_ct):
+        # Build opening-drive state only from completed bars. The first entry
+        # decision after the drive therefore occurs at the next bar's open.
+        if (od.session_date == session_date
+                and prev_date_ct.date() == session_date
+                and _is_od_drive_bar(prev_date_ct)):
             if od.bars_seen == 0:
-                od.drive_open = float(row["open"])
-                od.drive_high = float(row["high"])
-                od.drive_low = float(row["low"])
+                od.drive_open = float(prev_row["open"])
+                od.drive_high = float(prev_row["high"])
+                od.drive_low = float(prev_row["low"])
             else:
-                od.drive_high = max(od.drive_high, float(row["high"]))
-                od.drive_low = min(od.drive_low, float(row["low"]))
-            od.drive_close = float(row["close"])
+                od.drive_high = max(od.drive_high, float(prev_row["high"]))
+                od.drive_low = min(od.drive_low, float(prev_row["low"]))
+            od.drive_close = float(prev_row["close"])
             od.bars_seen += 1
-        elif od.session_date == session_date and not od.formed and od.bars_seen > 0:
+        if (od.session_date == session_date
+                and not od.formed
+                and od.bars_seen > 0
+                and not _is_od_drive_bar(date_ct)):
             _finalize_od_pullback_state(od, prev_row, i - 1)
 
         if (od.session_date == session_date
@@ -2737,10 +3279,21 @@ def run_backtest(
             _htf_zones_ptr += 1
         active_htf_fvgs = [z for z in active_htf_fvgs if z["ts_expires"] > _cur_ts]
 
+        # Prune only gaps that existed before this bar. A newly detected gap must
+        # never be invalidated by the middle candle that predates its creation.
+        active_fvgs = [
+            f for f in active_fvgs
+            if is_fvg_valid(f, i, session_date,
+                            prev_row["high"], prev_row["low"], prev_row["close"])
+        ]
+
         # ── Detect new FVG ────────────────────────────────────────────────────
         fvg_size_min = FVG_MIN_SIZE_TICKS * MNQ_TICK_SIZE
+        _fvg_window_same_session = _same_session_window(
+            bar_2.name, prev_row.name, row.name
+        )
 
-        if bar_2["high"] < row["low"]:
+        if _fvg_window_same_session and bar_2["high"] < row["low"]:
             gap_size = row["low"] - bar_2["high"]
             if gap_size >= fvg_size_min:
                 _imp_range = prev_row["high"] - prev_row["low"]
@@ -2757,7 +3310,7 @@ def run_backtest(
                     vwap_dist_at_creation=abs(float(prev_row["close"]) - _vwap_val) if _vwap_val > 0 else 0.0,
                 ))
 
-        if bar_2["low"] > row["high"]:
+        if _fvg_window_same_session and bar_2["low"] > row["high"]:
             gap_size = bar_2["low"] - row["high"]
             if gap_size >= fvg_size_min:
                 _imp_range = prev_row["high"] - prev_row["low"]
@@ -2774,52 +3327,9 @@ def run_backtest(
                     vwap_dist_at_creation=abs(float(prev_row["close"]) - _vwap_val) if _vwap_val > 0 else 0.0,
                 ))
 
-        # ── Prune stale FVGs ──────────────────────────────────────────────────
-        active_fvgs = [
-            f for f in active_fvgs
-            if is_fvg_valid(f, i, session_date, row["high"], row["low"], row["close"])
-        ]
-
         # ── Hard flatten outside session ──────────────────────────────────────
         if in_trade and not _is_in_session(date_ct):
-            exit_price    = row["open"]
-            pnl_pts       = ((exit_price - entry_price) if direction == "long"
-                             else (entry_price - exit_price))
-            gross_pnl_usd = pnl_pts * MNQ_POINT_VALUE * contracts
-            costs_usd     = round_turn_cost(contracts)
-            pnl_usd       = gross_pnl_usd - costs_usd
-            pnl_pct       = pnl_pts / entry_price
-            won           = pnl_usd > 0
-            cash          += pnl_usd
-
-            state.update(won, pnl_pct, pnl_usd)
-            if cash > day_peak_cash:   day_peak_cash   = cash
-            if cash < day_trough_cash: day_trough_cash = cash
-
-            tr = _build_trade_record(
-                entry_snapshot=entry_snapshot,
-                date=date, direction=direction,
-                entry_price=entry_price, exit_price=exit_price,
-                pnl_pts=pnl_pts, gross_pnl_usd=gross_pnl_usd,
-                costs_usd=costs_usd, pnl_usd=pnl_usd,
-                pnl_pct=pnl_pct, won=won, cash=cash,
-                contracts=contracts, entry_regime=entry_regime,
-                exit_reason="flatten", fvg_stop=fvg_stop,
-                trade_mae=trade_mae, trade_mfe=trade_mfe,
-                bars_to_exit=i - entry_bar_idx, state=state,
-            )
-            trades.append(tr)
-            day_trades_list.append(tr)
-
-            if won: consecutive_wins += 1;  consecutive_losses = 0
-            else:   consecutive_losses += 1; consecutive_wins = 0
-
-            in_trade             = False
-            trade_mfe            = 0.0
-            trade_mae            = 0.0
-            partial_taken        = False
-            partial_pnl_banked   = 0.0
-            breakeven_triggered  = False
+            _finalize_active_trade(float(row["open"]), "flatten", date, i)
 
         # ── Exit logic ────────────────────────────────────────────────────────
         if in_trade:
@@ -2832,67 +3342,11 @@ def run_backtest(
             # code path the live stop manager uses -> parity by construction).
             fvg_stop = desired_stop_price(direction, entry_price, fvg_stop, trade_mfe_prev_bar)
 
-            target_pts  = target_ticks * MNQ_TICK_SIZE
-            partial_pts = PARTIAL_PROFIT_TICKS * MNQ_TICK_SIZE
-            if direction == "long":
-                stop_px       = fvg_stop
-                target_px     = entry_price + target_pts
-                partial_px    = entry_price + partial_pts
-                hit_stop      = row["low"]  <= stop_px
-                hit_target    = row["high"] >= target_px
-                # Gap-through: if the bar opened below the stop, fill at the open.
-                stop_fill_px  = min(row["open"], stop_px) if GAP_THROUGH_STOPS_ENABLED else stop_px
-                stop_fill_px -= STOP_EXTRA_SLIP_TICKS * MNQ_TICK_SIZE  # stress: worse long-stop fill
-                hit_partial   = (PARTIAL_PROFIT_ENABLED
-                                 and not partial_taken
-                                 and contracts > 1
-                                 and row["high"] >= partial_px)
-            else:
-                stop_px       = fvg_stop
-                target_px     = entry_price - target_pts
-                partial_px    = entry_price - partial_pts
-                hit_stop      = row["high"] >= stop_px
-                hit_target    = row["low"]  <= target_px
-                # Gap-through: if the bar opened above the stop, fill at the open.
-                stop_fill_px  = max(row["open"], stop_px) if GAP_THROUGH_STOPS_ENABLED else stop_px
-                stop_fill_px += STOP_EXTRA_SLIP_TICKS * MNQ_TICK_SIZE  # stress: worse short-stop fill
-                hit_partial   = (PARTIAL_PROFIT_ENABLED
-                                 and not partial_taken
-                                 and contracts > 1
-                                 and row["low"] <= partial_px)
-
-            exit_price  = None
-            exit_reason = None
+            exit_price, exit_reason = None, None
 
             # Partial profit fires first — close fraction, continue with rest
-            if hit_partial:
-                partial_contracts  = max(1, round(contracts * PARTIAL_PROFIT_FRACTION))
-                remaining          = contracts - partial_contracts
-                pp_pts             = ((partial_px - entry_price) if direction == "long"
-                                      else (entry_price - partial_px))
-                pp_gross           = pp_pts * MNQ_POINT_VALUE * partial_contracts
-                pp_costs           = round_turn_cost(partial_contracts)
-                pp_net             = pp_gross - pp_costs
-                cash              += pp_net
-                state.daily_pnl_usd += pp_net
-                partial_pnl_banked += pp_net
-                contracts          = remaining
-                partial_taken      = True
-                if cash > day_peak_cash:   day_peak_cash   = cash
-                if cash < day_trough_cash: day_trough_cash = cash
-
-            # Conservative intrabar resolution: when both stop and target are touched
-            # in the same bar, assume stop was hit first. Prevents the backtest from
-            # favorably assuming targets fill before stops on volatile bars.
-            if hit_stop and hit_target:
-                exit_price  = stop_fill_px
-                exit_reason = "stop"
-            elif hit_target:
-                exit_price  = target_px
-                exit_reason = "target"
-            elif hit_stop:
-                exit_price  = stop_fill_px
-                exit_reason = "stop"
+            if _stop_is_triggered_at_open(row):
+                exit_price, exit_reason = _resolve_intrabar_exit(row)
             elif ((direction == "long"  and not prev_row["long_signal"]) or
                   (direction == "short" and not prev_row["short_signal"])):
                 exit_price  = row["open"]
@@ -2905,6 +3359,8 @@ def run_backtest(
                 # stop. Decision uses prior-bar MFE only; fill at current open.
                 exit_price  = row["open"]
                 exit_reason = "time_stop"
+            else:
+                exit_price, exit_reason = _resolve_intrabar_exit(row)
 
             # EOD flatten: if still in a trade on the last bar of the session,
             # close at THIS bar's close. Prevents holding overnight and eating
@@ -2915,47 +3371,10 @@ def run_backtest(
                 exit_reason = "eod_flatten"
 
             if exit_price is not None:
-                pnl_pts       = ((exit_price - entry_price) if direction == "long"
-                                 else (entry_price - exit_price))
-                gross_pnl_usd = pnl_pts * MNQ_POINT_VALUE * contracts
-                costs_usd     = round_turn_cost(contracts)
-                pnl_usd       = gross_pnl_usd - costs_usd
-                pnl_pct       = pnl_pts / entry_price
-                # won = True if final leg OR banked partial makes total positive
-                won           = (pnl_usd + partial_pnl_banked) > 0
-                cash          += pnl_usd
-
-                state.update(won, pnl_pct, pnl_usd)
-                if cash > day_peak_cash:   day_peak_cash   = cash
-                if cash < day_trough_cash: day_trough_cash = cash
-
-                tr = _build_trade_record(
-                    entry_snapshot=entry_snapshot,
-                    date=date, direction=direction,
-                    entry_price=entry_price, exit_price=exit_price,
-                    pnl_pts=pnl_pts, gross_pnl_usd=gross_pnl_usd,
-                    costs_usd=costs_usd, pnl_usd=pnl_usd,
-                    pnl_pct=pnl_pct, won=won, cash=cash,
-                    contracts=contracts, entry_regime=entry_regime,
-                    exit_reason=exit_reason, fvg_stop=fvg_stop,
-                    trade_mae=trade_mae, trade_mfe=trade_mfe,
-                    bars_to_exit=i - entry_bar_idx, state=state,
-                )
-                trades.append(tr)
-                day_trades_list.append(tr)
-
-                if won: consecutive_wins += 1;  consecutive_losses = 0
-                else:   consecutive_losses += 1; consecutive_wins = 0
-
-                in_trade             = False
-                trade_mfe            = 0.0
-                trade_mae            = 0.0
-                partial_taken        = False
-                partial_pnl_banked   = 0.0
-                breakeven_triggered  = False
+                _finalize_active_trade(float(exit_price), str(exit_reason), date, i)
 
         # ── Entry logic ───────────────────────────────────────────────────────
-        if not in_trade:
+        if not in_trade and not position_at_bar_open:
             if not _is_entry_allowed(date_ct):
                 portfolio.append(cash)
                 continue
@@ -2966,8 +3385,9 @@ def run_backtest(
                 portfolio.append(cash)
                 continue
 
-            if cash <= state.max_loss_floor:
-                state.floor_breached = True
+            if enforce_evaluation_floor and not account_floor_allows_entry(cash, state):
+                portfolio.append(cash)
+                continue
 
             if state.daily_pnl_usd <= BOT_DAILY_LOSS_LIMIT:
                 portfolio.append(cash)
@@ -3262,12 +3682,22 @@ def run_backtest(
                 if profile["contracts"] > 0 and state.daily_trades < profile["max_trades"]:
                     if prev_row["long_bias"]:
                         for fvg in active_fvgs:
+                            # CAUSALITY FIX (2026-07-25): an FVG created ON this bar
+                            # cannot be traded on this bar. Its top is row["low"] and
+                            # entry is priced at row["open"]; since open >= low always,
+                            # a same-bar entry required open == low, i.e. foreknowledge
+                            # that the bar would never trade below its open. That one
+                            # condition produced 777 trades at PF 13.48 (64% of all
+                            # backtest profit) versus PF 2.30 for every honest trade.
                             if (fvg.direction == "bullish"
+                                    and fvg.created_bar < i
                                     and (not FVG_FRESH_ONLY or not fvg.tested)
                                     and (not FVG_BODY_QUALITY_ENABLED or fvg.body_pct >= FVG_BODY_MIN_PCT)
                                     and (not FVG_SWEEP_REQUIRED or fvg.sweep)
                                     and (not FVG_VWAP_RUBBER_BAND_ENABLED or fvg.vwap_dist_at_creation >= FVG_VWAP_MIN_EXTENSION_PTS)
-                                    and (not FVG_OVERLAP_REQUIRED or _has_fvg_overlap(fvg, active_fvgs))
+                                    and (not FVG_OVERLAP_REQUIRED or _has_fvg_overlap(
+                                        fvg, [other for other in active_fvgs if other.created_bar < i]
+                                    ))
                                     and price_in_fvg(fvg, current_price)):
                                 entry_fvg       = fvg
                                 entry_dir       = "long"
@@ -3276,12 +3706,18 @@ def run_backtest(
 
                     if entry_dir is None and prev_row["short_bias"]:
                         for fvg in active_fvgs:
+                            # CAUSALITY FIX (2026-07-25): see the bullish branch.
+                            # Bearish mirror: bottom is row["high"], and open <= high
+                            # always, so a same-bar entry required open == high.
                             if (fvg.direction == "bearish"
+                                    and fvg.created_bar < i
                                     and (not FVG_FRESH_ONLY or not fvg.tested)
                                     and (not FVG_BODY_QUALITY_ENABLED or fvg.body_pct >= FVG_BODY_MIN_PCT)
                                     and (not FVG_SWEEP_REQUIRED or fvg.sweep)
                                     and (not FVG_VWAP_RUBBER_BAND_ENABLED or fvg.vwap_dist_at_creation >= FVG_VWAP_MIN_EXTENSION_PTS)
-                                    and (not FVG_OVERLAP_REQUIRED or _has_fvg_overlap(fvg, active_fvgs))
+                                    and (not FVG_OVERLAP_REQUIRED or _has_fvg_overlap(
+                                        fvg, [other for other in active_fvgs if other.created_bar < i]
+                                    ))
                                     and price_in_fvg(fvg, current_price)):
                                 entry_fvg       = fvg
                                 entry_dir       = "short"
@@ -3344,8 +3780,6 @@ def run_backtest(
                 session_level_data=sl,
             )
 
-            peak_equity  = state.eod_high_balance
-            drawdown_pct = (cash - peak_equity) / peak_equity * 100
             if this_entry_type == "ORB":
                 orb_regime_ok = (not pd.isna(prev_row["atr"]) and
                                  not pd.isna(prev_row["atr_avg_20"]) and
@@ -3374,44 +3808,6 @@ def run_backtest(
                 base_contracts = GAP_FILL_CONTRACTS
             else:
                 base_contracts = profile["contracts"]
-            if drawdown_pct > -2.5:
-                contracts = base_contracts
-            elif drawdown_pct > -1.5:
-                contracts = max(2, base_contracts - 2)
-            else:
-                contracts = 2
-
-            # ── VWAP size modifier ────────────────────────────────────────────
-            above_vwap_now = current_price > prev_row["vwap"]
-            if entry_dir == "long"  and not above_vwap_now:
-                contracts = max(2, contracts - 2)
-            elif entry_dir == "short" and above_vwap_now:
-                contracts = max(2, contracts - 2)
-
-            # NOTE: this additive score-sizing step is OVERWRITTEN below whenever
-            # FVG_SCORE_CONTRACT_MAP_ENABLED is True (the map assigns `contracts`
-            # outright). With both flags True (current config) this block has no
-            # effect on final size. Kept only for the map-disabled fallback path.
-            if this_entry_type == "FVG" and FVG_SCORE_SIZING_ENABLED:
-                fvg_score = int(fvg_quality["score"])
-                if drawdown_pct > -2.5:
-                    if fvg_score >= FVG_SCORE_HIGH_THRESHOLD:
-                        contracts = min(STRONG_CONTRACTS, contracts + FVG_SCORE_HIGH_SIZE_STEP)
-                    elif fvg_score >= FVG_SCORE_MEDIUM_THRESHOLD:
-                        contracts = min(STRONG_CONTRACTS, contracts + FVG_SCORE_MEDIUM_SIZE_STEP)
-
-            if this_entry_type == "FVG" and FVG_SCORE_CONTRACT_MAP_ENABLED:
-                fvg_score = int(fvg_quality["score"])
-                for threshold in sorted(FVG_SCORE_CONTRACT_MAP.keys(), reverse=True):
-                    if fvg_score >= threshold:
-                        contracts = FVG_SCORE_CONTRACT_MAP[threshold]
-                        break
-            elif (this_entry_type == "FAILED_BREAKOUT"
-                  and FB_QUALITY_SIZING_ENABLED
-                  and drawdown_pct > -2.5
-                  and fb_setup is not None
-                  and str(fb_setup.get("level_type", "")).startswith("globex_")):
-                contracts = min(STRONG_CONTRACTS, contracts + FB_GLOBEX_SIZE_STEP)
 
             # ── Stop placement ────────────────────────────────────────────────
             if this_entry_type == "ORB":
@@ -3523,54 +3919,46 @@ def run_backtest(
                             ATR_TARGET_MIN_TICKS), ATR_TARGET_MAX_TICKS))
                     active_fvgs  = [f for f in active_fvgs if f is not entry_fvg]
 
-            # ATR constant-dollar-risk sizing: after stop is known, rescale FVG
-            # contracts so the dollar exposure stays near ATR_CDR_TARGET_USD.
-            # For score-mapped contracts, scale the CDR target proportionally so
-            # per-contract risk stays constant (same $16/contract = 8-pt equivalent).
-            # Risk-budget sizing (DLL-headroom aware) takes precedence when
-            # enabled; otherwise fall back to the legacy constant-dollar-risk.
-            if RISK_BUDGET_SIZING_ENABLED and this_entry_type == "FVG" and fvg_stop != 0.0:
-                _stop_dist = abs(current_price - fvg_stop)
-                if _stop_dist > 0:
-                    _worst_slip   = max(_t for _cap, _t in SLIPPAGE_SCALE_TIERS)
-                    _per_ctr_cost = COMMISSION_PER_CONTRACT + _worst_slip * MNQ_TICK_VALUE * 2
-                    # Gap-aware: budget against a stop that fills GAP_STOP_MULT x
-                    # its width worse, so a gapped fill still fits the budget.
-                    _eff_stop_dist = _stop_dist * (GAP_STOP_MULT if GAP_AWARE_SIZING_ENABLED else 1.0)
-                    _per_ctr_risk = _eff_stop_dist * MNQ_POINT_VALUE + _per_ctr_cost
-                    _score  = int(fvg_quality["score"])
-                    _budget = RISK_BUDGET_DEFAULT
-                    for _th in sorted(RISK_BUDGET_MAP.keys(), reverse=True):
-                        if _score >= _th:
-                            _budget = RISK_BUDGET_MAP[_th]
-                            break
-                    _headroom     = state.daily_pnl_usd - BOT_DAILY_LOSS_LIMIT
-                    _headroom_cap = max(0.0, _headroom) * HEADROOM_SAFETY_FRAC
-                    _allowed_risk = min(_budget, _headroom_cap)
-                    contracts     = max(0, min(contracts, int(_allowed_risk / _per_ctr_risk)))
-            elif ATR_CDR_ENABLED and this_entry_type == "FVG" and fvg_stop != 0.0:
-                _stop_dist = abs(current_price - fvg_stop)
-                if _stop_dist > 0:
-                    _risk_per_ctr = _stop_dist * MNQ_POINT_VALUE
-                    _cdr_target = ATR_CDR_TARGET_USD
-                    if FVG_SCORE_CONTRACT_MAP_ENABLED:
-                        _sc = int(fvg_quality["score"])
-                        for _th in sorted(FVG_SCORE_CONTRACT_MAP.keys(), reverse=True):
-                            if _sc >= _th:
-                                _cdr_target = ATR_CDR_TARGET_USD * (FVG_SCORE_CONTRACT_MAP[_th] / STRONG_CONTRACTS)
-                                break
-                    contracts = max(1, min(contracts, int(_cdr_target / _risk_per_ctr)))
-
-            # News-day size cap: on scheduled high-impact news days (gap-prone),
-            # cap size so a gap-through fill cannot breach the DLL. Other days
-            # keep full size, so the P&L cost is confined to these few sessions.
-            if (NEWS_DAY_SIZE_CAP_ENABLED and this_entry_type == "FVG"
-                    and str(session_date) in ALL_NEWS_DATES):
-                contracts = min(contracts, NEWS_DAY_MAX_CONTRACTS)
-
-            # Risk-budget may zero out size when headroom is nearly exhausted;
-            # skip the trade rather than force a minimum (the FVG is consumed).
-            if RISK_BUDGET_SIZING_ENABLED and this_entry_type == "FVG" and contracts < 1:
+            sizing_decision = determine_trade_size(
+                TradeSizingRequest(
+                    entry_type=this_entry_type,
+                    direction=entry_dir,
+                    entry_price=float(current_price),
+                    stop_price=float(fvg_stop),
+                    base_contracts=int(base_contracts),
+                    vwap_price=(
+                        float(prev_row["vwap"])
+                        if not pd.isna(prev_row["vwap"])
+                        else 0.0
+                    ),
+                    quality_score=int(fvg_quality["score"]),
+                    fb_level_type=(
+                        str(fb_setup.get("level_type", ""))
+                        if fb_setup is not None
+                        else ""
+                    ),
+                    is_news_day=str(session_date) in ALL_NEWS_DATES,
+                ),
+                AccountRiskContext(
+                    cash=float(cash),
+                    peak_equity=float(state.eod_high_balance),
+                    daily_pnl_usd=float(state.daily_pnl_usd),
+                    max_loss_floor=(
+                        float(state.max_loss_floor)
+                        if enforce_evaluation_floor
+                        else -1.0e12
+                    ),
+                    floor_breached=(
+                        bool(state.floor_breached)
+                        if enforce_evaluation_floor
+                        else False
+                    ),
+                ),
+            )
+            contracts = sizing_decision.contracts
+            entry_contracts = contracts
+            drawdown_pct = sizing_decision.drawdown_pct
+            if contracts < 1:
                 portfolio.append(cash)
                 continue
 
@@ -3613,6 +4001,8 @@ def run_backtest(
             trade_mae            = 0.0
             partial_taken        = False
             partial_pnl_banked   = 0.0
+            partial_gross_banked = 0.0
+            partial_costs_banked = 0.0
             breakeven_triggered  = False
             trade_number_overall += 1
             trade_number_today   += 1
@@ -3632,7 +4022,7 @@ def run_backtest(
             is_nfp_today  = date_str_news in NFP_DATES
             is_news_today = date_str_news in ALL_NEWS_DATES
 
-            open_hour   = 9
+            open_hour   = 8
             open_minute = 30
             entry_h     = date_ct.hour
             entry_m     = date_ct.minute
@@ -3653,6 +4043,7 @@ def run_backtest(
 
             entry_snapshot = {
                 "entry_type":                  this_entry_type,
+                "entry_date":                  date,
                 "entry_hour":                  entry_h,
                 "session_minute":              sess_min,
                 "day_of_week":                 dow_str,
@@ -3684,6 +4075,17 @@ def run_backtest(
                 "stop_price":                  fvg_stop,
                 "target_price":                tgt_px,
                 "stop_width_ticks":            stop_w_ticks,
+                "base_contracts":               int(base_contracts),
+                "candidate_contracts":          int(sizing_decision.candidate_contracts),
+                "account_scaled_contracts":     int(
+                    sizing_decision.account_scaled_contracts
+                ),
+                "modeled_per_contract_risk_usd": float(
+                    sizing_decision.per_contract_risk_usd
+                ),
+                "modeled_allowed_risk_usd":     float(
+                    sizing_decision.allowed_risk_usd
+                ),
                 "trade_number_today":          trade_number_today,
                 "trade_number_overall":        trade_number_overall,
                 "consecutive_wins_before":     consecutive_wins,
@@ -3747,6 +4149,17 @@ def run_backtest(
                 "bar_adx_regime":              entry_bar_adx_regime,
             }
 
+            # The entry is modeled at this bar's open, so its stop/target must
+            # protect the position for the rest of this same bar.
+            entry_bar_exit_price, entry_bar_exit_reason = _resolve_intrabar_exit(row)
+            if entry_bar_exit_price is not None:
+                _finalize_active_trade(
+                    float(entry_bar_exit_price),
+                    str(entry_bar_exit_reason),
+                    date,
+                    i,
+                )
+
         portfolio.append(cash)
 
     # Final day close
@@ -3786,6 +4199,24 @@ def run_backtest(
     df["buy_hold_value"]  = INIT_CASH * (df["close"] / df["close"].iloc[0])
 
     return df, trades, daily_records, state
+
+
+def run_strategy_pipeline(
+    raw_bars: pd.DataFrame,
+    *,
+    live_signal_sink: Optional[Dict[str, object]] = None,
+    enforce_evaluation_floor: bool = True,
+) -> Tuple[pd.DataFrame, List[TradeRecord], List[DailyRecord], RiskState]:
+    """Canonical bars-to-decisions path shared by research and live runtime."""
+    prepared = add_indicators(raw_bars.copy())
+    prepared = generate_signals(prepared)
+    levels = compute_session_levels(prepared)
+    return run_backtest(
+        prepared,
+        levels,
+        live_signal_sink=live_signal_sink,
+        enforce_evaluation_floor=enforce_evaluation_floor,
+    )
 
 
 # ── TRADE RECORD BUILDER ──────────────────────────────────────────────────────
@@ -3830,6 +4261,7 @@ def _build_trade_record(
         contracts=contracts, regime=entry_regime,
         exit_reason=exit_reason, fvg_stop=fvg_stop,
         entry_type             = snap.get("entry_type", "FVG"),
+        entry_date             = snap.get("entry_date"),
         entry_hour             = snap.get("entry_hour", 0),
         session_minute         = snap.get("session_minute", 0),
         day_of_week            = snap.get("day_of_week", ""),
@@ -3855,6 +4287,13 @@ def _build_trade_record(
         stop_price             = snap.get("stop_price", 0.0),
         target_price           = snap.get("target_price", 0.0),
         stop_width_ticks       = snap.get("stop_width_ticks", 0.0),
+        base_contracts         = snap.get("base_contracts", contracts),
+        candidate_contracts    = snap.get("candidate_contracts", contracts),
+        account_scaled_contracts = snap.get("account_scaled_contracts", contracts),
+        modeled_per_contract_risk_usd = snap.get(
+            "modeled_per_contract_risk_usd", 0.0
+        ),
+        modeled_allowed_risk_usd = snap.get("modeled_allowed_risk_usd", 0.0),
         trade_number_today     = snap.get("trade_number_today", 0),
         trade_number_overall   = snap.get("trade_number_overall", 0),
         consecutive_wins_before  = snap.get("consecutive_wins_before", 0),

@@ -1005,7 +1005,10 @@ def _contract_rollover_warning(contract: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
-def _bars_to_strategy_df(bars: List[Dict[str, Any]]):
+def _bars_to_strategy_df(
+    bars: List[Dict[str, Any]],
+    blind_last_bar_to_open: bool = False,
+):
     if not bars:
         raise TopstepXAPIError("ProjectX returned no historical bars for the selected contract.")
 
@@ -1053,6 +1056,11 @@ def _bars_to_strategy_df(bars: List[Dict[str, Any]]):
         raise TopstepXAPIError(
             f"DATA_INTEGRITY_FAILURE: missing strategy bars detected near {gap_at.isoformat()} gap={gap_value}."
         )
+    if blind_last_bar_to_open:
+        last = df.index[-1]
+        opening_price = float(df.loc[last, "open"])
+        df.loc[last, ["high", "low", "close"]] = opening_price
+        df.loc[last, "volume"] = 0.0
     return df
 
 
@@ -1076,20 +1084,32 @@ def build_live_strategy_signal(
         unit=2,
         unit_number=5,
         limit=lookback_bars,
-        include_partial_bar=False,
+        include_partial_bar=True,
     )
-    df = _bars_to_strategy_df(bars)
+    df = _bars_to_strategy_df(bars, blind_last_bar_to_open=True)
+    expected_decision_bar = (
+        bot.pd.Timestamp(now_utc, tz="UTC")
+        .tz_convert("America/Chicago")
+        .floor("5min")
+    )
+    if df.index[-1] != expected_decision_bar:
+        raise TopstepXAPIError(
+            "DATA_INTEGRITY_FAILURE: ProjectX did not return the current "
+            f"decision bar open; expected={expected_decision_bar.isoformat()} "
+            f"received={df.index[-1].isoformat()}."
+        )
     data_summary = bot.validate_loaded_data(df)
-    df = bot.add_indicators(df)
-    df = bot.generate_signals(df)
-    session_levels = bot.compute_session_levels(df)
     live_signal_sink: Dict[str, Any] = {}
-    _, _, _, _ = bot.run_backtest(df, session_levels, live_signal_sink=live_signal_sink)
+    df, _, _, _ = bot.run_strategy_pipeline(
+        df,
+        live_signal_sink=live_signal_sink,
+    )
 
     payload = {
         "version": "V29",
         "generated_at": datetime.now(bot.TIMEZONE).isoformat(),
-        "bar_close_at": df.index[-1].isoformat(),
+        "bar_close_at": df.index[-2].isoformat() if len(df) > 1 else None,
+        "decision_bar_open_at": df.index[-1].isoformat(),
         "run_mode": bot.RUN_MODE,
         "execution_profile": bot.EXECUTION_PROFILE,
         "data_source": "projectx_history_retrieveBars",
@@ -1497,12 +1517,14 @@ def _evaluate_signal_risk_halts(
         month = int(signal.get("month", 0) or 0)
     if bot.SKIP_JULY and month == 7:
         return "Signal blocked because July trading is disabled in the locked strategy."
-    if (now.hour, now.minute) >= (bot.HARD_FLATTEN_H, bot.HARD_FLATTEN_M):
+    session_entry_cutoff = bot.session_last_bar_start_ct(now.date())
+    if now.time() >= session_entry_cutoff:
         return (
-            f"Signal blocked because the hard flatten time {bot.HARD_FLATTEN_H:02d}:{bot.HARD_FLATTEN_M:02d} CT "
+            f"Signal blocked because the session entry cutoff "
+            f"{session_entry_cutoff.strftime('%H:%M')} CT "
             "has already passed."
         )
-    if (now.hour, now.minute) > (bot.ENTRY_CUTOFF_H, bot.ENTRY_CUTOFF_M):
+    if (now.hour, now.minute) >= (bot.ENTRY_CUTOFF_H, bot.ENTRY_CUTOFF_M):
         return (
             f"Signal blocked because the entry cutoff time {bot.ENTRY_CUTOFF_H:02d}:{bot.ENTRY_CUTOFF_M:02d} CT "
             "has already passed."
@@ -1880,6 +1902,52 @@ def _require_single_account(accounts, requested_name: str) -> Dict[str, Any]:
     return accounts[0]
 
 
+def _live_sizing_decision(
+    signal: Dict[str, Any],
+    state: Dict[str, Any],
+    account_metrics: Optional[Dict[str, Any]] = None,
+) -> bot.TradeSizingDecision:
+    """Adapt reconciled live state to the shared backtest/live sizing engine."""
+    metrics = account_metrics or {}
+    current_balance = float(
+        metrics.get("balance")
+        or state.get("last_known_account_balance")
+        or bot.INIT_CASH
+    )
+    peak_balance = max(
+        current_balance,
+        float(state.get("peak_account_balance") or current_balance),
+    )
+    max_loss_floor = min(
+        float(bot.INIT_CASH),
+        peak_balance - float(bot.EOD_LOSS_BUFFER),
+    )
+    return bot.determine_trade_size(
+        bot.TradeSizingRequest(
+            entry_type=str(signal["entry_type"]),
+            direction=str(signal["direction"]),
+            entry_price=float(signal["entry_price"]),
+            stop_price=float(signal["stop_price"]),
+            base_contracts=int(
+                signal.get("base_contracts")
+                or signal.get("candidate_contracts")
+                or signal["contracts"]
+            ),
+            vwap_price=float(signal.get("vwap_at_entry", 0.0) or 0.0),
+            quality_score=int(signal.get("fvg_quality_score", 0) or 0),
+            fb_level_type=str(signal.get("fb_level_type", "") or ""),
+            is_news_day=bool(signal.get("is_news_day", False)),
+        ),
+        bot.AccountRiskContext(
+            cash=current_balance,
+            peak_equity=peak_balance,
+            daily_pnl_usd=float(state.get("session_daily_pnl_usd", 0.0) or 0.0),
+            max_loss_floor=max_loss_floor,
+            floor_breached=current_balance <= max_loss_floor,
+        ),
+    )
+
+
 def build_order_plan(
     signal_payload: Dict[str, Any],
     config: TopstepXConfig,
@@ -1904,6 +1972,7 @@ def build_order_plan(
 
     account = None
     contract = None
+    account_metrics: Dict[str, Any] = {}
     order_symbol = config.contract_search_text
     # Default to the symbol-aware fallback (MNQ->50) rather than the raw NQ-lot
     # count (5), so no-client/dry-run plans don't show a misleading 5-contract cap.
@@ -1918,18 +1987,24 @@ def build_order_plan(
             raise TopstepXAPIError(f"Could not resolve contract for search text '{config.contract_search_text}'.")
         order_symbol = str(contract.get("name") or contract.get("symbol") or config.contract_search_text)
         topstep_max_contracts = _infer_topstep_max_contracts(account, signal, symbol=order_symbol)
+        account_metrics = _extract_account_metrics(account, config)
         if scaling_plan_limit_mnq is None:
-            metrics = _extract_account_metrics(account, config)
             scaling_plan_limit_mnq = _topstepx_scaling_plan_limit_mnq(
                 config,
                 signal=signal,
-                current_profit=metrics.get("scaling_profit"),
+                current_profit=account_metrics.get("scaling_profit"),
             )
 
     stop_ticks = round(abs(float(signal["entry_price"]) - float(signal["stop_price"])) / bot.MNQ_TICK_SIZE)
     target_ticks = int(signal["target_ticks"])
     side = 0 if signal["direction"] == "long" else 1
-    final_size = max(1, min(int(signal["contracts"]), int(topstep_max_contracts)))
+    sizing_decision = _live_sizing_decision(signal, state, account_metrics)
+    if sizing_decision.contracts < 1:
+        raise TopstepXAPIError(
+            "Signal blocked by shared risk sizing: "
+            f"{sizing_decision.rejection_reason}."
+        )
+    final_size = min(int(sizing_decision.contracts), int(topstep_max_contracts))
     if scaling_plan_limit_mnq is not None:
         final_size = min(final_size, int(scaling_plan_limit_mnq))
 
@@ -1943,41 +2018,12 @@ def build_order_plan(
             )
             final_size = throttled_size
 
-    # Dynamic MLL proximity guard: scale contracts proportionally to remaining trailing
-    # drawdown buffer. Buffer = current_balance - (peak_balance - $2,000).
-    # At 100% buffer → full contracts. At 50% → half contracts. At 0% → 1 contract.
-    mll_note = ""
-    if client is not None:
-        _cur_bal = float(state.get("last_known_account_balance") or 0.0)
-        _peak_bal = float(state.get("peak_account_balance") or _cur_bal)
-        _mll_total = float(bot.EOD_LOSS_BUFFER)
-        if _cur_bal > 0 and _peak_bal > 0 and _mll_total > 0:
-            _buffer = _cur_bal - (_peak_bal - _mll_total)
-            _fraction = max(0.0, min(1.0, _buffer / _mll_total))
-            _mll_size = max(1, int(final_size * _fraction))
-            if _mll_size < final_size:
-                mll_note = (
-                    f"MLL guard: buffer ${_buffer:.0f}/{_mll_total:.0f} "
-                    f"({_fraction:.0%}) — size {final_size}→{_mll_size}"
-                )
-                final_size = _mll_size
-                _last_lvl = int(state.get("last_mll_alert_level") or 0)
-                _new_lvl = 2 if _fraction < 0.25 else 1 if _fraction < 0.50 else 0
-                if _new_lvl > _last_lvl:
-                    _send_telegram_lines([
-                        f"MNQ Bot: MLL BUFFER {'CRITICAL' if _new_lvl == 2 else 'WARNING'}",
-                        f"Buffer: ${_buffer:.0f} remaining ({_fraction:.0%} of ${_mll_total:.0f})",
-                        f"Contracts scaled: {final_size} (normal: {int(signal['contracts'])})",
-                        f"Account: ${_cur_bal:.0f}  Peak: ${_peak_bal:.0f}",
-                    ])
-                    state["last_mll_alert_level"] = _new_lvl
-                elif _new_lvl < _last_lvl:
-                    state["last_mll_alert_level"] = _new_lvl
-
     # Size audit trail before every order: requested vs broker max vs final.
     _write_log(
         "INFO",
-        f"order_sizing symbol={order_symbol} requested={int(signal['contracts'])} "
+        f"order_sizing symbol={order_symbol} candidate={int(sizing_decision.candidate_contracts)} "
+        f"account_scaled={int(sizing_decision.account_scaled_contracts)} "
+        f"risk_sized={int(sizing_decision.contracts)} "
         f"max_allowed={int(topstep_max_contracts)} "
         f"scaling_plan_limit_mnq={scaling_plan_limit_mnq} final_size={int(final_size)}",
     )
@@ -1995,7 +2041,11 @@ def build_order_plan(
             "type": 2,
             "side": side,
             "size": final_size,
-            "requestedSize": int(signal["contracts"]),
+            "requestedSize": int(sizing_decision.contracts),
+            "candidateSize": int(sizing_decision.candidate_contracts),
+            "accountScaledSize": int(sizing_decision.account_scaled_contracts),
+            "modeledPerContractRiskUsd": float(sizing_decision.per_contract_risk_usd),
+            "modeledAllowedRiskUsd": float(sizing_decision.allowed_risk_usd),
             "topstepMaxContracts": int(topstep_max_contracts),
             "topstepScalingPlanLimitMnq": scaling_plan_limit_mnq,
             "topstepAccountStage": config.topstep_account_stage,
@@ -3145,9 +3195,10 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
             now = _current_ct_now()
             minute_key = now.strftime("%Y-%m-%d %H:%M")
 
-            if (now.hour, now.minute) >= (bot.HARD_FLATTEN_H, bot.HARD_FLATTEN_M):
+            scheduled_flatten = bot.session_flatten_time_ct(now.date())
+            if now.time() >= scheduled_flatten:
                 if state.get("open_order_count") or state.get("open_position_count") or state.get("current_position"):
-                    _flatten_account_internal(client, config, reason="hard_flatten_time")
+                    _flatten_account_internal(client, config, reason="scheduled_session_flatten")
                 try:
                     _send_eod_summary(state)   # once-per-day end-of-day digest
                 except Exception as exc:
@@ -3160,7 +3211,20 @@ def run_loop(auto_submit: bool, interval_seconds: int, max_cycles: int) -> None:
                     break
                 continue
 
-            if state.get("last_loop_minute") != minute_key:
+            if (
+                state.get("last_loop_minute") != minute_key
+                and not bot.is_strategy_decision_time_ct(now)
+            ):
+                # The historical strategy contains RTH bars only. Do not ask it
+                # to synthesize an overnight/weekend decision from yesterday's
+                # final bar. Existing positions still receive stop management.
+                try:
+                    _manage_position_stops(client, config, state)
+                except Exception as exc:
+                    _write_log("ERROR", f"stop_mgmt_error: {exc}", error_only=True)
+                state["last_loop_minute"] = minute_key
+                _save_state(state)
+            elif state.get("last_loop_minute") != minute_key:
                 # Live stop management first: while in a position, ratchet the
                 # protective stop (breakeven/trail) per completed 5-min bar.
                 # Never raises into the loop; no-op when flat or disabled.

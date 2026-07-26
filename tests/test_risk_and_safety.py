@@ -476,27 +476,307 @@ def _mk_df(closes, spread=1.0):
         "volume":[10] * len(closes),
     }, index=idx)
 
-def test_phantom_bar_floating_above_removed():
+def test_phantom_bar_floating_above_removed(monkeypatch):
+    # The filter is DISABLED in the shipped config (see
+    # test_phantom_filter_is_disabled_by_default). Force it on to prove the
+    # function itself still behaves, in case it is ever needed for a new dataset.
+    monkeypatch.setattr(bot, "PHANTOM_BAR_FILTER_ENABLED", True)
     df = _mk_df([100, 100, 300, 100, 100])   # bar 2 floats far above both neighbors
     out = bot.filter_phantom_bars(df)
     assert len(out) == 4
     assert 300 not in list(out["close"])
 
-def test_phantom_bar_floating_below_removed():
+def test_phantom_bar_floating_below_removed(monkeypatch):
+    monkeypatch.setattr(bot, "PHANTOM_BAR_FILTER_ENABLED", True)
     df = _mk_df([20000, 20000, 19000, 20000, 20000])  # bar 2 floats far below
     out = bot.filter_phantom_bars(df)
     assert len(out) == 4
     assert 19000 not in list(out["close"])
 
-def test_real_trend_move_not_removed():
+def test_real_trend_move_not_removed(monkeypatch):
     # A genuine move where price steps and the next bar CONTINUES (overlaps) is
     # not a phantom — must be kept.
+    monkeypatch.setattr(bot, "PHANTOM_BAR_FILTER_ENABLED", True)
     df = _mk_df([20000, 20010, 20025, 20040, 20055], spread=8.0)
     out = bot.filter_phantom_bars(df)
     assert len(out) == 5
 
-def test_phantom_filter_flag_and_default():
-    assert bot.PHANTOM_BAR_FILTER_ENABLED is True
+def test_phantom_filter_is_disabled_by_default():
+    """The filter must stay OFF: it is not causal.
+
+    It inspects bar k+1 to decide whether to delete bar k, which a live bot can
+    never do for its newest bar. It only ever existed to mop up ~206pt
+    spike-and-revert bars caused by load_data.py picking the highest-volume
+    contract PER BAR during rollover weeks. select_front_month() now rolls once
+    per day, forward only, and the artifact count went 76 -> 0. With the data
+    clean this filter removes nothing, so enabling it would add a non-causal
+    step for no benefit.
+    """
+    assert bot.PHANTOM_BAR_FILTER_ENABLED is False
+
+
+# ── Contract rollover: the real fix for the phantom bars ───────────────────────
+def test_contract_expiry_ordering():
+    from src.load_data import contract_sort_key
+    syms = ["MNQH6", "MNQZ4", "MNQM9", "MNQU4", "MNQZ0", "MNQH5"]
+    assert sorted(syms, key=contract_sort_key) == [
+        "MNQM9", "MNQZ0", "MNQU4", "MNQZ4", "MNQH5", "MNQH6"
+    ]
+    # Unparseable symbols sort last so they can never win front month.
+    assert contract_sort_key("GARBAGE") > contract_sort_key("MNQH6")
+
+def test_front_month_roll_is_forward_only_and_fixed_at_rth_open():
+    """A thin session on the expiring contract must not drag the series back.
+
+    This is the exact shape that produced the 76 fake bars: two contracts with
+    comparable volume during a rollover week, selected independently per bar.
+    """
+    import pandas as pd
+    from src.load_data import select_front_month
+
+    rows = []
+    # Pre-open volume fixes the choice. Day 2 rolls forward; day 3 cannot roll back.
+    for day, vols in [("2024-12-16", {"MNQZ4": 900, "MNQH5": 100}),
+                      ("2024-12-17", {"MNQZ4": 100, "MNQH5": 900}),
+                      ("2024-12-18", {"MNQZ4": 900, "MNQH5": 100})]:
+        for sym, vol in vols.items():
+            px = 20000.0 if sym == "MNQZ4" else 20200.0   # ~200pt contract spread
+            for minute in ("08:00", "09:30", "09:35"):
+                rows.append({
+                    "ts_event": pd.Timestamp(f"{day} {minute}", tz="US/Eastern"),
+                    "symbol": sym, "open": px, "high": px + 5, "low": px - 5,
+                    "close": px, "volume": vol if minute == "08:00" else 1,
+                })
+    out = select_front_month(pd.DataFrame(rows))
+
+    days = out.index.normalize().unique()
+    picked = [out.loc[out.index.normalize() == d, "symbol"].unique().tolist() for d in days]
+    # Exactly one contract per day — never mixed inside a session.
+    assert all(len(p) == 1 for p in picked), picked
+    assert [p[0] for p in picked] == ["MNQZ4", "MNQH5", "MNQH5"], (
+        "roll must be forward-only; day 3 must stay on MNQH5 despite MNQZ4 volume"
+    )
+    # And therefore no 200-point flip-flop appears in the stitched series.
+    assert out["close"].nunique() <= 2
+
+
+def test_front_month_morning_is_invariant_to_afternoon_volume():
+    import pandas as pd
+    from src.load_data import select_front_month
+
+    rows = []
+    for sym, preopen_volume, afternoon_volume in [
+        ("MNQZ4", 900, 1),
+        ("MNQH5", 100, 1),
+    ]:
+        for minute, volume in [
+            ("08:00", preopen_volume),
+            ("09:30", 1),
+            ("09:35", 1),
+            ("15:30", afternoon_volume),
+        ]:
+            rows.append({
+                "ts_event": pd.Timestamp(f"2024-12-16 {minute}", tz="US/Eastern"),
+                "symbol": sym,
+                "open": 20000.0,
+                "high": 20001.0,
+                "low": 19999.0,
+                "close": 20000.0,
+                "volume": volume,
+            })
+    prefix = pd.DataFrame([row for row in rows if row["ts_event"].hour < 12])
+    full = pd.DataFrame(rows)
+    full.loc[
+        (full["symbol"] == "MNQH5") & (full["ts_event"].dt.hour == 15),
+        "volume",
+    ] = 1_000_000
+
+    a = select_front_month(prefix)
+    b = select_front_month(full)
+    morning = b.index.time <= pd.Timestamp("09:35").time()
+    pd.testing.assert_frame_equal(a, b.loc[morning])
+
+
+def test_contract_year_resolution_survives_2029():
+    from src.load_data import contract_sort_key
+
+    assert contract_sort_key("MNQZ8", reference_year=2029) == (2028, 12)
+    assert contract_sort_key("MNQH9", reference_year=2029) == (2029, 3)
+    assert contract_sort_key("MNQH29", reference_year=2029) == (2029, 3)
+
+
+def test_topstep_floor_breach_is_absorbing():
+    state = bot.RiskState()
+    state.max_loss_floor = 48_000.0
+
+    assert not bot.account_floor_allows_entry(47_999.0, state)
+    assert state.floor_breached
+    assert not bot.account_floor_allows_entry(50_000.0, state)
+
+
+def _sizing_account(cash=50_000.0, peak=50_000.0, daily_pnl=0.0):
+    return bot.AccountRiskContext(
+        cash=cash,
+        peak_equity=peak,
+        daily_pnl_usd=daily_pnl,
+        max_loss_floor=min(bot.INIT_CASH, peak - bot.EOD_LOSS_BUFFER),
+    )
+
+
+def _sizing_request(entry_type="ORB", base_contracts=5, score=0):
+    return bot.TradeSizingRequest(
+        entry_type=entry_type,
+        direction="long",
+        entry_price=20_000.0,
+        stop_price=19_999.0,
+        base_contracts=base_contracts,
+        vwap_price=19_990.0,
+        quality_score=score,
+    )
+
+
+def test_shared_sizing_drawdown_branches_are_ordered_and_never_increase_size():
+    full = bot.determine_trade_size(_sizing_request(), _sizing_account())
+    medium = bot.determine_trade_size(
+        _sizing_request(), _sizing_account(cash=49_000.0, peak=50_000.0)
+    )
+    deep = bot.determine_trade_size(
+        _sizing_request(), _sizing_account(cash=48_600.0, peak=50_000.0)
+    )
+
+    assert full.candidate_contracts == 5
+    assert medium.candidate_contracts == 5
+    assert deep.candidate_contracts == 5
+    assert full.account_scaled_contracts == 5
+    assert medium.account_scaled_contracts == 3
+    assert deep.account_scaled_contracts == 2
+    one_lot = bot.determine_trade_size(
+        _sizing_request(base_contracts=1),
+        _sizing_account(cash=48_600.0, peak=50_000.0),
+    )
+    assert one_lot.candidate_contracts == 1
+    assert one_lot.account_scaled_contracts == 1
+
+
+def test_shared_sizing_reserves_daily_and_trailing_floor_headroom():
+    decision = bot.determine_trade_size(
+        _sizing_request(entry_type="FVG", base_contracts=50, score=8),
+        _sizing_account(cash=48_005.0, peak=50_000.0),
+    )
+
+    assert decision.contracts == 0
+    assert decision.rejection_reason == "risk_headroom_below_one_contract"
+    assert decision.allowed_risk_usd == pytest.approx(
+        5.0 * bot.HEADROOM_SAFETY_FRAC
+    )
+
+
+def test_live_adapter_and_backtest_sizing_are_identical_for_same_inputs():
+    signal = {
+        "entry_type": "FVG",
+        "direction": "long",
+        "entry_price": 20_000.0,
+        "stop_price": 19_999.0,
+        "contracts": 50,
+        "base_contracts": 5,
+        "candidate_contracts": 50,
+        "vwap_at_entry": 19_990.0,
+        "fvg_quality_score": 8,
+        "fb_level_type": "",
+        "is_news_day": False,
+    }
+    state = tr._default_state()
+    state.update({
+        "last_known_account_balance": 50_000.0,
+        "peak_account_balance": 50_000.0,
+        "session_daily_pnl_usd": 0.0,
+    })
+    live = tr._live_sizing_decision(signal, state)
+    historical = bot.determine_trade_size(
+        bot.TradeSizingRequest(
+            entry_type="FVG",
+            direction="long",
+            entry_price=20_000.0,
+            stop_price=19_999.0,
+            base_contracts=5,
+            vwap_price=19_990.0,
+            quality_score=8,
+        ),
+        _sizing_account(),
+    )
+
+    assert live == historical
+
+
+def test_shared_sizing_rejects_structurally_invalid_stop():
+    request = bot.TradeSizingRequest(
+        entry_type="FVG",
+        direction="long",
+        entry_price=20_000.0,
+        stop_price=20_001.0,
+        base_contracts=5,
+    )
+    decision = bot.determine_trade_size(request, _sizing_account())
+    assert decision.contracts == 0
+    assert decision.rejection_reason == "long_stop_not_below_entry"
+
+
+def test_ambiguous_ohlc_bar_always_resolves_stop_first():
+    decision = bot.resolve_ohlc_bracket_exit(
+        direction="long",
+        entry_price=100.0,
+        stop_price=95.0,
+        target_price=110.0,
+        bar_open=100.0,
+        bar_high=112.0,
+        bar_low=94.0,
+    )
+    assert decision.hit_stop and decision.hit_target
+    assert decision.exit_reason == "stop"
+    assert decision.exit_price == pytest.approx(
+        95.0 - bot.STOP_EXTRA_SLIP_TICKS * bot.MNQ_TICK_SIZE
+    )
+
+
+@pytest.mark.parametrize(
+    "direction,entry,stop,target,bar_open,bar_high,bar_low,expected",
+    [
+        ("long", 100.0, 95.0, 110.0, 92.0, 94.0, 90.0, 92.0),
+        ("short", 100.0, 105.0, 90.0, 108.0, 110.0, 106.0, 108.0),
+    ],
+)
+def test_gap_through_stop_fills_at_worse_open(
+    direction, entry, stop, target, bar_open, bar_high, bar_low, expected
+):
+    decision = bot.resolve_ohlc_bracket_exit(
+        direction=direction,
+        entry_price=entry,
+        stop_price=stop,
+        target_price=target,
+        bar_open=bar_open,
+        bar_high=bar_high,
+        bar_low=bar_low,
+    )
+    adverse = bot.STOP_EXTRA_SLIP_TICKS * bot.MNQ_TICK_SIZE
+    expected_with_slip = expected - adverse if direction == "long" else expected + adverse
+    assert decision.exit_reason == "stop"
+    assert decision.exit_price == pytest.approx(expected_with_slip)
+
+
+def test_bracket_exit_allows_profitable_breakeven_or_trailing_stop():
+    decision = bot.resolve_ohlc_bracket_exit(
+        direction="long",
+        entry_price=100.0,
+        stop_price=103.0,
+        target_price=110.0,
+        bar_open=104.0,
+        bar_high=105.0,
+        bar_low=102.0,
+    )
+    assert decision.exit_reason == "stop"
+    assert decision.exit_price == pytest.approx(
+        103.0 - bot.STOP_EXTRA_SLIP_TICKS * bot.MNQ_TICK_SIZE
+    )
 
 
 # ── Orphan-order detection (E4: flat account with leftover working orders) ──────
