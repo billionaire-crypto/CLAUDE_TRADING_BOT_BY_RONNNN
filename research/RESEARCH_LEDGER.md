@@ -13,6 +13,92 @@ root as modules, e.g. `python -m research.run_bias_validation`.
 
 ---
 
+## 2026-07-26 — Quant harness: overnight-extreme sweep failure (H1) — HARNESS ONLY, NOT YET TESTED
+
+### Background
+Ran the 3-stage autonomous research harness (generate → gatekeeper → script) to
+produce a structural, non-indicator hypothesis and a standalone verification
+script. Nothing in `src/` was touched; no live parameter changed.
+
+### Stage 1 — three candidates
+1. **H1 — Overnight extreme sweep failure at the RTH transition.** The Globex
+   range high/low (18:00 → 09:29 ET) is the most-referenced resting-liquidity
+   shelf on NQ. In 09:30–11:00 ET, an extension *through* ONH/ONL that fails to
+   close beyond it, on a bar whose volume is high relative to its own trailing
+   distribution, is a liquidity event rather than a trend event. Claim:
+   penetration depth × relative volume is monotonically related to 15–60 min
+   reversion.
+2. **H2 — 0DTE gamma pin decay into the cash close.** Fade spot excursions away
+   from the NDX max-gamma strike in 15:00–16:00 ET.
+3. **H3 — Opening-hour range compression → intraday expansion.** Lowest-decile
+   09:30–10:30 range predicts above-median expansion for the rest of the session.
+
+### Stage 2 — gatekeeper verdicts
+- **H1 ACCEPT.** No indicator; counterparty named explicitly (breakout entrants
+  long the ONH break + resting buy-stops of overnight shorts, both filled at the
+  extreme and underwater at the close-back-inside); horizon is tens of NQ points
+  against $2.50 round-turn friction, and entry is next-bar-open, so it survives
+  execution reality.
+- **H2 REJECT — execution reality.** The residual excursion around a pin in the
+  final hour is ~5–15 NQ points and the fade is inherently high-frequency;
+  friction eats a large share before adverse selection. Worse, the actual driver
+  (dealer gamma by strike) is not derivable from MNQ OHLCV — we have no options
+  chain feed, so any "verification" would be a proxy of a proxy.
+- **H3 REJECT — counterparty.** Compression→expansion is a variance property,
+  not a transfer of money from an identified participant. Nobody is trapped by a
+  quiet opening hour, and the statistic is directionally agnostic.
+- **H4 (replacement, generated then set aside): RTH-open absorption of the Globex
+  close imbalance.** Logged so a future session does not regenerate it. H1
+  already cleared all three filters and needs no options/auction data.
+
+### Stage 3 — what was built
+`research/verify_hypothesis.py` (standalone; imports nothing from `src/`):
+- Sessionises 1m bars on an 18:00 ET roll; freezes ONH/ONL at 09:29 so the
+  levels are fully known before RTH opens.
+- Signed feature `-side × (penetration_depth / overnight_range) × volume_rank`,
+  where `volume_rank` is a rolling **percentile rank** (an order statistic, not a
+  moving average) so the score normalises across volatility regimes.
+- Exactly **one** `.shift(1)`, isolated in `align_signal_and_returns()`: the score
+  computed at the close of bar *t-1* is scored against the move starting at bar
+  *t*, entered at that bar's open. Signals are also nulled across the 09:30
+  session boundary.
+- Friction hardcoded: $1.50 RT commission + 1 tick ($0.50) slippage **per side**
+  = $2.50 RT/contract — deliberately stricter than a 1-tick-total assumption.
+- Reports Spearman **Rank IC** vs forward 15m / 60m returns, both all-bars and
+  events-only (the events-only figure is the decision number; the all-bars figure
+  is swamped by zero-valued non-event bars), plus a fixed-horizon event study in
+  net dollars with win rate and profit factor.
+- Forward returns are masked wherever the horizon would cross 16:00 into the next
+  session.
+
+### Result — NONE YET. This machine has no MNQ 1m data.
+`src/bot.py:DATA_PATH` points at a local Windows path that does not exist in this
+environment, and no 1m CSV is checked in. The script therefore fell back to a
+seeded **synthetic** random walk purely to prove it runs end-to-end (exit 0;
+102 synthetic sessions, 71 events, IC ≈ 0.00/0.11, PF 0.84/0.92, net ≈ −friction
+— which is exactly the correct answer on data containing no edge, and is the only
+thing that run demonstrates). **Every number from a synthetic run is noise and
+the script prints a loud banner saying so.**
+
+### Decision — PARKED, pending a real-data run
+H1 is unvalidated. Nothing may be inferred about MNQ until someone re-runs:
+
+    MNQ_1M_CSV=/path/to/glbx-mdp3-*.ohlcv-1m.csv python3 ./research/verify_hypothesis.py
+
+(or drops the CSV in `research/data/`). Only then does an IC/PF number belong in
+this ledger, and only then is a walk-forward / stress / combine-sim gauntlet worth
+starting. No `src/bot.py` parameter is eligible to move on the strength of this
+entry.
+
+### Notes for the next session
+- Requires `scipy` (added to `requirements.txt` under a research-only section)
+  and `tzdata` on slim Linux images.
+- If the real-data events-only IC is flat, the next thing to vary is the sweep
+  definition, not the horizon: try requiring the reclaim to occur within N bars
+  rather than on the sweeping bar itself, which is the version most desks trade.
+
+---
+
 ## 2026-07-19 — Port: FVG_BLOCK_LEVEL_SWEEP_ENABLED (candidate, not shipped)
 
 ### Background

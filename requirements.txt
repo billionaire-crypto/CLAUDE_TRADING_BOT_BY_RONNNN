@@ -13,6 +13,10 @@ python-dotenv>=1.0.0
 pandas>=2.0.0
 numpy>=1.24.0
 
+# Research-only (research/verify_hypothesis.py — rank IC). Not imported by src/.
+scipy>=1.10.0
+tzdata>=2024.1          # slim Linux images ship no zoneinfo database
+
 # Technical indicators (uncomment whichever you use)
 # ta>=0.11.0             # Simple TA library
 # pandas-ta>=0.3.14b     # Pandas-based TA
