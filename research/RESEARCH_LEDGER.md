@@ -97,6 +97,89 @@ entry.
   definition, not the horizon: try requiring the reclaim to occur within N bars
   rather than on the sweeping bar itself, which is the version most desks trade.
 
+### AMENDMENT 2026-07-26 — literature pass: H1's stated mechanism points the WRONG WAY
+
+Ran a multi-source literature review (49 agents, 12 sources fetched, 15 claims
+extracted, 10 put to a 3-vote adversarial panel; 5 confirmed, 5 refuted). This is
+a **literature result, not a backtest** — H1's status is unchanged at PARKED, and
+no `src/` parameter is eligible to move. What changed is the *reason* to be
+skeptical.
+
+**The finding that matters.** Osler (2003), "Currency Orders and Exchange Rate
+Dynamics," *Journal of Finance* 58(5):1791-1820 — primary order-book data, one
+large FX dealing bank, 9,655 orders — documents the mechanism I claimed in Stage 2,
+with the sign reversed:
+
+> "Take-profit orders tend to reflect price trends, and stop-loss orders tend to
+> intensify trends."
+
+Take-profit clusters sit **at** the level and cause reversals. Stop-loss clusters
+sit **just beyond** the level and cause *acceleration*. Corroborated by the same
+author in Osler (2005), *JIMF* 24(2):219-241 (price cascades at stop clusters), and
+the stop-cluster response is larger and longer-lasting than the take-profit one.
+Adversarial search found **no** peer-reviewed rebuttal or sign reversal.
+
+My Stage 2 counterparty story — "breakout entrants and the resting buy-stops of
+overnight shorts are trapped, and their exit is the reversion" — therefore names
+the right participants but predicts the wrong direction. Running those stops is,
+per the only rigorous evidence located, *continuation fuel*.
+
+**The caveat that keeps H1 alive.** Osler's result is **unconditional** on the level
+being touched. H1 conditions on a **failed** penetration — no close beyond — which is
+precisely the subset where the cascade did *not* sustain. That is a genuinely
+different conditional distribution, so Osler weakens H1's rationale without
+logically excluding it. H1 is now a hypothesis with a *disputed* mechanism rather
+than a supported one.
+
+**Absence findings (per the brief, these count as results).** No rigorous source was
+found for any of: stop clustering at prior-session/overnight extremes as opposed to
+round numbers; failed/false breakouts of prior-session ranges in equity index
+futures; any post-sweep reversion magnitude in index points; whether such reversion
+survives MNQ costs; or an RTH-open vs. overnight liquidity profile for NQ. Every
+source affirming the sweep-to-reversion story was retail/ICT tier (TradingView,
+Medium, vendor blogs) plus one unrefereed preprint. Two attempts to import
+round-number barrier effects from US equities were **refuted 0-3** on source
+strength. **The overnight-extreme shelf is currently folklore with a plausible but
+untested microstructural analogy behind it.**
+
+**On the other two hypotheses.** H2 (0DTE gamma pin): the only surviving claim is
+*sign-conditional* — dealer inventory gamma sign modulates intraday reversal vs.
+momentum in the **S&P 500** (corroborated by Baltussen et al., *JFE* 2021) — which
+is explicitly not a pin, is not NDX/NQ, carries no effect size, and is
+unexploitable in practice because dealer gamma sign is not reliably inferable from
+public data. Both specific 0DTE claims tested were refuted (1-2 and 0-3). This
+*supports* the original Stage 2 rejection, and on firmer ground than I had.
+H3 (compression→expansion): **zero** claims surfaced in either direction. The
+tension flagged at rejection time is unresolved — GARCH-family persistence would
+predict low range *persisting* (inverting the hypothesis), and no directional
+edge from compression was documented anywhere.
+
+**Cross-cutting gap.** No verified figure for MNQ all-in round-turn cost, spread by
+time of day, or meaningful intraday rank-IC magnitudes. Every surviving claim is
+effect-size-free and cost-free, so **nothing here can be promoted to a P&L claim**.
+
+**Run quality — read before trusting the absence findings.** Egress was materially
+degraded: Wiley, NY Fed, FRASER, RePEc, Semantic Scholar, ScienceDirect and SSRN
+all returned HTTP 403 through the proxy (6 of 12 fetched sources yielded zero
+claims), and one verifier exhausted its search budget. Osler's scope was confirmed
+via multiple independent secondary summaries, not direct PDF reading. Absence of
+retrieval is not proof of absence — though repeatedly failing to surface anything
+above retail tier is itself informative.
+
+### Decision — H1 stays PARKED. Script changed to test the sign, not assume it.
+`verify_hypothesis.py` now reports a **continuation leg** alongside the reversion
+leg: the same events traded the opposite direction, each paying full friction
+independently (they are not mirror images — both can lose, and on the synthetic
+tape both do, netting exactly `-2 x $2.50 x n`). A future session must not read a
+negative reversion result as "no edge" when it may be a continuation edge with the
+sign flipped.
+
+**Recommended next step when real data is attached:** run it as a *two-sided* test.
+If the continuation leg is the profitable one, Osler is confirmed on MNQ and the
+strategy inverts. If neither clears friction, H1 dies on evidence rather than on
+literature. Either outcome is a real result; only the reversion leg winning would
+vindicate the original Stage 2 reasoning.
+
 ---
 
 ## 2026-07-19 — Port: FVG_BLOCK_LEVEL_SWEEP_ENABLED (candidate, not shipped)

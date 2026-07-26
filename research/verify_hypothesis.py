@@ -21,6 +21,13 @@ the resting buy-stops of overnight shorts. Both are filled at the extreme and
 are underwater the instant the bar closes back inside the range. Their exit is
 the reversion this feature tries to capture. (Mirror image at ONL.)
 
+DISPUTED — read the 2026-07-26 ledger amendment before trusting the sign above.
+A literature pass found Osler (2003, J. Finance 58(5)) documents the opposite
+mechanism: stop-loss clusters *intensify* trends, while take-profit clusters are
+what produce reversals. Under that finding, running the stops predicts
+continuation, not a fade. This script therefore reports BOTH directions and takes
+no position on which sign wins — that is the empirical question to settle.
+
 FEATURE (continuous, signed; positive = expect price up):
     score = -side * (penetration_depth / overnight_range) * volume_rank
 where `side` is +1 for a failed break above ONH, -1 for a failed break below
@@ -378,7 +385,17 @@ def event_study(aligned: pd.DataFrame, horizon_label: str) -> dict:
     gross_usd = gross_pts * POINT_VALUE
     net_usd = gross_usd - FRICTION_ROUND_TURN
 
+    # The CONTINUATION leg: identical events, opposite direction. Osler (2003,
+    # J. Finance) finds stop-loss clusters *intensify* trends while take-profit
+    # clusters reverse them, so the sign of this edge is an open question, not a
+    # given — see the 2026-07-26 ledger amendment. Reporting both legs stops a
+    # future session from reading a real continuation edge as "reversion failed,
+    # no edge here". Both legs pay full friction, so they are not mirror images:
+    # each must clear $2.50 on its own, and both can lose.
+    net_usd_cont = -gross_usd - FRICTION_ROUND_TURN
+
     net_usd = net_usd.dropna()
+    net_usd_cont = net_usd_cont.dropna()
     if net_usd.empty:
         return {"n": 0}
 
@@ -389,6 +406,9 @@ def event_study(aligned: pd.DataFrame, horizon_label: str) -> dict:
 
     return {
         "n": int(len(net_usd)),
+        "cont_net_usd": float(net_usd_cont.sum()),
+        "cont_avg_usd": float(net_usd_cont.mean()),
+        "cont_win_rate": float((net_usd_cont > 0).mean()),
         "net_usd": float(net_usd.sum()),
         "avg_usd": float(net_usd.mean()),
         "median_usd": float(net_usd.median()),
@@ -460,6 +480,11 @@ def main() -> int:
         print(f"  profit factor  : {_fmt(r['profit_factor'], 2)}")
         print(f"  best / worst   : ${r['best']:,.2f} / ${r['worst']:,.2f}")
         print(f"  friction paid  : ${r['friction_usd']:,.2f}")
+        print(
+            f"  [continuation leg — same events, opposite side] "
+            f"net ${r['cont_net_usd']:,.2f} | avg ${r['cont_avg_usd']:,.2f} | "
+            f"win {r['cont_win_rate'] * 100:,.1f}%"
+        )
 
     print("\n" + "=" * 74)
     if synthetic:
